@@ -1,0 +1,32 @@
+{
+  "name": "openclaw-context-engine-js",
+  "version": "1.0.0",
+  "description": "OpenClaw Context Engine - JavaScript rewrite",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "start:http": "node src/index.js",
+    "start:mcp": "node src/mcp-server.js",
+    "test": "node --test tests/**/*.test.js",
+    "lint": "eslint src/",
+    "healthcheck": "scripts/healthcheck.sh"
+  },
+  "dependencies": {
+    "fastify": "^4.26.0",
+    "zod": "^3.22.4",
+    "@modelcontextprotocol/sdk": "^0.4.0",
+    "chromadb": "^1.8.0",
+    "better-sqlite3": "^9.4.0",
+    "pino": "^8.19.0",
+    "dotenv": "^16.4.0",
+    "uuid": "^9.0.1",
+    "nodejieba": "^2.6.0",
+    "winston": "^3.17.0"
+  },
+  "devDependencies": {
+    "eslint": "^8.57.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
