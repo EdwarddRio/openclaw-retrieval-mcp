@@ -179,6 +179,48 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           required: ['memory_id'],
         },
       },
+      {
+        name: 'save_memory',
+        description: 'Save a memory item with optional governance conflict detection.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            session_id: { type: 'string' },
+            content: { type: 'string' },
+            state: { type: 'string', enum: ['tentative', 'local_only', 'manual_only', 'candidate_on_reuse', 'wiki_candidate', 'published', 'discarded'] },
+            aliases: { type: 'array', items: { type: 'string' } },
+            path_hints: { type: 'array', items: { type: 'string' } },
+            collection_hints: { type: 'array', items: { type: 'string' } },
+            source: { type: 'string', enum: ['manual', 'auto_triage', 'user_explicit', 'auto_draft'] },
+            use_governance: { type: 'boolean', default: true },
+          },
+          required: ['session_id', 'content'],
+        },
+      },
+      {
+        name: 'plan_knowledge_update',
+        description: 'Dry-run governance: plan how a new memory would integrate without persisting.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            content: { type: 'string' },
+            aliases: { type: 'array', items: { type: 'string' } },
+            path_hints: { type: 'array', items: { type: 'string' } },
+            collection_hints: { type: 'array', items: { type: 'string' } },
+          },
+          required: ['content'],
+        },
+      },
+      {
+        name: 'run_benchmark',
+        description: 'Run benchmark suite to evaluate search quality.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            suite_name: { type: 'string' },
+          },
+        },
+      },
     ],
   };
 });
@@ -292,6 +334,31 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'delete_memory':
         result = await knowledgeBase.deleteMemory(args.memory_id);
+        break;
+
+      case 'save_memory':
+        result = await knowledgeBase.saveMemoryWithGovernance({
+          session_id: args.session_id,
+          content: args.content,
+          state: args.state || 'local_only',
+          aliases: args.aliases || [],
+          path_hints: args.path_hints || [],
+          collection_hints: args.collection_hints || [],
+          source: args.source || 'manual',
+        });
+        break;
+
+      case 'plan_knowledge_update':
+        result = await knowledgeBase.planKnowledgeUpdateDryRun({
+          content: args.content,
+          aliases: args.aliases || [],
+          path_hints: args.path_hints || [],
+          collection_hints: args.collection_hints || [],
+        });
+        break;
+
+      case 'run_benchmark':
+        result = await knowledgeBase.runBenchmark(args.suite_name || null);
         break;
 
       default:

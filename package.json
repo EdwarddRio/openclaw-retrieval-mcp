@@ -9,7 +9,9 @@
     "start:mcp": "node src/mcp-server.js",
     "test": "node --test tests/**/*.test.js",
     "lint": "eslint src/",
-    "healthcheck": "scripts/healthcheck.sh"
+    "healthcheck": "scripts/healthcheck.sh",
+    "benchmark": "node src/benchmark/cli.js",
+    "benchmark:default": "node src/benchmark/cli.js --suite default"
   },
   "dependencies": {
     "fastify": "^4.26.0",

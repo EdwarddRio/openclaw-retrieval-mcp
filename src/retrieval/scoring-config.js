@@ -82,10 +82,6 @@ export class ScoringConfig {
     // File aggregation
     this.fileAggregationWeight = options.fileAggregationWeight ?? 0.35;
     this.fileAggregationCap = options.fileAggregationCap ?? 0.04;
-    this.rulesProfileFileAggregationWeight = options.rulesProfileFileAggregationWeight ?? 0.12;
-    this.rulesProfileFileAggregationCap = options.rulesProfileFileAggregationCap ?? 0.015;
-    this.rulesProfilePathMatchBonus = options.rulesProfilePathMatchBonus ?? 0.002;
-
     // RRF K
     this.rrfK = options.rrfK ?? 60;
 
@@ -100,50 +96,13 @@ export class ScoringConfig {
   }
 
   static load() {
+    // Only 5 core env vars; everything else uses hardcoded defaults.
     return new ScoringConfig({
       denseDefaultWeight: envFloat('SCORING_DENSE_DEFAULT_WEIGHT', 1.0),
       bm25DefaultWeight: envFloat('SCORING_BM25_DEFAULT_WEIGHT', 1.0),
-      denseExactWeight: envFloat('SCORING_DENSE_EXACT_WEIGHT', 0.45),
-      bm25ExactWeight: envFloat('SCORING_BM25_EXACT_WEIGHT', 2.2),
-      densePathWeight: envFloat('SCORING_DENSE_PATH_WEIGHT', 0.4),
-      bm25PathWeight: envFloat('SCORING_BM25_PATH_WEIGHT', 2.0),
-      denseErrorWeight: envFloat('SCORING_DENSE_ERROR_WEIGHT', 0.75),
-      bm25ErrorWeight: envFloat('SCORING_BM25_ERROR_WEIGHT', 1.5),
-      denseConfigWeight: envFloat('SCORING_DENSE_CONFIG_WEIGHT', 0.6),
-      bm25ConfigWeight: envFloat('SCORING_BM25_CONFIG_WEIGHT', 1.8),
-      variantPrimaryWeight: envFloat('SCORING_VARIANT_PRIMARY_WEIGHT', 1.0),
-      variantSimplifiedWeight: envFloat('SCORING_VARIANT_SIMPLIFIED_WEIGHT', 0.92),
-      variantExactSymbolWeight: envFloat('SCORING_VARIANT_EXACT_SYMBOL_WEIGHT', 1.35),
-      variantSymbolContextWeight: envFloat('SCORING_VARIANT_SYMBOL_CONTEXT_WEIGHT', 0.88),
-      variantSplitSymbolWeight: envFloat('SCORING_VARIANT_SPLIT_SYMBOL_WEIGHT', 0.78),
-      variantAliasWeight: envFloat('SCORING_VARIANT_ALIAS_WEIGHT', 0.85),
-      symbolTitleExact: envFloat('SCORING_SYMBOL_TITLE_EXACT', 0.06),
-      symbolTitleContains: envFloat('SCORING_SYMBOL_TITLE_CONTAINS', 0.04),
-      symbolSourceContains: envFloat('SCORING_SYMBOL_SOURCE_CONTAINS', 0.035),
-      symbolContentContains: envFloat('SCORING_SYMBOL_CONTENT_CONTAINS', 0.02),
-      symbolSplitContent: envFloat('SCORING_SYMBOL_SPLIT_CONTENT', 0.012),
-      tokenTitleWeight: envFloat('SCORING_TOKEN_TITLE_WEIGHT', 0.008),
-      tokenSourceWeight: envFloat('SCORING_TOKEN_SOURCE_WEIGHT', 0.004),
-      tokenContentWeight: envFloat('SCORING_TOKEN_CONTENT_WEIGHT', 0.004),
-      tokenHitCap: envInt('SCORING_TOKEN_HIT_CAP', 6),
-      codeIntentBonus: envFloat('SCORING_CODE_INTENT_BONUS', 0.015),
-      ruleIntentBonus: envFloat('SCORING_RULE_INTENT_BONUS', 0.01),
-      pathHintBonus: envFloat('SCORING_PATH_HINT_BONUS', 0.03),
-      collectionHintBonus: envFloat('SCORING_COLLECTION_HINT_BONUS', 0.012),
-      exactMatchBonus: envFloat('SCORING_EXACT_MATCH_BONUS', 0.02),
-      fileAggregationWeight: envFloat('SCORING_FILE_AGG_WEIGHT', 0.35),
-      fileAggregationCap: envFloat('SCORING_FILE_AGG_CAP', 0.04),
-      rulesProfileFileAggregationWeight: envFloat('SCORING_RULES_PROFILE_FILE_AGG_WEIGHT', 0.12),
-      rulesProfileFileAggregationCap: envFloat('SCORING_RULES_PROFILE_FILE_AGG_CAP', 0.015),
-      rulesProfilePathMatchBonus: envFloat('SCORING_RULES_PATH_MATCH_BONUS', 0.002),
       rrfK: envInt('SCORING_RRF_K', 60),
       mmrEnabled: envBool('SCORING_MMR_ENABLED', true),
       mmrLambda: envFloat('SCORING_MMR_LAMBDA', 0.7),
-      mmrThreshold: envFloat('SCORING_MMR_THRESHOLD', 0.85),
-      mmrMinResults: envInt('SCORING_MMR_MIN_RESULTS', 3),
-      mmrDuplicateFloor: envFloat('SCORING_MMR_DUPLICATE_FLOOR', 0.35),
-      mmrDisableExactIntent: envBool('SCORING_MMR_DISABLE_EXACT_INTENT', true),
-      mmrDisablePathIntent: envBool('SCORING_MMR_DISABLE_PATH_INTENT', true),
     });
   }
 }

@@ -6,11 +6,16 @@ import { SearchFacade } from './facades/search.js';
 import { MemoryFacade } from './facades/memory.js';
 import { HealthFacade } from './facades/health.js';
 import { BenchmarkFacade } from './facades/benchmark.js';
+import { BenchmarkHarness } from './benchmark/harness.js';
+import { BENCHMARKS_DIR } from './config.js';
 
 export class KnowledgeBase {
   constructor(options = {}) {
-    this.searchFacade = new SearchFacade(options);
     this.memoryFacade = new MemoryFacade(options);
+    this.searchFacade = new SearchFacade({
+      ...options,
+      memoryStore: this.memoryFacade.localMemory,
+    });
     this.benchmarkFacade = new BenchmarkFacade(options.benchmarkRoot);
     this.healthFacade = new HealthFacade(this.searchFacade, this.memoryFacade, this.benchmarkFacade);
   }
@@ -97,6 +102,22 @@ export class KnowledgeBase {
     return this.memoryFacade.deleteMemory(memoryId);
   }
 
+  saveMemory(options) {
+    return this.memoryFacade.saveMemory(options);
+  }
+
+  async saveMemoryWithGovernance(options) {
+    return this.memoryFacade.saveMemoryWithGovernance(options);
+  }
+
+  async planKnowledgeUpdateDryRun(options) {
+    return this.memoryFacade.planKnowledgeUpdateDryRun(options);
+  }
+
+  listActiveFacts(limit) {
+    return this.memoryFacade.listActiveFacts(limit);
+  }
+
   // ========== Health ==========
 
   async healthSnapshot() {
@@ -127,6 +148,15 @@ export class KnowledgeBase {
 
   benchmarkHistory(suiteName = null, limit = 20) {
     return this.benchmarkFacade.benchmarkHistory(suiteName, limit);
+  }
+
+  async runBenchmark(suiteName = null) {
+    const harness = new BenchmarkHarness({
+      searchFn: (opts) => this.search(opts),
+      scenariosDir: './config/benchmark-scenarios',
+      reportDir: BENCHMARKS_DIR,
+    });
+    return harness.runSuite(suiteName);
   }
 }
 

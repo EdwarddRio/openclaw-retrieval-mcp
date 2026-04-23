@@ -20,31 +20,47 @@ export class KnowledgeBaseSearchService {
     const { query, top_k, doc_type, session_id, include_debug } = options;
 
     try {
-      const searchPlan = buildSearchPlan(query, doc_type, top_k);
-      const allResults = [];
-      const debugInfo = include_debug ? { plan: searchPlan } : null;
-
-      // Memory results
+      // Build memory context if memory store is available
+      let memoryContext = null;
       if (this.memoryStore) {
-        const memoryResults = this.memoryStore.queryMemory(query, Math.min(top_k, 3), session_id);
-        allResults.push(...(memoryResults.items || []).map(item => ({
-          ...item,
-          source: item.source || 'memory',
-          doc_type: 'memory',
-          score: item.score || 0.5,
-          content: item.content,
-          title: '记忆',
-          collection: 'memory',
-        })));
+        try {
+          const memCtx = this.memoryStore.queryMemoryContext(query, Math.min(top_k, 3));
+          memoryContext = memCtx;
+        } catch (err) {
+          logger.warn(`Memory context query failed: ${err.message}`);
+        }
       }
 
-      // Collection results
-      if (this.collectionManager) {
+      const searchPlan = buildSearchPlan(query, doc_type, top_k, memoryContext);
+      const allResults = [];
+      const debugInfo = include_debug ? { plan: searchPlan, memory_context: memoryContext } : null;
+
+      // Memory results (only when route is not static-only)
+      if (this.memoryStore && searchPlan.memoryRoute !== 'static-only') {
+        try {
+          const memoryResults = this.memoryStore.queryMemory(query, Math.min(top_k, 3), session_id);
+          const memItems = (memoryResults.hits || memoryResults.items || []);
+          allResults.push(...memItems.map(item => ({
+            ...item,
+            source: item.source || 'memory',
+            doc_type: 'memory',
+            score: item.score || 0.5,
+            content: item.content,
+            title: item.title || '记忆',
+            collection: 'memory',
+          })));
+        } catch (err) {
+          logger.warn(`Memory search failed: ${err.message}`);
+        }
+      }
+
+      // Collection results (skip if abstain-preferred and no strong evidence)
+      if (this.collectionManager && searchPlan.memoryRoute !== 'abstain-preferred') {
         for (const collectionName of searchPlan.collections) {
           try {
             await this.collectionManager.prepareLazyForQuery(collectionName);
             const state = this.collectionManager.states[collectionName];
-            
+
             if (state && state.retriever) {
               const collectionResults = await state.retriever.search(
                 query,
@@ -61,8 +77,8 @@ export class KnowledgeBaseSearchService {
       }
 
       // Rerank
-      const reranked = rerankResults(searchPlan, allResults, top_k);
-      
+      const reranked = rerankResults(searchPlan, allResults, top_k, memoryContext);
+
       // MMR deduplication
       let finalResults = reranked;
       if (DEFAULT_SCORING.mmrEnabled) {

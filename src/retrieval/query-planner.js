@@ -35,29 +35,7 @@ const RULE_INTENT_KEYWORDS = ['规则', '规范', '约定', 'rule', 'convention'
 const ERROR_INTENT_KEYWORDS = ['报错', '异常', 'error', 'exception', 'traceback', 'stacktrace'];
 const CONFIG_INTENT_KEYWORDS = ['配置', 'config', 'yaml', 'json', '.env'];
 const SYMBOL_LOOKUP_HINTS = ['实现', '调用', '在哪里', '在哪', '函数', '方法', '类', 'symbol', 'def'];
-const RULES_PROFILE_PATH_HINTS = [
-  '.cursor/rules', '.mdc', 'memory.md', 'session-state.md', 'soul.md', 'user.md',
-];
-const RULES_PROFILE_HINTS = [
-  'localmem', 'session', 'fact', 'governance', 'transcript',
-  'reviewqueue', 'promotioncandidate', 'shouldabstain',
-  'evidencechains', 'lazy', 'collection', '按需加载',
-];
-const RULES_PROFILE_STRONG_HINTS = [
-  'cursor机器人', '志明', '称呼', '身份', 'savememory',
-  'queryrules', 'querymemory', '记忆文件', '读取范围',
-  '范围限制', '保持薄', '薄层',
-];
-const RULES_PROFILE_CANONICAL_VARIANTS = [
-  { requiredHints: ['记忆文件', '范围'], anchor: 'memory scope' },
-  { requiredHints: ['读取范围'], anchor: 'memory scope' },
-  { requiredHints: ['范围限制'], anchor: 'memory scope' },
-  { requiredHints: ['savememory', 'localmem'], anchor: 'savememory localmem' },
-  { requiredHints: ['queryrules'], anchor: 'query rules' },
-  { requiredHints: ['querymemory'], anchor: 'query memory' },
-  { requiredHints: ['mcp', '保持薄'], anchor: 'mcp thin layer' },
-  { requiredHints: ['mcp', '薄层'], anchor: 'mcp thin layer' },
-];
+
 
 // ========== SearchPlan Class ==========
 
@@ -72,6 +50,10 @@ export class SearchPlan {
     this.docType = options.docType;
     this.candidateLimit = options.candidateLimit;
     this.queryIntent = options.queryIntent;
+    this.memoryRoute = options.memoryRoute || 'static-only';
+    this.timeFilters = options.timeFilters || [];
+    this.abstainPreferred = options.abstainPreferred || false;
+    this.evidenceGroups = options.evidenceGroups || [];
   }
 }
 
@@ -80,34 +62,34 @@ export class SearchPlan {
 export function buildSearchPlan(query, docType = null, topK = null, memoryContext = null) {
   const normalized = _normalizeQuery(query);
   const symbols = _extractSymbols(normalized);
-  const filteredMemoryContext = _planningMemoryContext(memoryContext);
+  const preparedMemoryContext = _prepareMemoryContext(query, docType, memoryContext);
   const queryIntent = _classifyQueryIntent(normalized, symbols);
   const { variants, variantWeights } = _buildVariants(
     normalized,
     symbols,
     queryIntent,
-    filteredMemoryContext,
+    preparedMemoryContext,
   );
-  
+
   const limitedVariants = variants.slice(0, MAX_QUERY_VARIANTS);
   const limitedVariantWeights = {};
   for (const variant of limitedVariants) {
     limitedVariantWeights[variant] = variantWeights[variant] || 1;
   }
-  
+
   const collections = _routeCollections(
     normalized,
     docType,
     symbols,
     queryIntent,
-    filteredMemoryContext,
+    preparedMemoryContext,
   );
-  
+
   const candidateLimit = Math.max(
     COLLECTION_CANDIDATE_LIMIT,
     (topK || 0) * 2 || COLLECTION_CANDIDATE_LIMIT,
   );
-  
+
   return new SearchPlan({
     rawQuery: query,
     normalizedQuery: normalized,
@@ -118,6 +100,10 @@ export function buildSearchPlan(query, docType = null, topK = null, memoryContex
     docType,
     candidateLimit,
     queryIntent,
+    memoryRoute: preparedMemoryContext.memory_route || 'static-only',
+    timeFilters: preparedMemoryContext.time_filters || [],
+    abstainPreferred: preparedMemoryContext.abstain_preferred || false,
+    evidenceGroups: preparedMemoryContext.evidence_groups || [],
   });
 }
 
@@ -151,10 +137,6 @@ export function rerankResults(plan, results, topK, memoryContext = null, scoring
   let aggWeight = cfg.fileAggregationWeight;
   let aggCap = cfg.fileAggregationCap;
   
-  if (_isRulesProfilePlan(plan)) {
-    aggWeight = cfg.rulesProfileFileAggregationWeight;
-    aggCap = cfg.rulesProfileFileAggregationCap;
-  }
   
   for (const group of fileGroups.values()) {
     group.sort((a, b) => b._rerankScore - a._rerankScore);
@@ -196,6 +178,214 @@ function _planningMemoryContext(memoryContext) {
   };
 }
 
+function _prepareMemoryContext(query, docType, memoryContext) {
+  if (memoryContext && memoryContext._prepared_for_planning) {
+    return { ...memoryContext };
+  }
+
+  const normalizedQuery = _normalizeQuery(query);
+  const filtered = _planningMemoryContext(memoryContext);
+  const timeFilters = _extractTimeFilters(normalizedQuery);
+  const timeFiltered = _applyTimeFilters(filtered, timeFilters);
+  const evidenceGroups = _buildEvidenceGroups(timeFiltered);
+  const memoryRoute = _resolveMemoryRoute(docType, timeFiltered, timeFilters);
+  const abstainPreferred = memoryRoute === 'abstain-preferred';
+
+  return {
+    ...timeFiltered,
+    time_filters: timeFilters,
+    evidence_groups: evidenceGroups,
+    memory_route: memoryRoute,
+    abstain_preferred: abstainPreferred,
+    abstention: {
+      applied: abstainPreferred,
+      reason: abstainPreferred ? 'insufficient_memory_evidence' : null,
+    },
+    _prepared_for_planning: true,
+  };
+}
+
+function _extractTimeFilters(normalizedQuery) {
+  const filters = [];
+  if (/(昨天之后|昨天后|昨天以来|自昨天以来)/.test(normalizedQuery)) {
+    filters.push({ mode: 'after', anchor: 'yesterday', scope: 'memory' });
+  }
+  if (/(最新|最近)/.test(normalizedQuery)) {
+    filters.push({ mode: 'latest', anchor: 'latest', scope: 'memory' });
+  }
+  return filters;
+}
+
+function _applyTimeFilters(memoryContext, timeFilters) {
+  if (!timeFilters || timeFilters.length === 0) {
+    return { ...memoryContext };
+  }
+
+  const filtered = { ...memoryContext };
+  const matchedSessions = [...(filtered.matched_sessions || [])];
+  const matchedFacts = [...(filtered.matched_facts || [])];
+
+  if (!matchedSessions.length && !matchedFacts.length) {
+    filtered.aliases = [];
+    filtered.pathHints = [];
+    filtered.collectionHints = [];
+    return filtered;
+  }
+
+  const referenceTs = _referenceTimestamp(matchedSessions, matchedFacts);
+  if (referenceTs <= 0) return filtered;
+
+  let keptSessions = matchedSessions;
+  let keptFacts = matchedFacts;
+
+  for (const tf of timeFilters) {
+    if (tf.mode === 'after') {
+      const anchorTs = referenceTs - 24 * 60 * 60 * 1000;
+      keptSessions = keptSessions.filter(item => _memoryItemTimestamp(item) >= anchorTs);
+      keptFacts = keptFacts.filter(item => _memoryItemTimestamp(item) >= anchorTs);
+    } else if (tf.mode === 'latest') {
+      keptSessions = _keepLatestItems(keptSessions);
+      keptFacts = _keepLatestItems(keptFacts);
+    }
+  }
+
+  const keptSessionIds = new Set(keptSessions.map(i => i.session_id).filter(Boolean));
+  filtered.matched_sessions = keptSessions;
+  filtered.matched_facts = keptFacts;
+  filtered.matched_turns = (filtered.matched_turns || []).filter(t => keptSessionIds.has(t.session_id));
+
+  const { aliases, pathHints, collectionHints } = _collectMemoryHints(keptSessions, keptFacts);
+  filtered.aliases = aliases;
+  filtered.pathHints = pathHints;
+  filtered.collectionHints = collectionHints;
+  filtered.recency_hint = _latestMemoryTimestampLabel(keptSessions, keptFacts) || filtered.recency_hint;
+
+  if (!keptSessions.length && !keptFacts.length) {
+    filtered.confidence = 0.0;
+  }
+  return filtered;
+}
+
+function _resolveMemoryRoute(docType, memoryContext, timeFilters) {
+  if (docType) return 'static-only';
+  if (memoryContext.abstain_preferred) return 'abstain-preferred';
+
+  const matchedSessions = memoryContext.matched_sessions || [];
+  const matchedFacts = memoryContext.matched_facts || [];
+
+  if (timeFilters && timeFilters.length && (matchedSessions.length || matchedFacts.length)) {
+    return 'timeline-constrained';
+  }
+  if (matchedFacts.length && !matchedSessions.length) {
+    return 'fact-assisted';
+  }
+  if (matchedSessions.length) {
+    return 'session-assisted';
+  }
+  if (memoryContext.memory_intent || timeFilters.length || (memoryContext.abstained_memories || []).length) {
+    return 'abstain-preferred';
+  }
+  return 'static-only';
+}
+
+function _buildEvidenceGroups(memoryContext) {
+  const groups = [];
+  for (const session of memoryContext.matched_sessions || []) {
+    groups.push({
+      evidence_type: 'session',
+      evidence_id: session.session_id,
+      score: session.score || 0.0,
+      updated_at: session.updated_at,
+      aliases: [...(session.aliases || [])],
+      path_hints: [...(session.path_hints || [])],
+      collection_hints: [...(session.collection_hints || [])],
+    });
+  }
+  for (const fact of memoryContext.matched_facts || []) {
+    groups.push({
+      evidence_type: 'fact',
+      evidence_id: fact.memory_id,
+      score: fact.score || 0.0,
+      updated_at: fact.updated_at,
+      aliases: [...(fact.aliases || [])],
+      path_hints: [...(fact.path_hints || [])],
+      collection_hints: [...(fact.collection_hints || [])],
+    });
+  }
+  groups.sort((a, b) => {
+    const scoreDiff = (b.score || 0) - (a.score || 0);
+    if (scoreDiff !== 0) return scoreDiff;
+    const ta = _safeIsoToEpochMs(a.updated_at);
+    const tb = _safeIsoToEpochMs(b.updated_at);
+    return tb - ta;
+  });
+  return groups;
+}
+
+function _collectMemoryHints(matchedSessions, matchedFacts) {
+  const aliases = [];
+  const pathHints = [];
+  const collectionHints = [];
+  const pushUnique = (arr, vals) => {
+    for (const v of vals) {
+      if (v && !arr.includes(v)) arr.push(v);
+    }
+  };
+  for (const s of matchedSessions) {
+    pushUnique(aliases, s.aliases || []);
+    pushUnique(pathHints, s.path_hints || []);
+    pushUnique(collectionHints, s.collection_hints || []);
+  }
+  for (const f of matchedFacts) {
+    pushUnique(aliases, f.aliases || []);
+    pushUnique(pathHints, f.path_hints || []);
+    pushUnique(collectionHints, f.collection_hints || []);
+  }
+  return { aliases, pathHints, collectionHints };
+}
+
+function _referenceTimestamp(matchedSessions, matchedFacts) {
+  const timestamps = [...matchedSessions, ...matchedFacts]
+    .map(_memoryItemTimestamp)
+    .filter(ts => ts > 0);
+  return timestamps.length ? Math.max(...timestamps) : 0;
+}
+
+function _keepLatestItems(items) {
+  if (!items.length) return [];
+  const latestTs = Math.max(...items.map(_memoryItemTimestamp));
+  return items.filter(i => _memoryItemTimestamp(i) === latestTs);
+}
+
+function _memoryItemTimestamp(item) {
+  return _safeIsoToEpochMs(item.updated_at || item.session_date);
+}
+
+function _latestMemoryTimestampLabel(matchedSessions, matchedFacts) {
+  let latestLabel = null;
+  let latestTs = 0;
+  for (const item of [...matchedSessions, ...matchedFacts]) {
+    const label = item.updated_at || item.session_date;
+    const ts = _safeIsoToEpochMs(label);
+    if (ts >= latestTs) {
+      latestTs = ts;
+      latestLabel = label;
+    }
+  }
+  return latestLabel;
+}
+
+function _safeIsoToEpochMs(value) {
+  if (!value) return 0;
+  let candidate = String(value);
+  if (candidate.length === 10) candidate = `${candidate}T00:00:00`;
+  try {
+    return new Date(candidate).getTime();
+  } catch {
+    return 0;
+  }
+}
+
 function _normalizeQuery(query) {
   let normalized = query.replace(/`/g, ' ').replace(/"/g, ' ').replace(/'/g, ' ');
   normalized = normalized.replace(/\s+/g, ' ').trim();
@@ -227,13 +417,6 @@ function _buildVariants(normalizedQuery, symbols, queryIntent, memoryContext = n
   if (simplified && !variants.includes(simplified)) {
     variants.push(simplified);
     variantWeights[simplified] = cfg.variantSimplifiedWeight;
-  }
-
-  for (const anchorVariant of _rulesProfileAnchorVariants(normalizedQuery)) {
-    if (!variants.includes(anchorVariant)) {
-      variants.push(anchorVariant);
-      variantWeights[anchorVariant] = cfg.variantAliasWeight;
-    }
   }
 
   for (const symbol of symbols) {
@@ -316,26 +499,19 @@ function _looksLikeCodeSymbol(symbol) {
 
 function _classifyQueryIntent(normalizedQuery, symbols) {
   const lowered = normalizedQuery.toLowerCase();
-  const rulesProfileQuery = _isRulesProfileQuery(normalizedQuery);
 
-  if (PATHISH_RE.test(normalizedQuery)) {
-    if (_isRulesProfilePathLookup(normalizedQuery)) return 'rulelookup';
-    return 'path';
-  }
+  if (PATHISH_RE.test(normalizedQuery)) return 'path';
 
   if (ERROR_INTENT_KEYWORDS.some(keyword => lowered.includes(keyword.toLowerCase()))) return 'error';
 
   if (symbols.length > 0) {
     const exactSymbolLookup = _isExactSymbolLookup(normalizedQuery, symbols);
-    if (rulesProfileQuery && !exactSymbolLookup) return 'symbollookup';
     if (exactSymbolLookup) return 'exactsymbol';
     if (CONFIG_INTENT_KEYWORDS.some(keyword => lowered.includes(keyword.toLowerCase()))) return 'configkey';
-    if (rulesProfileQuery) return 'symbollookup';
     return 'exactsymbol';
   }
 
   if (CONFIG_INTENT_KEYWORDS.some(keyword => lowered.includes(keyword.toLowerCase()))) return 'configkey';
-  if (rulesProfileQuery) return 'rulelookup';
   if (RULE_INTENT_KEYWORDS.some(keyword => lowered.includes(keyword.toLowerCase()))) return 'rulelookup';
 
   return 'naturallanguage';
@@ -346,49 +522,6 @@ function _isExactSymbolLookup(normalizedQuery, symbols) {
   if (symbols.length === 1 && normalizedQuery.trim() === symbols[0]) return true;
   if (SYMBOL_LOOKUP_HINTS.some(hint => lowered.includes(hint.toLowerCase()))) return true;
   return CODE_QUERY_KEYWORDS.some(keyword => lowered.includes(keyword.toLowerCase()));
-}
-
-function _isRulesProfilePathLookup(normalizedQuery) {
-  const lowered = normalizedQuery.toLowerCase();
-  return RULES_PROFILE_PATH_HINTS.some(hint => lowered.includes(hint.toLowerCase()));
-}
-
-function _isRulesProfileQuery(normalizedQuery) {
-  const lowered = normalizedQuery.toLowerCase();
-  let score = 0;
-
-  for (const hint of RULES_PROFILE_PATH_HINTS) {
-    if (lowered.includes(hint.toLowerCase())) score += 2;
-  }
-  for (const hint of RULES_PROFILE_STRONG_HINTS) {
-    if (lowered.includes(hint.toLowerCase())) score += 2;
-  }
-  for (const hint of RULES_PROFILE_HINTS) {
-    if (lowered.includes(hint.toLowerCase())) score += 1;
-  }
-  if (RULE_INTENT_KEYWORDS.some(keyword => lowered.includes(keyword.toLowerCase()))) score += 1;
-
-  return score >= 2;
-}
-
-function _rulesProfileAnchorVariants(normalizedQuery) {
-  const lowered = normalizedQuery.toLowerCase();
-  const anchors = [];
-
-  for (const { requiredHints, anchor } of RULES_PROFILE_CANONICAL_VARIANTS) {
-    const allHintsPresent = requiredHints.every(hint => lowered.includes(hint.toLowerCase()));
-    if (allHintsPresent && !anchors.includes(anchor)) anchors.push(anchor);
-  }
-
-  return anchors;
-}
-
-function _matchedRulesProfilePathHints(normalizedQuery, source) {
-  const loweredQuery = normalizedQuery.toLowerCase();
-  const loweredSource = source.toLowerCase();
-  return RULES_PROFILE_PATH_HINTS.filter(hint => 
-    loweredQuery.includes(hint.toLowerCase()) && loweredSource.includes(hint.toLowerCase())
-  );
 }
 
 function _resultKey(result) {
@@ -413,8 +546,6 @@ function _rerankScore(plan, result, memoryContext = null, scoring = null) {
   const sourceLower = source.toLowerCase();
   const contentLower = content.toLowerCase();
   const normalizedLower = (plan.normalizedQuery || '').toLowerCase();
-  const rulesProfileQuery = _isRulesProfilePlan(plan);
-
   // Symbol matching
   const symbols = plan.symbols || [];
   for (const symbol of symbols) {
@@ -429,7 +560,7 @@ function _rerankScore(plan, result, memoryContext = null, scoring = null) {
       breakdown.symbolTitleContains = Math.round((breakdown.symbolTitleContains || 0) + cfg.symbolTitleContains * 10000) / 10000;
     }
 
-    if (sourceLower.includes(symbolLower) && !rulesProfileQuery) {
+    if (sourceLower.includes(symbolLower)) {
       score += cfg.symbolSourceContains;
       breakdown.symbolSourceContains = Math.round((breakdown.symbolSourceContains || 0) + cfg.symbolSourceContains * 10000) / 10000;
     }
@@ -452,7 +583,7 @@ function _rerankScore(plan, result, memoryContext = null, scoring = null) {
   for (const token of queryTokens) {
     if (titleLower.includes(token)) titleHits++;
     if (sourceLower.includes(token)) sourceHits++;
-    if (rulesProfileQuery && contentLower.includes(token)) contentHits++;
+    if (contentLower.includes(token)) contentHits++;
   }
 
   const titleBonus = Math.min(titleHits, cfg.tokenHitCap) * cfg.tokenTitleWeight;
@@ -482,17 +613,6 @@ function _rerankScore(plan, result, memoryContext = null, scoring = null) {
     }
   }
 
-  // Rules profile path matching
-  const normalizedQuery = plan.normalizedQuery || '';
-  if (_isRulesProfilePathLookup(normalizedQuery)) {
-    const matchedPathHints = _matchedRulesProfilePathHints(normalizedQuery, source);
-    if (matchedPathHints.length > 0) {
-      const pathBonus = matchedPathHints.length * cfg.rulesProfilePathMatchBonus;
-      score += pathBonus;
-      breakdown.rulesProfilePathMatchBonus = Math.round(pathBonus * 10000) / 10000;
-    }
-  }
-
   // Memory context hints
   const pathHints = (memoryContext || {}).pathHints || [];
   if (source && pathHints.includes(source)) {
@@ -518,11 +638,6 @@ function _rerankScore(plan, result, memoryContext = null, scoring = null) {
 function _queryTokens(plan) {
   const query = plan.normalizedQuery || '';
   return tokenize(query);
-}
-
-function _isRulesProfilePlan(plan) {
-  const queryIntent = plan.queryIntent || '';
-  return queryIntent === 'rulelookup' || queryIntent === 'symbollookup' || _isRulesProfileQuery(plan.normalizedQuery || '');
 }
 
 function _isCodeIntent(plan) {

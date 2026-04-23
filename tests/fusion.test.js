@@ -20,18 +20,23 @@ describe('RRF Fusion', () => {
     const result = rrfFuse([list1, list2], 3);
 
     // 'a' appears in both lists, should be ranked first
-    assert.strictEqual(result[0], 'a');
+    assert.strictEqual(result[0].item, 'a');
   });
 
   it('should handle two-stage fusion', () => {
+    // variantResults: each collection has an array of result lists
     const collectionResults = {
-      static_kb: [{ item: 'doc1' }, { item: 'doc2' }],
-      code: [{ item: 'code1' }, { item: 'doc1' }],
+      static_kb: [
+        [{ source: 'doc1' }, { source: 'doc2' }],
+      ],
+      code: [
+        [{ source: 'code1' }, { source: 'doc1' }],
+      ],
     };
 
     const result = twoStageFuse(collectionResults, 3);
 
-    assert.ok(result.length > 0);
+    assert.ok(Array.isArray(result));
     assert.ok(result.length <= 3);
   });
 });

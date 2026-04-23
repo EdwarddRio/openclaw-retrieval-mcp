@@ -1,0 +1,34 @@
+{
+  "name": "default",
+  "description": "Default benchmark suite for openclaw-engine-js search quality regression testing.",
+  "defaults": {
+    "top_k": 5
+  },
+  "cases": [
+    {
+      "id": "rules-001",
+      "query": "OpenClaw 的端口配置在哪里",
+      "expected_hits": ["端口", "8901"],
+      "expected_recalls": ["config", "env"],
+      "tags": ["rules", "config"],
+      "notes": "Should find configuration docs mentioning port settings."
+    },
+    {
+      "id": "code-001",
+      "query": "UserService 实现在哪",
+      "doc_type": "code",
+      "expected_hits": ["UserService"],
+      "min_recall": 0.5,
+      "tags": ["code", "symbol"],
+      "notes": "Should find code files containing UserService."
+    },
+    {
+      "id": "memory-001",
+      "query": "上次约定的规则",
+      "expected_hits": ["约定", "规则"],
+      "min_recall": 0.3,
+      "tags": ["memory"],
+      "notes": "Should recall recent memory about rules/conventions."
+    }
+  ]
+}

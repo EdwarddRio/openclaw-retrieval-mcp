@@ -63,7 +63,7 @@ class BM25Okapi {
     }
 
     // Compute IDF for each term
-    const idfSum = 0;
+    let idfSum = 0;
     const negativeIdfs = [];
 
     for (const [word, freq] of Object.entries(nd)) {

@@ -10,7 +10,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { logger, LOCALMEM_DIR, LOCALMEM_FACT_MAX_AGE_DAYS, PROJECT_ROOT } from '../config.js';
 import { SqliteStore } from './sqlite-store.js';
 import { ChatTurn, ChatSession, MemoryFact, isoNow, canonicalKeyForText, TRIAGE_CONFIRM_SIGNALS, TRIAGE_DISCARD_SIGNALS, TRIAGE_MIN_CONTENT_LENGTH, TRIAGE_MAX_CONTENT_LENGTH } from './models.js';
-import { appendEvent, queryEvents } from './timeline.js';
+import { planKnowledgeUpdate, extractSessionReviewCandidates } from './governance.js';
 import { publishCandidate, publishWikiPage, rebuildWikiIndex, slugify } from './wiki-publisher.js';
 
 // ========== V2 saveable states ==========
@@ -34,7 +34,6 @@ export class LocalMemoryStore {
     this._root = path.resolve(rootDir);
     this._projectRoot = options.projectRoot || PROJECT_ROOT;
     this._dbPath = path.join(this._root, 'memory.db');
-    this._timelinePath = path.join(this._root, 'timeline', 'events.jsonl');
     this._statePath = path.join(this._root, 'meta', 'state.json');
     
     this._factMaxAgeDays = options.factMaxAgeDays || LOCALMEM_FACT_MAX_AGE_DAYS;
@@ -110,6 +109,10 @@ export class LocalMemoryStore {
 
   queryMemory(query, topK = 3, sessionId = null) {
     return this._store.queryMemory(query, topK);
+  }
+
+  listActiveFacts(limit = 1000) {
+    return this._store.listActiveFacts(limit);
   }
 
   queryMemoryFull(query, topK = 3, sessionId = null) {
@@ -271,12 +274,11 @@ export class LocalMemoryStore {
 
     // Timeline event
     try {
-      appendEvent(this._timelinePath, {
+      this._store.addEvent({
         memory_id: memoryId,
-        session_id: session_id,
         event_type: 'memory_created',
         created_at: now,
-        payload: { state: normalizedState, source: source },
+        event_data: { state: normalizedState, source: source },
       });
     } catch (error) {
       logger.warn(`Failed to append timeline event: ${error}`);
@@ -303,11 +305,11 @@ export class LocalMemoryStore {
     if (success) {
       const memory = this._store.getMemory(memoryId);
       if (memory) {
-        appendEvent(this._timelinePath, {
+        this._store.addEvent({
           memory_id: memoryId,
-          session_id: memory.session_id,
           event_type: 'memory_deleted',
           created_at: isoNow(),
+          event_data: {},
         });
       }
     }
@@ -323,8 +325,19 @@ export class LocalMemoryStore {
   }
 
   getMemoryTimeline(options = {}) {
-    const { memory_id, session_id, limit = 50 } = options;
-    return queryEvents(this._timelinePath, { memory_id, session_id, limit });
+    const { memory_id, limit = 50 } = options;
+    const events = this._store.getTimeline(memory_id, limit);
+    return {
+      filters: { memory_id, limit },
+      event_count: events.length,
+      events: events.map(e => ({
+        event_id: e.id,
+        memory_id: e.memory_id,
+        event_type: e.event_type,
+        created_at: e.created_at,
+        payload: e.payload_json ? JSON.parse(e.payload_json) : {},
+      })),
+    };
   }
 
   // ========== Memory Choice & Review (aligned with Python localmem_v2) ==========
@@ -505,15 +518,15 @@ export class LocalMemoryStore {
   }
 
   /**
-   * Auto-triage a conversation turn for memory extraction.
+   * Auto-triage a conversation turn for memory extraction (async, with governance).
    */
-  autoTriageTurn(options) {
+  async autoTriageTurn(options) {
     const { session_id, role, content, previous_role, previous_content, persist = true, side_llm_gateway } = options;
     const candidates = [];
 
     if (role === 'assistant' && this._shouldKeepCandidate(content, side_llm_gateway)) {
       if (persist) {
-        const saved = this.saveMemory({
+        const saved = await this.saveMemoryWithGovernance({
           session_id,
           content: content.trim(),
           state: 'tentative',
@@ -535,7 +548,7 @@ export class LocalMemoryStore {
       const extracted = this._extractMemoryFromUserMessage(content, previous_content);
       if (extracted && this._shouldKeepCandidate(extracted, side_llm_gateway)) {
         if (persist) {
-          const saved = this.saveMemory({
+          const saved = await this.saveMemoryWithGovernance({
             session_id,
             content: extracted,
             state: 'tentative',
@@ -560,6 +573,87 @@ export class LocalMemoryStore {
     }
 
     return candidates;
+  }
+
+  /**
+   * Save memory with governance conflict detection.
+   * For manual sources, falls back to plain saveMemory.
+   */
+  async saveMemoryWithGovernance(options) {
+    const source = options.source || 'manual';
+    const isAutoSource = ['auto_triage', 'user_explicit', 'auto_draft'].includes(source);
+
+    if (!isAutoSource) {
+      return this.saveMemory(options);
+    }
+
+    const facts = this._store.listActiveFacts(500);
+    const plan = await planKnowledgeUpdate({
+      content: options.content || '',
+      aliases: options.aliases || [],
+      path_hints: options.path_hints || [],
+      collection_hints: options.collection_hints || [],
+      facts,
+    });
+
+    if (plan.strategy === 'keep_existing') {
+      return {
+        memory_id: plan.suggestedMemoryId,
+        content: options.content,
+        state: options.state || 'tentative',
+        status: 'governed_kept',
+        governance: plan,
+      };
+    }
+
+    if (plan.strategy === 'supersede_existing' && plan.suggestedMemoryId) {
+      return this.supersedeMemory(plan.suggestedMemoryId, options);
+    }
+
+    if (plan.strategy === 'resolve_conflict') {
+      // Save as tentative with conflict flag for manual resolution
+      const saved = this.saveMemory({
+        ...options,
+        state: 'tentative',
+      });
+      saved.governance = plan;
+      saved.governance_note = `语义冲突检测到 ${plan.conflictMemoryIds.length} 条相关记忆，建议人工审阅`;
+      return saved;
+    }
+
+    // create_new
+    return this.saveMemory(options);
+  }
+
+  supersedeMemory(oldMemoryId, options) {
+    const memoryId = `${options.session_id || 'manual'}-${crypto.randomBytes(4).toString('hex')}`;
+    const now = options.created_at || isoNow();
+    const newMemory = new MemoryFact({
+      memory_id: memoryId,
+      session_id: options.session_id,
+      content: options.content.trim(),
+      state: options.state || 'tentative',
+      aliases: [...new Set(options.aliases || [])],
+      path_hints: this._filterPathHints(options.path_hints || []),
+      collection_hints: [...new Set(options.collection_hints || [])],
+      source: options.source || 'manual',
+      created_at: now,
+    });
+    return this._store.supersedeMemory(oldMemoryId, newMemory);
+  }
+
+  /**
+   * Plan a knowledge update without persisting (dry-run governance).
+   */
+  async planKnowledgeUpdateDryRun(options) {
+    const facts = this._store.listActiveFacts(500);
+    return planKnowledgeUpdate({
+      content: options.content || '',
+      aliases: options.aliases || [],
+      path_hints: options.path_hints || [],
+      collection_hints: options.collection_hints || [],
+      facts,
+    });
   }
 
   _shouldKeepCandidate(content, sideLlmGateway) {
@@ -625,13 +719,9 @@ export class LocalMemoryStore {
     }
 
     const metaDir = path.join(this._root, 'meta');
-    const timelineDir = path.join(this._root, 'timeline');
 
     if (!fs.existsSync(metaDir)) {
       fs.mkdirSync(metaDir, { recursive: true });
-    }
-    if (!fs.existsSync(timelineDir)) {
-      fs.mkdirSync(timelineDir, { recursive: true });
     }
 
     if (!fs.existsSync(this._statePath)) {

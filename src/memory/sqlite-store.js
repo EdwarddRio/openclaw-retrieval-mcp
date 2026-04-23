@@ -585,6 +585,39 @@ export class SqliteStore {
     `);
     return stmt.get(`${today}%`).c;
   }
+
+  listActiveFacts(limit = 1000) {
+    const stmt = this.db.prepare(`
+      SELECT * FROM memory_items
+      WHERE status = 'active' AND state != 'discarded'
+      ORDER BY updated_at DESC
+      LIMIT ?
+    `);
+    return stmt.all(limit).map(r => this._rowToMemory(r));
+  }
+
+  supersedeMemory(oldMemoryId, newMemory) {
+    const now = newMemory.created_at || new Date().toISOString();
+    // Mark old memory as archived/superseded
+    this.db.prepare(`
+      UPDATE memory_items
+      SET status = 'archived', state = 'discarded', updated_at = ?
+      WHERE id = ?
+    `).run(now, oldMemoryId);
+
+    // Insert new memory
+    const saved = this.saveMemory(newMemory);
+
+    // Record event
+    this.addEvent({
+      memory_id: oldMemoryId,
+      event_type: 'memory_superseded',
+      created_at: now,
+      event_data: { new_memory_id: saved.memory_id },
+    });
+
+    return { oldMemoryId, newMemory: saved };
+  }
 }
 
 export default SqliteStore;

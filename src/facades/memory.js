@@ -78,6 +78,22 @@ export class MemoryFacade {
   deleteMemory(memoryId) {
     return this.localMemory.deleteMemory(memoryId);
   }
+
+  saveMemory(options) {
+    return this.localMemory.saveMemory(options);
+  }
+
+  async saveMemoryWithGovernance(options) {
+    return this.localMemory.saveMemoryWithGovernance(options);
+  }
+
+  async planKnowledgeUpdateDryRun(options) {
+    return this.localMemory.planKnowledgeUpdateDryRun(options);
+  }
+
+  listActiveFacts(limit) {
+    return this.localMemory.listActiveFacts(limit);
+  }
 }
 
 export default MemoryFacade;

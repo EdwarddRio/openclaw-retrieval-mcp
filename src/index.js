@@ -176,6 +176,35 @@ fastify.post('/api/memory/session/import-transcript', async (request, reply) => 
   }
 });
 
+fastify.post('/api/memory/save', async (request, reply) => {
+  try {
+    const { session_id, content, state, aliases, path_hints, collection_hints, source, use_governance } = request.body;
+    const options = {
+      session_id, content, state, aliases, path_hints, collection_hints, source: source || 'manual',
+    };
+    const result = use_governance
+      ? await knowledgeBase.saveMemoryWithGovernance(options)
+      : knowledgeBase.saveMemory(options);
+    return { success: true, ...result };
+  } catch (err) {
+    reply.code(500);
+    return KnowledgeBasePresenter.presentError(err, 500);
+  }
+});
+
+fastify.post('/api/memory/governance/plan-update', async (request, reply) => {
+  try {
+    const { content, aliases, path_hints, collection_hints } = request.body;
+    const result = await knowledgeBase.planKnowledgeUpdateDryRun({
+      content, aliases, path_hints, collection_hints,
+    });
+    return { success: true, ...result };
+  } catch (err) {
+    reply.code(500);
+    return KnowledgeBasePresenter.presentError(err, 500);
+  }
+});
+
 // ========== Health Endpoints ==========
 
 fastify.get('/api/health', async (request, reply) => {
@@ -226,6 +255,17 @@ fastify.get('/api/benchmarks/history', async (request, reply) => {
     const { suite_name, limit } = request.query;
     const result = await knowledgeBase.benchmarkHistory(suite_name, parseInt(limit) || 20);
     return result || [];
+  } catch (err) {
+    reply.code(500);
+    return KnowledgeBasePresenter.presentError(err, 500);
+  }
+});
+
+fastify.post('/api/benchmarks/run', async (request, reply) => {
+  try {
+    const { suite_name } = request.body || {};
+    const result = await knowledgeBase.runBenchmark(suite_name);
+    return { success: true, suites: result };
   } catch (err) {
     reply.code(500);
     return KnowledgeBasePresenter.presentError(err, 500);
