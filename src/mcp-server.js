@@ -1,6 +1,7 @@
 /**
  * MCP server entry point.
- * Exposes 16 tools via stdio using @modelcontextprotocol/sdk.
+ * Exposes tools via stdio using @modelcontextprotocol/sdk.
+ * Architecture: localMem (memory) + LLMWiki (knowledge) — no static_kb.
  */
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
@@ -13,9 +14,6 @@ import { KnowledgeBase } from './knowledge-base.js';
 import {
   SEARCH_TOOL_INPUT_SCHEMA,
   MEMORY_QUERY_INPUT_SCHEMA,
-  SAVE_MEMORY_CHOICE_INPUT_SCHEMA,
-  LIST_MEMORY_REVIEWS_INPUT_SCHEMA,
-  REVIEW_MEMORY_CANDIDATE_INPUT_SCHEMA,
 } from './api/contract.js';
 
 const knowledgeBase = new KnowledgeBase();
@@ -36,19 +34,10 @@ const server = new Server(
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   return {
     tools: [
-      {
-        name: 'query_static_kb',
-        description: 'Search the workspace knowledge base. Returns relevant knowledge fragments + session/transcript binding info.',
-        inputSchema: SEARCH_TOOL_INPUT_SCHEMA,
-      },
-      {
-        name: 'rebuild_index',
-        description: 'Rebuild the workspace knowledge base index when project files change.',
-        inputSchema: { type: 'object', properties: {} },
-      },
+
       {
         name: 'query_memory',
-        description: 'Query localMem v2 memory hits, tentative items, and review queue.',
+        description: 'Query localMem memory hits and tentative items.',
         inputSchema: MEMORY_QUERY_INPUT_SCHEMA,
       },
       {
@@ -78,21 +67,6 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             limit: { type: 'integer' },
           },
         },
-      },
-      {
-        name: 'save_memory_choice',
-        description: 'Record explicit user choice for a localMem v2 memory.',
-        inputSchema: SAVE_MEMORY_CHOICE_INPUT_SCHEMA,
-      },
-      {
-        name: 'list_memory_reviews',
-        description: 'List localMem v2 pending review items.',
-        inputSchema: LIST_MEMORY_REVIEWS_INPUT_SCHEMA,
-      },
-      {
-        name: 'review_memory_candidate',
-        description: 'Execute review action on a localMem v2 candidate.',
-        inputSchema: REVIEW_MEMORY_CANDIDATE_INPUT_SCHEMA,
       },
       {
         name: 'append_session_turn',
@@ -170,7 +144,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: 'delete_memory',
-        description: 'Delete a memory (mark as discarded).',
+        description: 'Delete a memory permanently from the database.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -187,7 +161,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           properties: {
             session_id: { type: 'string' },
             content: { type: 'string' },
-            state: { type: 'string', enum: ['tentative', 'local_only', 'manual_only', 'candidate_on_reuse', 'wiki_candidate', 'published', 'discarded'] },
+            state: { type: 'string', enum: ['tentative', 'kept'] },
             aliases: { type: 'array', items: { type: 'string' } },
             path_hints: { type: 'array', items: { type: 'string' } },
             collection_hints: { type: 'array', items: { type: 'string' } },
@@ -221,6 +195,92 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           },
         },
       },
+      {
+        name: 'wiki_detect_changes',
+        description: 'Detect changes in raw source files since last wiki compilation. Returns added/modified/deleted files with content for LLM to compile. This is the first step in incremental wiki compilation.',
+        inputSchema: { type: 'object', properties: {} },
+      },
+      {
+        name: 'wiki_compile_prompt',
+        description: 'Generate a compilation prompt for changed raw sources. Use after wiki_detect_changes if you want the structured prompt format with schema reference.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            include_content: { type: 'boolean', default: true, description: 'Include file content in prompt' },
+          },
+        },
+      },
+      {
+        name: 'wiki_save_page',
+        description: 'Save a compiled wiki page to the wiki directory. Call this after LLM compiles raw material into a structured wiki page.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            source_path: { type: 'string', description: 'Original source file path' },
+            wiki_page_name: { type: 'string', description: 'Wiki page filename (e.g. "用户画像与偏好.md")' },
+            content: { type: 'string', description: 'Compiled wiki page content in Markdown' },
+            source_id: { type: 'string', description: 'Source ID from raw-sources.json' },
+          },
+          required: ['source_path', 'wiki_page_name', 'content', 'source_id'],
+        },
+      },
+      {
+        name: 'wiki_remove_page',
+        description: 'Remove a wiki page when its source file is deleted.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            wiki_page_name: { type: 'string', description: 'Wiki page filename to remove' },
+          },
+          required: ['wiki_page_name'],
+        },
+      },
+      {
+        name: 'wiki_update_index',
+        description: 'Update the wiki/index.md with current page listing. Call after saving/removing pages.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            pages: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  name: { type: 'string' },
+                  title: { type: 'string' },
+                  sourceId: { type: 'string' },
+                  lastCompiled: { type: 'string' },
+                },
+                required: ['name', 'title', 'sourceId'],
+              },
+              description: 'Array of wiki page metadata',
+            },
+          },
+          required: ['pages'],
+        },
+      },
+      {
+        name: 'wiki_status',
+        description: 'Get wiki compilation status: manifest entries, existing wiki pages, etc.',
+        inputSchema: { type: 'object', properties: {} },
+      },
+      {
+        name: 'wiki_search',
+        description: 'Search wiki pages by keywords. Wiki owns its own search independent of any BM25 index. Use this to find relevant wiki pages before reading them.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            query: { type: 'string', description: 'Search query keywords' },
+            top_k: { type: 'integer', description: 'Max results (default 5)', default: 5 },
+          },
+          required: ['query'],
+        },
+      },
+      {
+        name: 'wiki_check_stale',
+        description: 'Check if wiki is stale (raw sources changed since last compilation). Returns stale status and change summary without reading file contents.',
+        inputSchema: { type: 'object', properties: {} },
+      },
     ],
   };
 });
@@ -232,20 +292,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     let result;
 
     switch (name) {
-      case 'query_static_kb':
-        result = await knowledgeBase.search({
-          query: args.query,
-          top_k: args.top_k,
-          doc_type: args.doc_type,
-          session_id: args.session_id,
-          include_debug: false,
-        });
-        break;
-
-      case 'rebuild_index':
-        result = await knowledgeBase.rebuild();
-        break;
-
       case 'query_memory':
         result = await knowledgeBase.queryMemory(args.query, args.top_k);
         break;
@@ -263,27 +309,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           memory_id: args.memory_id,
           session_id: args.session_id,
           limit: args.limit,
-        });
-        break;
-
-      case 'save_memory_choice':
-        result = await knowledgeBase.saveMemoryChoice({
-          memory_id: args.memory_id,
-          choice: args.choice,
-          updated_at: args.updated_at,
-        });
-        break;
-
-      case 'list_memory_reviews':
-        result = await knowledgeBase.listMemoryReviews(args.limit);
-        break;
-
-      case 'review_memory_candidate':
-        result = await knowledgeBase.reviewMemoryCandidate({
-          memory_id: args.memory_id,
-          action: args.action,
-          publish_target: args.publish_target,
-          updated_at: args.updated_at,
         });
         break;
 
@@ -340,7 +365,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         result = await knowledgeBase.saveMemoryWithGovernance({
           session_id: args.session_id,
           content: args.content,
-          state: args.state || 'local_only',
+          state: args.state || 'tentative',
           aliases: args.aliases || [],
           path_hints: args.path_hints || [],
           collection_hints: args.collection_hints || [],
@@ -359,6 +384,45 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'run_benchmark':
         result = await knowledgeBase.runBenchmark(args.suite_name || null);
+        break;
+
+      case 'wiki_detect_changes':
+        result = knowledgeBase.wikiDetectChanges();
+        break;
+
+      case 'wiki_compile_prompt': {
+        const changes = knowledgeBase.wikiDetectChanges();
+        result = knowledgeBase.wikiGenerateCompilePrompt(changes);
+        break;
+      }
+
+      case 'wiki_save_page':
+        result = knowledgeBase.wikiSavePage({
+          sourcePath: args.source_path,
+          wikiPageName: args.wiki_page_name,
+          content: args.content,
+          sourceId: args.source_id,
+        });
+        break;
+
+      case 'wiki_remove_page':
+        result = knowledgeBase.wikiRemovePage(args.wiki_page_name);
+        break;
+
+      case 'wiki_update_index':
+        result = knowledgeBase.wikiUpdateIndex(args.pages);
+        break;
+
+      case 'wiki_status':
+        result = knowledgeBase.wikiGetStatus();
+        break;
+
+      case 'wiki_search':
+        result = knowledgeBase.wikiSearch(args.query, args.top_k || 5);
+        break;
+
+      case 'wiki_check_stale':
+        result = knowledgeBase.wikiIsStale();
         break;
 
       default:

@@ -10,13 +10,16 @@ import { v4 as uuidv4 } from 'uuid';
 import { logger, LOCALMEM_DIR, LOCALMEM_FACT_MAX_AGE_DAYS, PROJECT_ROOT } from '../config.js';
 import { SqliteStore } from './sqlite-store.js';
 import { ChatTurn, ChatSession, MemoryFact, isoNow, canonicalKeyForText, TRIAGE_CONFIRM_SIGNALS, TRIAGE_DISCARD_SIGNALS, TRIAGE_MIN_CONTENT_LENGTH, TRIAGE_MAX_CONTENT_LENGTH } from './models.js';
-import { planKnowledgeUpdate, extractSessionReviewCandidates } from './governance.js';
-import { publishCandidate, publishWikiPage, rebuildWikiIndex, slugify } from './wiki-publisher.js';
+import { planKnowledgeUpdate } from './governance.js';
 
-// ========== V2 saveable states ==========
-const SAVEABLE_V2_STATES = new Set([
-  'tentative', 'local_only', 'manual_only', 'candidate_on_reuse',
-  'wiki_candidate', 'published', 'discarded',
+// ========== Saveable states ==========
+// localMem has two states:
+//   tentative — temporary, auto-extracted, expires after 7 days unless confirmed
+//   kept      — permanent, user-confirmed, persists in SQLite indefinitely
+// Discarding a memory = hard DELETE from the database.
+// Wiki is independently managed by the LLMWiki compiler.
+const SAVEABLE_STATES = new Set([
+  'tentative', 'kept',
 ]);
 
 const EXPLICIT_MEMORY_SIGNALS = [
@@ -40,7 +43,6 @@ export class LocalMemoryStore {
     
     this._ensureLayout();
     this._store = new SqliteStore(this._dbPath);
-    this._ensureWikiDir();
   }
 
   close() {
@@ -119,8 +121,6 @@ export class LocalMemoryStore {
     this._maybePeriodicCleanup();
     const hits = this._store.queryMemory(query, topK);
     const tentativeItems = this._store.listMemoryByState('tentative', topK);
-    const reviewQueue = this.listMemoryReviews(Math.max(topK * 3, 1));
-    const reviewQueueSummary = this._reviewSummaryCounts();
     const freshness = this._freshnessPayload(hits);
     const memoryContext = {
       query,
@@ -135,8 +135,6 @@ export class LocalMemoryStore {
       confidence_applied: false,
       lookup_performed: true,
       skipped_reason: null,
-      review_queue_items: reviewQueue,
-      review_queue_summary: reviewQueueSummary,
       timeline_summary: { memory_ids: hits.map(h => h.memory_id), event_count: 0, recent_events: [] },
       abstained_memories: [],
       temporal_range: null,
@@ -151,13 +149,12 @@ export class LocalMemoryStore {
       should_abstain: hits.length === 0,
       abstain_reason: hits.length === 0 ? 'no_v2_hits' : '',
       evidence_chains: [],
-      reasoning_hints: { abstain: hits.length === 0, suggest_review: reviewQueue.length > 0 },
+      reasoning_hints: { abstain: hits.length === 0 },
       agentic_rerank_applied: false,
     };
     return {
       hits,
       tentative_items: tentativeItems,
-      review_queue: reviewQueue,
       freshness,
       abstention_signals: {
         should_abstain: hits.length === 0,
@@ -177,8 +174,6 @@ export class LocalMemoryStore {
       sessionId = activeSession?.session_id || null;
     }
     const hits = this._store.queryMemory(query, topK * 2);
-    const reviewQueue = this.listMemoryReviews(Math.max(topK * 3, 1));
-    const reviewQueueSummary = this._reviewSummaryCounts();
     const freshness = this._freshnessPayload(hits);
     const memoryIds = hits.map(h => h.memory_id);
     const aliases = [...new Set(hits.flatMap(item => item.aliases || []))];
@@ -186,7 +181,7 @@ export class LocalMemoryStore {
     const collectionHints = [...new Set(hits.flatMap(item => item.collection_hints || []))];
 
     if (sessionId) {
-      const insight = this._buildRetrievalInsight({ query, hits, freshness, reviewQueue, reviewQueueSummary });
+      const insight = this._buildRetrievalInsight({ query, hits, freshness });
       if (insight) {
         try {
           this.appendTurn({
@@ -214,8 +209,6 @@ export class LocalMemoryStore {
       confidence_applied: hits.length > 0,
       lookup_performed: true,
       skipped_reason: null,
-      review_queue_items: reviewQueue,
-      review_queue_summary: reviewQueueSummary,
       timeline_summary: { memory_ids: memoryIds, event_count: 0, recent_events: [] },
       abstained_memories: [],
       temporal_range: null,
@@ -230,7 +223,7 @@ export class LocalMemoryStore {
       should_abstain: hits.length === 0,
       abstain_reason: hits.length === 0 ? 'no_v2_hits' : '',
       evidence_chains: [],
-      reasoning_hints: { abstain: hits.length === 0, suggest_review: reviewQueue.length > 0 },
+      reasoning_hints: { abstain: hits.length === 0 },
       agentic_rerank_applied: false,
       summary: {
         total_hits: hits.length,
@@ -256,9 +249,9 @@ export class LocalMemoryStore {
       created_at,
     } = options;
 
-    const normalizedState = (state || 'local_only').trim() || 'local_only';
-    if (!SAVEABLE_V2_STATES.has(normalizedState)) {
-      throw new Error(`Unsupported v2 state: ${normalizedState}`);
+    const normalizedState = (state || 'tentative').trim() || 'tentative';
+    if (!SAVEABLE_STATES.has(normalizedState)) {
+      throw new Error(`Unsupported state: ${normalizedState}. Valid states: tentative, kept`);
     }
 
     // Daily write limit for auto sources
@@ -281,11 +274,13 @@ export class LocalMemoryStore {
     const filteredPathHints = this._filterPathHints(path_hints || []);
     const normalizedAliases = [...new Set(aliases || [])];
     const normalizedCollectionHints = [...new Set(collection_hints || [])];
+    const canonicalKey = canonicalKeyForText(content.trim());
 
     const saved = this._store.saveMemory(new MemoryFact({
       memory_id: memoryId,
       session_id: session_id,
       content: content.trim(),
+      canonical_key: canonicalKey,
       state: normalizedState,
       aliases: normalizedAliases,
       path_hints: filteredPathHints,
@@ -326,19 +321,14 @@ export class LocalMemoryStore {
   }
 
   deleteMemory(memoryId) {
-    const success = this._store.deleteMemory(memoryId);
-    if (success) {
-      const memory = this._store.getMemory(memoryId);
-      if (memory) {
-        this._store.addEvent({
-          memory_id: memoryId,
-          event_type: 'memory_deleted',
-          created_at: isoNow(),
-          event_data: {},
-        });
-      }
-    }
-    return success;
+    // Record event before deletion (memory won't exist after)
+    this._store.addEvent({
+      memory_id: memoryId,
+      event_type: 'memory_deleted',
+      created_at: isoNow(),
+      event_data: {},
+    });
+    return this._store.deleteMemory(memoryId);
   }
 
   stats() {
@@ -365,167 +355,37 @@ export class LocalMemoryStore {
     };
   }
 
-  // ========== Memory Choice & Review (aligned with Python localmem_v2) ==========
+  // ========== Memory Choice (tentative → kept, or discard = DELETE) ==========
 
   saveMemoryChoice({ memoryId, choice, updatedAt }) {
-    const mapping = {
-      discard: 'discarded',
-      keep_local: 'local_only',
-      manual_publish: 'manual_only',
-      candidate_on_reuse: 'candidate_on_reuse',
-      publish_now: 'wiki_candidate',
-    };
-    if (!(choice in mapping)) {
-      throw new Error(`Unsupported choice: ${choice}`);
-    }
-    const state = mapping[choice];
-    const status = state === 'discarded' ? 'archived' : 'active';
-    const now = updatedAt || isoNow();
-
     const current = this._store.getMemory(memoryId);
     if (!current) {
       throw new Error(`Memory not found: ${memoryId}`);
     }
 
-    this._store.updateMemoryState(memoryId, state, {
-      status,
-      updated_at: now,
-      last_choice: choice,
-    });
-
-    const updated = this._store.getMemory(memoryId);
-    return { ...updated, choice };
-  }
-
-  listMemoryReviews(limit = 50) {
-    const items = this._store.listMemoryByState('wiki_candidate', limit);
-    const availableActions = ['publish', 'keep_local', 'discard', 'manual_only'];
-    return items.map(item => ({
-      memory_id: item.memory_id,
-      review_id: item.memory_id,
-      state: item.state,
-      status: item.status,
-      content: item.content,
-      updated_at: item.updated_at,
-      reason: '',
-      recommended_action: 'publish',
-      available_actions: [...availableActions],
-      source_queue_type: 'wiki_candidate',
-    }));
-  }
-
-  reviewMemoryCandidate({ memoryId, action, publishTarget, updatedAt }) {
-    const actionMapping = {
-      publish: 'published',
-      discard: 'discarded',
-      keep_local: 'local_only',
-      manual_only: 'manual_only',
-      candidate_on_reuse: 'candidate_on_reuse',
-    };
-    if (!(action in actionMapping)) {
-      throw new Error(`Unsupported review action: ${action}`);
-    }
-    const nextState = actionMapping[action];
-    const now = updatedAt || isoNow();
-
-    const current = this._store.getMemory(memoryId);
-    if (!current) {
-      throw new Error(`Memory not found: ${memoryId}`);
-    }
-    if (current.state !== 'wiki_candidate') {
-      throw new Error(`Memory ${memoryId} is not reviewable as a wiki_candidate`);
+    if (choice === 'discard') {
+      // Hard delete — remove from database entirely
+      this._store.deleteMemory(memoryId);
+      return { memory_id: memoryId, choice: 'discard', status: 'deleted' };
     }
 
-    let publishMetadata = {};
-    if (action === 'publish') {
-      const content = (current.content || '').trim();
-      const slug = current.slug || slugify(content, current.memory_id);
-      const title = (current.wiki_title || content.slice(0, 80) || current.memory_id).trim();
-      const targets = ['wiki'];
-      publishMetadata = {
-        slug,
-        wiki_title: title,
-        publish_target: 'wiki',
-        publish_targets: targets,
-      };
-      const wikiDir = path.join(this._projectRoot, 'wiki');
-      // Use publishWikiPage for full markdown content (no bullet wrapping)
-      const pageContent = content.startsWith('#') ? content : `# ${title}\n\n${content}\n`;
-      const outputPath = publishWikiPage({
-        outputDir: wikiDir,
-        slug,
-        content: pageContent,
+    if (choice === 'keep') {
+      // Confirm: tentative → kept (permanent)
+      const now = updatedAt || isoNow();
+      this._store.updateMemoryState(memoryId, 'kept', {
+        updated_at: now,
+        last_choice: choice,
       });
-      const indexPath = rebuildWikiIndex(wikiDir);
-      Object.assign(publishMetadata, {
-        output_path: outputPath,
-        wiki_output_path: outputPath,
-        index_path: indexPath,
-      });
-      if (publishMetadata.wiki_output_path) {
-        this._store.addWikiExport({
-          memory_id: memoryId,
-          output_path: publishMetadata.wiki_output_path,
-          created_at: now,
-        });
-      }
+      const updated = this._store.getMemory(memoryId);
+      return { ...updated, choice };
     }
 
-    const status = nextState === 'discarded' ? 'archived' : 'active';
-    this._store.updateMemoryState(memoryId, nextState, {
-      status,
-      updated_at: now,
-      last_review_action: action,
-      output_path: publishMetadata.output_path || null,
-      slug: publishMetadata.slug || null,
-      wiki_title: publishMetadata.wiki_title || null,
-    });
-
-    this._store.addReview({
-      memory_id: memoryId,
-      action,
-      created_at: now,
-      reason: '',
-    });
-
-    const updated = this._store.getMemory(memoryId);
-    const payload = { ...updated, action };
-    if (action === 'publish') {
-      Object.assign(payload, publishMetadata);
-      const guidance = {
-        default_target: 'wiki',
-        available_targets: ['wiki'],
-        selected_target: 'wiki',
-        rules_requires_manual_export: false,
-        reminder: '当前 OpenClaw context-engine 仅支持发布到 wiki/，不再提供 rules 发布目标。',
-      };
-      const reviewUi = {
-        recommended_action: 'publish',
-        recommended_publish_target: guidance.default_target,
-        available_publish_targets: [...guidance.available_targets],
-        selected_publish_target: guidance.selected_target,
-        reminder: guidance.reminder,
-      };
-      return {
-        ...payload,
-        publish_guidance: guidance,
-        review_ui: reviewUi,
-      };
-    }
-    return payload;
+    throw new Error(`Unsupported choice: ${choice}. Valid choices: keep, discard`);
   }
 
-  _reviewSummaryCounts() {
-    const wikiCandidate = this._store.listMemoryByState('wiki_candidate', 1).length;
-    const actionHint = wikiCandidate > 0
-      ? '可选操作：publish（发布到 wiki）、keep_local（保留在 localmem）、discard（丢弃）、manual_only（手动管理）。先 list_memory_reviews 查看，再 review_memory_candidate 执行 action。'
-      : '';
-    return {
-      pending_review_count: wikiCandidate,
-      wiki_candidate_count: wikiCandidate,
-      review_hint: actionHint,
-    };
-  }
+
+
+
 
   _freshnessPayload(hits) {
     if (!hits || hits.length === 0) {
@@ -548,7 +408,7 @@ export class LocalMemoryStore {
     return { level: 'old', note: 'Not updated recently', age_days: Math.floor(minAge) };
   }
 
-  _buildRetrievalInsight({ query, hits, freshness, reviewQueueSummary }) {
+  _buildRetrievalInsight({ query, hits, freshness }) {
     const parts = [];
     const hasHits = hits.length > 0;
 
@@ -558,16 +418,8 @@ export class LocalMemoryStore {
       parts.push(`记忆查询命中 ${hits.length} 条结果，新鲜度 ${freshness.level}。`);
     }
 
-    if (reviewQueueSummary.wiki_candidate_count > 0) {
-      parts.push(`当前有 ${reviewQueueSummary.wiki_candidate_count} 条 wiki_candidate 待审核。`);
-    }
-
     if (freshness.level === 'stale' || freshness.level === 'old') {
       parts.push(`注意：命中记忆已 ${freshness.age_days} 天未更新，可能已过时。`);
-    }
-
-    if (!hasHits && reviewQueueSummary.wiki_candidate_count > 0) {
-      parts.push(`建议：有相关候选记忆待审核，审核后可能改善查询结果。`);
     }
 
     return parts.join(' ');
@@ -584,14 +436,11 @@ export class LocalMemoryStore {
       const sessionAge = Math.min(this._factMaxAgeDays || 180, 60);
       const turnResult = this._store.cleanupOldTurns(sessionAge);
       const sessionResult = this._store.cleanupOldSessions(sessionAge);
-      const mentionResult = this._store.cleanupOldMentions(30);
       const eventResult = this._store.cleanupOldEvents(30);
-      const reviewResult = this._store.cleanupOldReviews(90);
       const tentativeResult = this._store.cleanupExpiredTentative(7);
       logger.info(
         `Periodic cleanup: turns=${turnResult.deleted}, sessions=${sessionResult.deleted}, ` +
-        `mentions=${mentionResult.deleted}, events=${eventResult.deleted}, ` +
-        `reviews=${reviewResult.deleted}, tentative=${tentativeResult.deleted}`
+        `events=${eventResult.deleted}, tentative=${tentativeResult.deleted}`
       );
     } catch (err) {
       logger.warn(`Periodic cleanup failed: ${err.message}`);
@@ -714,7 +563,8 @@ export class LocalMemoryStore {
       memory_id: memoryId,
       session_id: options.session_id,
       content: options.content.trim(),
-      state: options.state || 'tentative',
+      canonical_key: canonicalKeyForText(options.content.trim()),
+      state: options.state || 'kept',
       aliases: [...new Set(options.aliases || [])],
       path_hints: this._filterPathHints(options.path_hints || []),
       collection_hints: [...new Set(options.collection_hints || [])],
@@ -811,90 +661,7 @@ export class LocalMemoryStore {
     }
   }
 
-  /**
-   * Ensure the wiki/ directory under project root is in sync with
-   * published memories in the database.  Rebuilds missing wiki files
-   * on startup so the static_kb indexer can pick them up.
-   */
-  _ensureWikiDir() {
-    const wikiDir = path.join(this._projectRoot, 'wiki');
 
-    const publishedItems = this._store.listMemoryByState('published', 1000);
-    if (publishedItems.length === 0) return;
-
-    // Build a set of expected slugs from DB
-    const expectedFiles = new Set();
-    for (const item of publishedItems) {
-      const content = typeof item.content === 'string' ? item.content.trim() : String(item.content || '').trim();
-      const slug = item.slug || slugify(content, item.memory_id);
-      expectedFiles.add(`${slug}.md`);
-    }
-
-    // Determine if rebuild is needed
-    let needsRebuild = !fs.existsSync(wikiDir);
-
-    if (!needsRebuild) {
-      // Check: any expected file missing on disk?
-      for (const filename of expectedFiles) {
-        if (!fs.existsSync(path.join(wikiDir, filename))) {
-          needsRebuild = true;
-          break;
-        }
-      }
-    }
-
-    if (!needsRebuild) {
-      // Check: any md file on disk not in DB (orphan files)?
-      try {
-        const diskFiles = fs.readdirSync(wikiDir).filter(f => f.endsWith('.md') && f !== 'index.md');
-        for (const filename of diskFiles) {
-          if (!expectedFiles.has(filename)) {
-            needsRebuild = true;
-            break;
-          }
-        }
-      } catch { /* ignore read errors */ }
-    }
-
-    // Always rebuild index to keep it in sync
-    const needsIndexRebuild = !fs.existsSync(path.join(wikiDir, 'index.md')) || needsRebuild;
-
-    if (!needsRebuild && !needsIndexRebuild) return;
-
-    if (needsRebuild) {
-      logger.info(`Rebuilding wiki directory from ${publishedItems.length} published memories`);
-    }
-
-    // Re-publish all published memories
-    for (const item of publishedItems) {
-      const content = typeof item.content === 'string' ? item.content.trim() : String(item.content || '').trim();
-      const slug = item.slug || slugify(content, item.memory_id);
-      const title = (item.wiki_title || content.slice(0, 80) || item.memory_id).trim();
-      // Use publishWikiPage for full markdown content (no bullet wrapping)
-      const pageContent = content.startsWith('#') ? content : `# ${title}\n\n${content}\n`;
-      publishWikiPage({
-        outputDir: wikiDir,
-        slug,
-        content: pageContent,
-      });
-    }
-
-    // Remove orphan files (md files on disk not in DB)
-    try {
-      const diskFiles = fs.readdirSync(wikiDir).filter(f => f.endsWith('.md') && f !== 'index.md');
-      for (const filename of diskFiles) {
-        if (!expectedFiles.has(filename)) {
-          const orphanPath = path.join(wikiDir, filename);
-          logger.info(`Removing orphan wiki file: ${orphanPath}`);
-          fs.unlinkSync(orphanPath);
-        }
-      }
-    } catch { /* ignore cleanup errors */ }
-
-    // Rebuild the index page
-    rebuildWikiIndex(wikiDir);
-    logger.info(`Wiki directory rebuilt at ${wikiDir}`);
-  }
 
   _writeState(extra = {}) {
     let current = {};

@@ -3,7 +3,13 @@
  * Aligned with rule-engine evaluation/metrics.py.
  */
 
-import { tokenize } from '../retrieval/tokenizer.js';
+/**
+ * Simple tokenizer for benchmark diversity computation.
+ * Replaces the removed retrieval/tokenizer.js dependency.
+ */
+function tokenize(text) {
+  return text.toLowerCase().split(/[^a-z0-9\u4e00-\u9fff]+/).filter(Boolean);
+}
 
 /**
  * Compute hit rate: fraction of expected hits that appear in results.

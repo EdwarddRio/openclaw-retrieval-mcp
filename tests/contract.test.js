@@ -3,7 +3,6 @@ import assert from 'node:assert';
 import {
   buildSearchCall,
   buildMemoryQueryCall,
-  buildSaveMemoryChoiceCall,
 } from '../src/api/contract.js';
 
 describe('API Contracts', () => {
@@ -18,11 +17,5 @@ describe('API Contracts', () => {
     const call = buildMemoryQueryCall({ query: 'test', top_k: 5 });
     assert.strictEqual(call.query, 'test');
     assert.strictEqual(call.top_k, 5);
-  });
-
-  it('should build save memory choice call', () => {
-    const call = buildSaveMemoryChoiceCall({ memory_id: '123', choice: 'keep_local' });
-    assert.strictEqual(call.memory_id, '123');
-    assert.strictEqual(call.choice, 'keep_local');
   });
 });

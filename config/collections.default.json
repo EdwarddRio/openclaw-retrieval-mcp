@@ -1,15 +1,1 @@
-{
-  "static_kb": {
-    "lazy": false,
-    "sources": {
-      "markdown": [
-        "memory/",
-        "wiki/",
-        "MEMORY.md",
-        "SESSION-STATE.md",
-        "SOUL.md",
-        "USER.md"
-      ]
-    }
-  }
-}
+{}

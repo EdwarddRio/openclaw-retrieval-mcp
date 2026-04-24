@@ -1,13 +1,12 @@
 /**
  * Health snapshot builder.
+ * ChromaDB and Embedding components removed — retrieval is BM25-only.
  */
 
-export function buildHealthSnapshot({ collections, localmem, benchmarks, chroma, embedding }) {
+export function buildHealthSnapshot({ collections, localmem, benchmarks }) {
   const allHealthy =
     (collections?.healthy !== false) &&
-    (localmem?.healthy !== false) &&
-    (chroma?.healthy !== false) &&
-    (embedding?.healthy !== false);
+    (localmem?.healthy !== false);
 
   return {
     status: allHealthy ? 'healthy' : 'degraded',
@@ -15,8 +14,7 @@ export function buildHealthSnapshot({ collections, localmem, benchmarks, chroma,
       collections: collections || { healthy: false },
       localmem: localmem || { healthy: false },
       benchmarks: benchmarks || { healthy: false },
-      chroma: chroma || { healthy: false },
-      embedding: embedding || { healthy: false },
+      retrieval_mode: 'bm25_only',
     },
     timestamp: new Date().toISOString(),
   };

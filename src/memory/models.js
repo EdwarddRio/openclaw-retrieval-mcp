@@ -44,32 +44,27 @@ export class ChatSession {
 
 export class MemoryFact {
   constructor(options = {}) {
-    // K version basic fields
+    // Basic fields
     this.memory_id = options.memory_id || '';
     this.content = options.content || '';
     this.canonical_key = options.canonical_key || null;
-    this.status = options.status || 'tentative';
+    this.status = options.status || 'active';
     this.source_session_id = options.source_session_id || options.session_id || null;
     this.created_at = options.created_at || new Date().toISOString();
     this.updated_at = options.updated_at || new Date().toISOString();
-    this.published_at = options.published_at || null;
     this.choice = options.choice || null;
 
-    // D version extended fields
+    // Extended fields
     this.session_id = options.session_id || options.source_session_id || '';
     this.source_turn_ids = options.source_turn_ids || [];
-    this.state = options.state || 'local_only';
+    this.state = options.state || 'tentative';
     this.normalized_text = options.normalized_text || '';
     this.aliases = options.aliases || [];
     this.path_hints = options.path_hints || [];
     this.collection_hints = options.collection_hints || [];
     this.previous_versions = options.previous_versions || [];
     this.source = options.source || 'manual';
-    this.output_path = options.output_path || null;
-    this.slug = options.slug || null;
-    this.wiki_title = options.wiki_title || null;
     this.last_choice = options.last_choice || null;
-    this.last_review_action = options.last_review_action || null;
   }
 }
 

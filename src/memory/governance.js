@@ -3,7 +3,7 @@
  * and semantic deduplication ported from rule-engine/memory/governance.py.
  */
 
-import { getEmbeddingClient } from '../vector/embedding-client.js';
+// Embedding client removed — semantic detection disabled in favor of LLM Wiki pattern
 
 const TOKEN_RE = /[A-Za-z0-9_]+|[\u4e00-\u9fff]+/g;
 const CAMEL_CASE_RE = /(?<![A-Za-z0-9_])[A-Z][A-Za-z0-9]*(?:Service|Action|Mapper|ConfigManager|Impl|Exception|Result|Type|Helper|Controller|Manager|Handler|Factory|Builder|Constants|Config)(?![A-Za-z0-9_])/g;
@@ -16,13 +16,7 @@ const TOPIC_STOPWORDS = new Set([
 
 const MEMORY_STATE_PRIORITY = {
   tentative: 1,
-  local_only: 2,
-  manual_only: 2,
-  candidate_on_reuse: 3,
-  review_candidate: 4,
-  wiki_candidate: 4,
-  published: 5,
-  discarded: 0,
+  kept: 2,
 };
 
 const SEMANTIC_MATCH_THRESHOLD = 0.83;
@@ -49,7 +43,7 @@ export async function planKnowledgeUpdate({
   pathHints = [],
   collectionHints = [],
   facts = [],
-  semanticEnabled = true,
+  semanticEnabled = false,
 }) {
   const candidateProfile = _topicProfile(content, aliases, pathHints, collectionHints);
   const relatedFacts = [];
@@ -190,115 +184,19 @@ function _topicRelation(candidateProfile, fact) {
 // ------------------------------------------------------------------
 
 async function _semanticRelatedFacts(candidateProfile, facts) {
-  const activeFacts = facts.filter(
-    f => (!f.status || f.status === 'active') && f.memory_id,
-  );
-  if (activeFacts.length === 0) return [];
-
-  const candidateText = candidateProfile.semanticText;
-  if (!candidateText) return [];
-
-  const enrichedFacts = await _enrichFactsWithSemanticCache(activeFacts);
-  const embeddings = await _encodeSemanticTexts([candidateText]);
-  const candidateEmbedding = embeddings.get(candidateText);
-  if (!candidateEmbedding) return [];
-
-  const scoredMatches = [];
-  for (const fact of enrichedFacts) {
-    const factEmbedding = fact.semantic_embedding;
-    if (!factEmbedding || factEmbedding.length === 0) continue;
-    const similarity = _cosineSimilarity(candidateEmbedding, factEmbedding);
-    if (similarity < SEMANTIC_MATCH_THRESHOLD) continue;
-    scoredMatches.push({ memory_id: fact.memory_id, score: similarity });
-  }
-
-  scoredMatches.sort((a, b) => b.score - a.score || a.memory_id.localeCompare(b.memory_id));
-  if (scoredMatches.length === 0) return [];
-  if (scoredMatches.length === 1) return scoredMatches;
-
-  const margin = scoredMatches[0].score - scoredMatches[1].score;
-  if (margin >= SEMANTIC_CONFLICT_MARGIN) {
-    return [scoredMatches[0]];
-  }
-
-  const topScore = scoredMatches[0].score;
-  return scoredMatches
-    .filter(m => topScore - m.score <= SEMANTIC_CONFLICT_MARGIN)
-    .slice(0, SEMANTIC_MAX_CONFLICT_CANDIDATES);
+  // Semantic detection disabled — no longer using embedding service.
+  // Lexical/token matching in planKnowledgeUpdate handles conflict detection.
+  return [];
 }
 
 async function _enrichFactsWithSemanticCache(facts, cachedFacts = []) {
-  const cachedById = new Map();
-  for (const cf of cachedFacts) {
-    if (cf.memory_id) cachedById.set(cf.memory_id, cf);
-  }
-
-  const enriched = [];
-  const missingTexts = [];
-
-  for (const fact of facts) {
-    const enrichedFact = { ...fact };
-    const semanticText = _buildSemanticText(
-      fact.content || '',
-      fact.aliases || [],
-      fact.path_hints || [],
-      fact.collection_hints || [],
-    );
-    enrichedFact.semantic_text = semanticText;
-
-    const cached = cachedById.get(fact.memory_id);
-    let cachedEmbedding = null;
-    if (cached && cached.semantic_text === semanticText) {
-      cachedEmbedding = cached.semantic_embedding;
-    }
-
-    if (cachedEmbedding && cachedEmbedding.length > 0) {
-      enrichedFact.semantic_embedding = cachedEmbedding;
-    } else if (semanticText) {
-      enrichedFact.semantic_embedding = [];
-      missingTexts.push(semanticText);
-    } else {
-      enrichedFact.semantic_embedding = [];
-    }
-    enriched.push(enrichedFact);
-  }
-
-  const uniqueMissing = [...new Set(missingTexts)];
-  if (uniqueMissing.length > 0) {
-    const encoded = await _encodeSemanticTexts(uniqueMissing);
-    for (const fact of enriched) {
-      if (fact.semantic_embedding && fact.semantic_embedding.length > 0) continue;
-      const text = fact.semantic_text;
-      const emb = encoded.get(text);
-      if (emb) {
-        fact.semantic_embedding = emb;
-      }
-    }
-  }
-
-  return enriched;
+  // No-op: semantic enrichment disabled (no embedding service)
+  return facts.map(f => ({ ...f, semantic_text: '', semantic_embedding: [] }));
 }
 
 async function _encodeSemanticTexts(texts) {
-  const missingTexts = texts.filter(t => t && !SEMANTIC_EMBEDDING_CACHE.has(t));
-  if (missingTexts.length > 0) {
-    try {
-      const client = getEmbeddingClient();
-      const embeddings = await client.encode(missingTexts);
-      for (let i = 0; i < missingTexts.length; i++) {
-        SEMANTIC_EMBEDDING_CACHE.set(missingTexts[i], embeddings[i]);
-      }
-    } catch (err) {
-      // Degrade gracefully: return whatever is already cached
-    }
-  }
-
-  const result = new Map();
-  for (const text of texts) {
-    const emb = SEMANTIC_EMBEDDING_CACHE.get(text);
-    if (emb) result.set(text, emb);
-  }
-  return result;
+  // No-op: encoding disabled (no embedding service)
+  return new Map();
 }
 
 // ------------------------------------------------------------------
@@ -417,97 +315,8 @@ function _setIntersect(a, b) {
 }
 
 // ------------------------------------------------------------------
-// Session review candidate extraction (lightweight heuristics)
+// Session review candidate extraction has been removed.
+// Wiki promotion path (wiki_candidate → published) no longer exists.
+// localMem now serves as permanent SQLite storage only.
+// Wiki is independently managed by the LLMWiki compiler.
 // ------------------------------------------------------------------
-
-const AUTO_DRAFT_TRIGGERS = new Set([
-  '约定', '以后', '必须', '统一', '不要', '优先看', '注意', '关键', '重要', '核心',
-  '原因', '解决', '修复', '改为', '改为使用', '移除', '删除', '新增', '变更', '架构', '决策',
-]);
-
-const AUTO_DRAFT_NOISE_MARKERS = [
-  '```', '<attached_files>', '<system_reminder>', 'Question ', 'Selected option',
-  'Retrieval summary', 'TODO', 'COMPLETED', 'IN_PROGRESS', 'PENDING',
-];
-
-const USER_MEMORY_DIRECTIVES = new Set(['记住', '约定', '统一', '固定', '必须', '不要', '别忘', '请按']);
-
-export function extractSessionReviewCandidates(turns) {
-  const candidates = [];
-  const seen = new Set();
-  for (const turn of turns) {
-    const role = turn.role || '';
-    if (role !== 'assistant' && role !== 'user') continue;
-    const content = String(turn.content || '').trim();
-    if (!content) continue;
-    const references = turn.references || {};
-    for (const candidateContent of _extractCandidateSentences(content, role)) {
-      const normalized = _normalizeText(candidateContent);
-      if (normalized.length < 6 || seen.has(normalized)) continue;
-      seen.add(normalized);
-      candidates.push({
-        content: candidateContent,
-        normalized_text: normalized,
-        aliases: _extractAliases(candidateContent),
-        path_hints: [...(references.path_hints || [])],
-        collection_hints: [...(references.collection_hints || [])],
-        source_turn_ids: [turn.turn_id || ''],
-      });
-    }
-  }
-  return candidates;
-}
-
-function _extractCandidateSentences(content, role) {
-  const candidates = [];
-  for (const rawSegment of _splitCandidateSegments(content)) {
-    const summarized = _summarizeCandidateContent(rawSegment);
-    if (_shouldKeepCandidateSentence(rawSegment, summarized, role)) {
-      candidates.push(summarized);
-    }
-  }
-  return candidates;
-}
-
-function _splitCandidateSegments(content) {
-  const segments = [];
-  for (const raw of String(content).split(/[。\n；;]+/)) {
-    const segment = raw.trim().replace(/^(?:[-*]\s*|\d+\.\s*)/, '').trim();
-    if (segment) segments.push(segment);
-  }
-  return segments;
-}
-
-function _summarizeCandidateContent(content) {
-  let sentence = String(content).split(/[。\n；;]/, 2)[0].trim();
-  sentence = sentence.replace(/^(?:[-*]\s*|\d+\.\s*)/, '');
-  sentence = sentence.replace(/^(约定[:：]\s*|以后\s*)/, '');
-  return sentence || String(content).trim();
-}
-
-function _shouldKeepCandidateSentence(rawSegment, candidateContent, role) {
-  if (_looksLikeNoiseSentence(rawSegment)) return false;
-  const aliases = _extractAliases(candidateContent);
-  const hasPath = /(?:[A-Za-z]:[\\/]|[\\/]|(?:\.\w{1,8}\b))/.test(rawSegment);
-  const hasAnchor = aliases.length > 0 || hasPath;
-  const hasTrigger = [...AUTO_DRAFT_TRIGGERS].some(t => rawSegment.includes(t));
-  const hasFactSignal = /\b(?:确认|字段|映射|入口|实现|路径|类名|配置|结束时间|开始时间|开关|对应|接口|Service|Action|Mapper|Redis|数据库|缓存|配置表|数据源|分页|乐观锁|事务|异常|GameException|JsonResult|ResultType)\b/.test(rawSegment);
-
-  if (role === 'user') {
-    const hasDirective = [...USER_MEMORY_DIRECTIVES].some(m => rawSegment.includes(m));
-    return hasDirective && (hasTrigger || hasFactSignal || hasAnchor);
-  }
-  return hasTrigger || hasFactSignal || hasAnchor;
-}
-
-function _looksLikeNoiseSentence(rawSegment) {
-  const normalized = _normalizeText(rawSegment);
-  if (normalized.length < 6) return true;
-  if (rawSegment.includes('?') || rawSegment.includes('？')) return true;
-  if (rawSegment.startsWith('##') || rawSegment.startsWith('###') || rawSegment.startsWith('```') || rawSegment.startsWith('>')) return true;
-  if (/\breview-[a-z0-9x]{3,}\b/i.test(rawSegment)) return true;
-  if (/^\[\d+\]\s+.+\([^)]+\)\s+-\s+.+$/.test(rawSegment.trim())) return true;
-  if (/^[A-Za-z_][A-Za-z0-9_]*\s*=\s*(?:[\(\[\{].+|['"].+|[A-Za-z_][A-Za-z0-9_]*(?:\s*[+\-*/].+)?)$/.test(rawSegment.trim())) return true;
-  if (AUTO_DRAFT_NOISE_MARKERS.some(m => normalized.includes(m.toLowerCase()))) return true;
-  return false;
-}

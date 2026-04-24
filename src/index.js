@@ -1,6 +1,7 @@
 /**
  * HTTP server entry point.
  * Fastify-based REST API.
+ * Architecture: localMem (memory) + LLMWiki (knowledge) — no static_kb/BM25.
  */
 
 import Fastify from 'fastify';
@@ -15,57 +16,8 @@ const fastify = Fastify({
 
 const queryExporter = new QueryExporter();
 
-/**
- * 根据检索结果生成洞察文本，供梦境系统消费。
- * 只在有显著信号时返回非空字符串。
- */
 // Initialize knowledge base
 const knowledgeBase = new KnowledgeBase();
-await knowledgeBase.initializeEager();
-
-// ========== Search Endpoints ==========
-
-fastify.post('/api/search', async (request, reply) => {
-  try {
-    const { query, top_k, doc_type, session_id, include_debug } = request.body;
-    const result = await knowledgeBase.search({
-      query,
-      top_k,
-      doc_type,
-      session_id,
-      include_debug,
-    });
-    return KnowledgeBasePresenter.presentSearchResults(result.results, {
-      query: result.query,
-      top_k: result.top_k,
-      timing_ms: result.timing_ms,
-      debug: result.debug,
-    });
-  } catch (err) {
-    reply.code(500);
-    return KnowledgeBasePresenter.presentError(err, 500);
-  }
-});
-
-fastify.post('/api/search/sync', async (request, reply) => {
-  try {
-    const result = await knowledgeBase.syncCollections();
-    return result;
-  } catch (err) {
-    reply.code(500);
-    return KnowledgeBasePresenter.presentError(err, 500);
-  }
-});
-
-fastify.get('/api/collections', async (request, reply) => {
-  try {
-    const result = knowledgeBase.getCollections();
-    return { collections: result };
-  } catch (err) {
-    reply.code(500);
-    return KnowledgeBasePresenter.presentError(err, 500);
-  }
-});
 
 // ========== Memory Endpoints ==========
 
@@ -99,46 +51,6 @@ fastify.get('/api/memory/timeline', async (request, reply) => {
     const { memory_id, session_id, limit } = request.query;
     const result = await knowledgeBase.memoryTimeline({ memoryId: memory_id, sessionId: session_id, limit: parseInt(limit) || 50 });
     return result;
-  } catch (err) {
-    reply.code(500);
-    return KnowledgeBasePresenter.presentError(err, 500);
-  }
-});
-
-fastify.post('/api/memory/choice', async (request, reply) => {
-  try {
-    const { memory_id, choice, updated_at } = request.body;
-    const result = await knowledgeBase.saveMemoryChoice({ memoryId: memory_id, choice, updatedAt: updated_at });
-    return { success: true, ...result };
-  } catch (err) {
-    reply.code(500);
-    return KnowledgeBasePresenter.presentError(err, 500);
-  }
-});
-
-fastify.get('/api/memory/reviews', async (request, reply) => {
-  try {
-    const { limit } = request.query;
-    const result = await knowledgeBase.listMemoryReviews(parseInt(limit) || 50);
-    const hint = result.length > 0
-      ? `当前有 ${result.length} 条待审核 wiki 候选。可选操作：publish（发布到 wiki）、keep_local（保留在 localmem）、discard（丢弃）、manual_only（手动管理）。先查看详情，再执行 action。`
-      : '';
-    return {
-      items: result,
-      hint,
-      available_actions: ['publish', 'keep_local', 'discard', 'manual_only'],
-    };
-  } catch (err) {
-    reply.code(500);
-    return KnowledgeBasePresenter.presentError(err, 500);
-  }
-});
-
-fastify.post('/api/memory/review', async (request, reply) => {
-  try {
-    const { memory_id, action, publish_target, updated_at } = request.body;
-    const result = await knowledgeBase.reviewMemoryCandidate({ memoryId: memory_id, action, publishTarget: publish_target, updatedAt: updated_at });
-    return { success: true, ...result };
   } catch (err) {
     reply.code(500);
     return KnowledgeBasePresenter.presentError(err, 500);
@@ -289,21 +201,32 @@ fastify.post('/api/benchmarks/run', async (request, reply) => {
   }
 });
 
-// ========== Admin Endpoints ==========
+// ========== Wiki Endpoints ==========
 
-fastify.post('/api/rebuild', async (request, reply) => {
+fastify.post('/api/wiki/search', async (request, reply) => {
   try {
-    const result = await knowledgeBase.rebuild();
-    return { success: true, ...result };
+    const { query, top_k } = request.body;
+    const result = knowledgeBase.wikiSearch(query, top_k || 5);
+    return { results: result };
   } catch (err) {
     reply.code(500);
     return KnowledgeBasePresenter.presentError(err, 500);
   }
 });
 
-fastify.get('/api/stats', async (request, reply) => {
+fastify.get('/api/wiki/check-stale', async (request, reply) => {
   try {
-    const result = await knowledgeBase.stats();
+    const result = knowledgeBase.wikiIsStale();
+    return result;
+  } catch (err) {
+    reply.code(500);
+    return KnowledgeBasePresenter.presentError(err, 500);
+  }
+});
+
+fastify.get('/api/wiki/status', async (request, reply) => {
+  try {
+    const result = knowledgeBase.wikiGetStatus();
     return result;
   } catch (err) {
     reply.code(500);

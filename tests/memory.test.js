@@ -36,7 +36,6 @@ describe('LocalMemory', () => {
     const result = memory.queryMemoryFull('test', 3);
     assert.ok(Array.isArray(result.hits));
     assert.ok(Array.isArray(result.tentative_items));
-    assert.ok(Array.isArray(result.review_queue));
   });
 
   it('should save and get memory', () => {

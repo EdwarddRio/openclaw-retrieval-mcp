@@ -1,51 +1,21 @@
 /**
  * KnowledgeBase - composite facade that composes all sub-facades.
+ * Architecture: localMem (memory) + LLMWiki (knowledge) — no BM25/static_kb.
  */
 
-import { SearchFacade } from './facades/search.js';
 import { MemoryFacade } from './facades/memory.js';
 import { HealthFacade } from './facades/health.js';
 import { BenchmarkFacade } from './facades/benchmark.js';
 import { BenchmarkHarness } from './benchmark/harness.js';
 import { BENCHMARKS_DIR } from './config.js';
+import { WikiCompiler } from './wiki/compiler.js';
 
 export class KnowledgeBase {
   constructor(options = {}) {
     this.memoryFacade = new MemoryFacade(options);
-    this.searchFacade = new SearchFacade({
-      ...options,
-      memoryStore: this.memoryFacade.localMemory,
-    });
     this.benchmarkFacade = new BenchmarkFacade(options.benchmarkRoot);
-    this.healthFacade = new HealthFacade(this.searchFacade, this.memoryFacade, this.benchmarkFacade);
-  }
-
-  // ========== Initialization ==========
-
-  async initializeEager() {
-    await this.searchFacade.initializeEager();
-  }
-
-  // ========== Search ==========
-
-  async search(options) {
-    return this.searchFacade.search(options);
-  }
-
-  async syncCollections() {
-    return this.searchFacade.syncCollections();
-  }
-
-  getCollections() {
-    return this.searchFacade.getCollections();
-  }
-
-  async rebuild() {
-    return this.searchFacade.rebuild();
-  }
-
-  async stats() {
-    return this.searchFacade.stats();
+    this.healthFacade = new HealthFacade(this.memoryFacade, this.benchmarkFacade);
+    this.wikiCompiler = new WikiCompiler(options);
   }
 
   // ========== Memory ==========
@@ -60,14 +30,6 @@ export class KnowledgeBase {
 
   saveMemoryChoice({ memoryId, choice, updatedAt }) {
     return this.memoryFacade.saveMemoryChoice({ memoryId, choice, updatedAt });
-  }
-
-  listMemoryReviews(limit = 50) {
-    return this.memoryFacade.listMemoryReviews(limit);
-  }
-
-  reviewMemoryCandidate({ memoryId, action, publishTarget, updatedAt }) {
-    return this.memoryFacade.reviewMemoryCandidate({ memoryId, action, publishTarget, updatedAt });
   }
 
   memoryTimeline({ memoryId, sessionId, limit }) {
@@ -124,10 +86,6 @@ export class KnowledgeBase {
     return this.healthFacade.healthSnapshot();
   }
 
-  async healthCollections() {
-    return this.healthFacade.healthCollections();
-  }
-
   healthLocalmem() {
     return this.healthFacade.healthLocalmem();
   }
@@ -150,13 +108,38 @@ export class KnowledgeBase {
     return this.benchmarkFacade.benchmarkHistory(suiteName, limit);
   }
 
-  async runBenchmark(suiteName = null) {
-    const harness = new BenchmarkHarness({
-      searchFn: (opts) => this.search(opts),
-      scenariosDir: './config/benchmark-scenarios',
-      reportDir: BENCHMARKS_DIR,
-    });
-    return harness.runSuite(suiteName);
+  // ========== Wiki Compiler ==========
+
+  wikiDetectChanges() {
+    return this.wikiCompiler.detectChanges();
+  }
+
+  wikiGenerateCompilePrompt(changesResult) {
+    return this.wikiCompiler.generateCompilePrompt(changesResult);
+  }
+
+  wikiSavePage({ sourcePath, wikiPageName, content, sourceId }) {
+    return this.wikiCompiler.saveWikiPage({ sourcePath, wikiPageName, content, sourceId });
+  }
+
+  wikiRemovePage(wikiPageName) {
+    return this.wikiCompiler.removeWikiPage(wikiPageName);
+  }
+
+  wikiUpdateIndex(pages) {
+    return this.wikiCompiler.updateIndex(pages);
+  }
+
+  wikiGetStatus() {
+    return this.wikiCompiler.getStatus();
+  }
+
+  wikiSearch(query, topK = 5) {
+    return this.wikiCompiler.searchWiki(query, topK);
+  }
+
+  wikiIsStale() {
+    return this.wikiCompiler.isStale();
   }
 }
 

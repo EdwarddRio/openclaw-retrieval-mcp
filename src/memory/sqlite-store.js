@@ -49,15 +49,6 @@ CREATE TABLE IF NOT EXISTS memory_items (
   updated_at TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS memory_mentions (
-  id TEXT PRIMARY KEY,
-  memory_id TEXT NOT NULL,
-  session_id TEXT NOT NULL,
-  turn_id TEXT NOT NULL,
-  mention_type TEXT NOT NULL,
-  seen_at TEXT NOT NULL
-);
-
 CREATE TABLE IF NOT EXISTS memory_events (
   id TEXT PRIMARY KEY,
   memory_id TEXT NOT NULL,
@@ -66,31 +57,10 @@ CREATE TABLE IF NOT EXISTS memory_events (
   payload_json TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS memory_reviews (
-  id TEXT PRIMARY KEY,
-  memory_id TEXT NOT NULL,
-  action TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  reason TEXT NOT NULL DEFAULT ''
-);
-
-CREATE TABLE IF NOT EXISTS wiki_exports (
-  id TEXT PRIMARY KEY,
-  memory_id TEXT NOT NULL,
-  output_path TEXT NOT NULL,
-  created_at TEXT NOT NULL
-);
-
 CREATE TABLE IF NOT EXISTS memory_aliases (
   memory_id TEXT NOT NULL,
   alias TEXT NOT NULL,
   PRIMARY KEY (memory_id, alias)
-);
-
-CREATE TABLE IF NOT EXISTS runtime_state (
-  key TEXT PRIMARY KEY,
-  value TEXT,
-  updated_at TEXT NOT NULL
 );
 `;
 
@@ -118,13 +88,7 @@ const MEMORY_ITEM_COLUMNS = {
   aliases_json: "TEXT NOT NULL DEFAULT '[]'",
   path_hints_json: "TEXT NOT NULL DEFAULT '[]'",
   collection_hints_json: "TEXT NOT NULL DEFAULT '[]'",
-  output_path: "TEXT",
-  rule_output_path: "TEXT",
-  publish_targets_json: "TEXT NOT NULL DEFAULT '[]'",
-  slug: "TEXT",
-  wiki_title: "TEXT",
   last_choice: "TEXT",
-  last_review_action: "TEXT",
 };
 
 function _ensureColumns(db, tableName, columns) {
@@ -182,46 +146,23 @@ export class SqliteStore {
       CREATE INDEX IF NOT EXISTS idx_memory_items_state_status_updated ON memory_items(state, status, updated_at DESC);
       CREATE INDEX IF NOT EXISTS idx_memory_items_ck_status ON memory_items(canonical_key, status);
       CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_items_ck_active ON memory_items(canonical_key) WHERE status = 'active';
-      CREATE INDEX IF NOT EXISTS idx_mentions_memory_seen_session ON memory_mentions(memory_id, seen_at, session_id);
-      CREATE INDEX IF NOT EXISTS idx_mentions_seen_at ON memory_mentions(seen_at);
-      CREATE INDEX IF NOT EXISTS idx_reviews_memory ON memory_reviews(memory_id);
       CREATE INDEX IF NOT EXISTS idx_aliases_memory ON memory_aliases(memory_id);
     `);
 
-    // Ensure FTS5 with triggers
-    try {
-      this.db.exec(`
-        CREATE VIRTUAL TABLE IF NOT EXISTS memory_items_fts USING fts5(
-          content,
-          content='memory_items',
-          content_rowid='rowid'
-        );
-      `);
-      this.db.exec(`
-        CREATE TRIGGER IF NOT EXISTS memory_items_ai AFTER INSERT ON memory_items BEGIN
-          INSERT INTO memory_items_fts(rowid, content) VALUES (new.rowid, new.content);
-        END;
-      `);
-      this.db.exec(`
-        CREATE TRIGGER IF NOT EXISTS memory_items_ad AFTER DELETE ON memory_items BEGIN
-          INSERT INTO memory_items_fts(memory_items_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
-        END;
-      `);
-      this.db.exec(`
-        CREATE TRIGGER IF NOT EXISTS memory_items_au AFTER UPDATE ON memory_items BEGIN
-          INSERT INTO memory_items_fts(memory_items_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
-          INSERT INTO memory_items_fts(rowid, content) VALUES (new.rowid, new.content);
-        END;
-      `);
-      // Rebuild if counts mismatch
-      const countItems = this.db.prepare("SELECT COUNT(*) as c FROM memory_items WHERE status = 'active'").get().c;
-      const countFts = this.db.prepare("SELECT COUNT(*) as c FROM memory_items_fts").get().c;
-      if (countItems !== countFts) {
-        this.db.exec("INSERT INTO memory_items_fts(memory_items_fts) VALUES ('rebuild')");
-      }
-    } catch {
-      // FTS5 may not be available in all builds
-    }
+    // Drop deprecated tables (wiki promotion path removed, mentions unused)
+    try { this.db.exec('DROP TABLE IF EXISTS memory_reviews'); } catch {}
+    try { this.db.exec('DROP TABLE IF EXISTS wiki_exports'); } catch {}
+    try { this.db.exec('DROP TABLE IF EXISTS memory_mentions'); } catch {}
+    try { this.db.exec('DROP TABLE IF EXISTS runtime_state'); } catch {}
+
+    // Migrate old states to new simplified states
+    this._migrateStates();
+
+    // Drop FTS5 — not used for memory queries (CJK unsupported by default tokenizer)
+    try { this.db.exec('DROP TABLE IF EXISTS memory_items_fts'); } catch {}
+    try { this.db.exec('DROP TRIGGER IF EXISTS memory_items_ai'); } catch {}
+    try { this.db.exec('DROP TRIGGER IF EXISTS memory_items_ad'); } catch {}
+    try { this.db.exec('DROP TRIGGER IF EXISTS memory_items_au'); } catch {}
   }
 
   // ========== Sessions ==========
@@ -351,16 +292,14 @@ export class SqliteStore {
       INSERT OR REPLACE INTO memory_items
       (id, canonical_key, summary, state, status, source, content,
        session_id, created_at, updated_at,
-       aliases_json, path_hints_json, collection_hints_json,
-       output_path, rule_output_path, publish_targets_json,
-       slug, wiki_title, last_choice, last_review_action)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       aliases_json, path_hints_json, collection_hints_json, last_choice)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
     stmt.run(
       memory.memory_id,
       memory.canonical_key || '',
       memory.summary || memory.content || '',
-      memory.state || memory.status || 'tentative',
+      memory.state || 'tentative',
       memory.status || 'active',
       memory.source || 'manual',
       memory.content || '',
@@ -370,13 +309,7 @@ export class SqliteStore {
       JSON.stringify(memory.aliases || []),
       JSON.stringify(memory.path_hints || []),
       JSON.stringify(memory.collection_hints || []),
-      memory.output_path || null,
-      memory.rule_output_path || null,
-      JSON.stringify(memory.publish_targets || []),
-      memory.slug || null,
-      memory.wiki_title || null,
-      memory.last_choice || null,
-      memory.last_review_action || null
+      memory.last_choice || null
     );
 
     // Sync aliases table
@@ -396,25 +329,24 @@ export class SqliteStore {
   }
 
   queryMemory(query, topK = 3) {
-    // Try FTS5 first, fallback to LIKE
-    try {
-      const stmt = this.db.prepare(`
-        SELECT mi.* FROM memory_items mi
-        JOIN memory_items_fts fts ON mi.rowid = fts.rowid
-        WHERE memory_items_fts MATCH ? AND mi.status != 'discarded'
-        ORDER BY rank
-        LIMIT ?
-      `);
-      return stmt.all(query, topK).map(r => this._rowToMemory(r));
-    } catch {
-      const stmt = this.db.prepare(`
-        SELECT * FROM memory_items
-        WHERE content LIKE ? AND status != 'discarded'
-        ORDER BY updated_at DESC
-        LIMIT ?
-      `);
-      return stmt.all(`%${query}%`, topK).map(r => this._rowToMemory(r));
-    }
+    // Use LIKE-based search with tokenized terms for CJK support.
+    // FTS5 default tokenizer doesn't handle Chinese, so we avoid it for memory queries.
+    if (!query || !query.trim()) return [];
+
+    // Build WHERE clause: each token must appear in content
+    const terms = query.trim().split(/\s+/).filter(t => t.length > 0);
+    if (terms.length === 0) return [];
+
+    const conditions = terms.map(() => 'content LIKE ?').join(' AND ');
+    const params = terms.map(t => `%${t}%`);
+
+    const stmt = this.db.prepare(`
+      SELECT * FROM memory_items
+      WHERE ${conditions} AND status = 'active' AND state IN ('tentative', 'kept')
+      ORDER BY updated_at DESC
+      LIMIT ?
+    `);
+    return stmt.all(...params, topK).map(r => this._rowToMemory(r));
   }
 
   listMemoryByStatus(status, limit = 50) {
@@ -443,7 +375,7 @@ export class SqliteStore {
   }
 
   updateMemoryState(memoryId, state, extra = {}) {
-    const allowed = ['state', 'status', 'last_choice', 'last_review_action', 'output_path', 'slug', 'wiki_title', 'updated_at'];
+    const allowed = ['state', 'status', 'last_choice', 'updated_at'];
     const fields = [];
     const values = [];
     for (const [k, v] of Object.entries(extra)) {
@@ -464,11 +396,12 @@ export class SqliteStore {
   }
 
   deleteMemory(memoryId) {
-    const stmt = this.db.prepare(`
-      UPDATE memory_items SET status = 'discarded', updated_at = ? WHERE id = ?
-    `);
-    stmt.run(new Date().toISOString(), memoryId);
-    return true;
+    // Clean up aliases first
+    this.db.prepare('DELETE FROM memory_aliases WHERE memory_id = ?').run(memoryId);
+    // Hard delete the memory item
+    const stmt = this.db.prepare('DELETE FROM memory_items WHERE id = ?');
+    const result = stmt.run(memoryId);
+    return result.changes > 0;
   }
 
   _rowToMemory(row) {
@@ -476,7 +409,7 @@ export class SqliteStore {
       memory_id: row.id,
       canonical_key: row.canonical_key || '',
       summary: row.summary || '',
-      state: row.state || 'local_only',
+      state: row.state || 'tentative',
       status: row.status || 'active',
       source: row.source || 'manual',
       content: row.content || '',
@@ -487,48 +420,8 @@ export class SqliteStore {
       aliases: row.aliases_json ? JSON.parse(row.aliases_json) : [],
       path_hints: row.path_hints_json ? JSON.parse(row.path_hints_json) : [],
       collection_hints: row.collection_hints_json ? JSON.parse(row.collection_hints_json) : [],
-      output_path: row.output_path || null,
-      rule_output_path: row.rule_output_path || null,
-      publish_targets: row.publish_targets_json ? JSON.parse(row.publish_targets_json) : [],
-      slug: row.slug || null,
-      wiki_title: row.wiki_title || null,
       last_choice: row.last_choice || null,
-      last_review_action: row.last_review_action || null,
     };
-  }
-
-  // ========== Reviews ==========
-
-  addReview(review) {
-    const stmt = this.db.prepare(`
-      INSERT INTO memory_reviews (id, memory_id, action, created_at, reason)
-      VALUES (?, ?, ?, ?, ?)
-    `);
-    stmt.run(_uuid(), review.memory_id, review.action, review.created_at, review.reason || '');
-  }
-
-  getReviews(memoryId) {
-    const stmt = this.db.prepare(`
-      SELECT * FROM memory_reviews WHERE memory_id = ? ORDER BY created_at DESC
-    `);
-    return stmt.all(memoryId);
-  }
-
-  // ========== Wiki Exports ==========
-
-  addWikiExport(exportRecord) {
-    const stmt = this.db.prepare(`
-      INSERT INTO wiki_exports (id, memory_id, output_path, created_at)
-      VALUES (?, ?, ?, ?)
-    `);
-    stmt.run(_uuid(), exportRecord.memory_id, exportRecord.output_path, exportRecord.created_at);
-  }
-
-  getWikiExports(memoryId) {
-    const stmt = this.db.prepare(`
-      SELECT * FROM wiki_exports WHERE memory_id = ? ORDER BY created_at DESC
-    `);
-    return stmt.all(memoryId);
   }
 
   // ========== Timeline (memory_events table) ==========
@@ -549,32 +442,15 @@ export class SqliteStore {
     return stmt.all(memoryId, limit);
   }
 
-  // ========== State ==========
-
-  getState(key) {
-    const stmt = this.db.prepare('SELECT value FROM runtime_state WHERE key = ?');
-    const row = stmt.get(key);
-    return row ? JSON.parse(row.value) : null;
-  }
-
-  setState(key, value) {
-    const stmt = this.db.prepare(`
-      INSERT OR REPLACE INTO runtime_state (key, value, updated_at)
-      VALUES (?, ?, ?)
-    `);
-    stmt.run(key, JSON.stringify(value), new Date().toISOString());
-  }
-
   // ========== Stats ==========
 
   statsSummary() {
     const total = this.db.prepare("SELECT COUNT(*) as c FROM memory_items").get().c;
-    const active = this.db.prepare("SELECT COUNT(*) as c FROM memory_items WHERE status = 'active'").get().c;
+    const active = this.db.prepare("SELECT COUNT(*) as c FROM memory_items WHERE status = 'active' AND state IN ('tentative', 'kept')").get().c;
     const tentative = this.db.prepare("SELECT COUNT(*) as c FROM memory_items WHERE state = 'tentative' AND status = 'active'").get().c;
-    const wikiCandidate = this.db.prepare("SELECT COUNT(*) as c FROM memory_items WHERE state = 'wiki_candidate' AND status = 'active'").get().c;
-    const published = this.db.prepare("SELECT COUNT(*) as c FROM memory_items WHERE state = 'published' AND status = 'active'").get().c;
+    const kept = this.db.prepare("SELECT COUNT(*) as c FROM memory_items WHERE state = 'kept' AND status = 'active'").get().c;
     const sessions = this.db.prepare("SELECT COUNT(*) as c FROM sessions").get().c;
-    return { total, active, tentative, wiki_candidate: wikiCandidate, published, sessions };
+    return { total, active, tentative, kept, sessions };
   }
 
   getDailyWriteCount() {
@@ -589,7 +465,7 @@ export class SqliteStore {
   listActiveFacts(limit = 1000) {
     const stmt = this.db.prepare(`
       SELECT * FROM memory_items
-      WHERE status = 'active' AND state != 'discarded'
+      WHERE status = 'active' AND state IN ('tentative', 'kept')
       ORDER BY updated_at DESC
       LIMIT ?
     `);
@@ -598,12 +474,8 @@ export class SqliteStore {
 
   supersedeMemory(oldMemoryId, newMemory) {
     const now = newMemory.created_at || new Date().toISOString();
-    // Mark old memory as archived/superseded
-    this.db.prepare(`
-      UPDATE memory_items
-      SET status = 'archived', state = 'discarded', updated_at = ?
-      WHERE id = ?
-    `).run(now, oldMemoryId);
+    // Delete old memory
+    this.deleteMemory(oldMemoryId);
 
     // Insert new memory
     const saved = this.saveMemory(newMemory);
@@ -637,21 +509,9 @@ export class SqliteStore {
     return { deleted: result.changes };
   }
 
-  cleanupOldMentions(maxAgeDays) {
-    const cutoff = new Date(Date.now() - maxAgeDays * 24 * 60 * 60 * 1000).toISOString();
-    const result = this.db.prepare(`DELETE FROM memory_mentions WHERE seen_at < ?`).run(cutoff);
-    return { deleted: result.changes };
-  }
-
   cleanupOldEvents(maxAgeDays) {
     const cutoff = new Date(Date.now() - maxAgeDays * 24 * 60 * 60 * 1000).toISOString();
     const result = this.db.prepare(`DELETE FROM memory_events WHERE created_at < ?`).run(cutoff);
-    return { deleted: result.changes };
-  }
-
-  cleanupOldReviews(maxAgeDays) {
-    const cutoff = new Date(Date.now() - maxAgeDays * 24 * 60 * 60 * 1000).toISOString();
-    const result = this.db.prepare(`DELETE FROM memory_reviews WHERE created_at < ?`).run(cutoff);
     return { deleted: result.changes };
   }
 
@@ -662,6 +522,21 @@ export class SqliteStore {
       WHERE state = 'tentative' AND status = 'active' AND created_at < ?
     `).run(cutoff);
     return { deleted: result.changes };
+  }
+
+  // ========== State Migration ==========
+
+  _migrateStates() {
+    // Migrate old states to simplified tentative/kept model
+    try {
+      this.db.prepare("UPDATE memory_items SET state = 'kept' WHERE state IN ('local_only', 'manual_only') AND status = 'active'").run();
+      // Delete discarded/archived items (they were soft-deleted before, now we hard-delete)
+      this.db.prepare("DELETE FROM memory_items WHERE state = 'discarded' OR status IN ('archived', 'discarded')").run();
+      // Clean up orphaned aliases
+      this.db.prepare("DELETE FROM memory_aliases WHERE memory_id NOT IN (SELECT id FROM memory_items)").run();
+    } catch (err) {
+      // Non-fatal: migration best-effort
+    }
   }
 }
 

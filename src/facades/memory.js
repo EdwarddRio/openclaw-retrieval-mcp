@@ -1,5 +1,8 @@
 /**
  * Memory facade - orchestrates memory operations via LocalMemoryStore.
+ * Two states: tentative (temporary, 7-day TTL) and kept (permanent).
+ * Discarding a memory = hard DELETE from database.
+ * Wiki is independently managed by the LLMWiki compiler.
  */
 
 import { LocalMemoryStore } from '../memory/local-memory.js';
@@ -19,14 +22,6 @@ export class MemoryFacade {
 
   saveMemoryChoice({ memoryId, choice, updatedAt }) {
     return this.localMemory.saveMemoryChoice({ memoryId, choice, updatedAt });
-  }
-
-  listMemoryReviews(limit = 50) {
-    return this.localMemory.listMemoryReviews(limit);
-  }
-
-  reviewMemoryCandidate({ memoryId, action, publishTarget, updatedAt }) {
-    return this.localMemory.reviewMemoryCandidate({ memoryId, action, publishTarget, updatedAt });
   }
 
   memoryTimeline({ memoryId, sessionId, limit }) {
