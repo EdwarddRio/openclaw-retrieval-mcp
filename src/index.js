@@ -78,9 +78,11 @@ fastify.post('/api/memory/query', async (request, reply) => {
 
 fastify.post('/api/memory/query-context', async (request, reply) => {
   try {
-    const { query, top_k } = request.body;
+    const { query, top_k, include_debug } = request.body;
     const result = await knowledgeBase.queryMemoryContext(query, top_k);
-    await queryExporter.exportQueryContext({ query, result });
+    if (include_debug && queryExporter) {
+      await queryExporter.exportQueryContext({ query, result });
+    }
     return result;
   } catch (err) {
     reply.code(500);
