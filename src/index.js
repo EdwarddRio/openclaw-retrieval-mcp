@@ -7,10 +7,13 @@ import Fastify from 'fastify';
 import { HTTP_HOST, HTTP_PORT } from './config.js';
 import { KnowledgeBase } from './knowledge-base.js';
 import { KnowledgeBasePresenter } from './api/presenter.js';
+import { QueryExporter } from './api/query-exporter.js';
 
 const fastify = Fastify({
   logger: true,
 });
+
+const queryExporter = new QueryExporter();
 
 // Initialize knowledge base
 const knowledgeBase = new KnowledgeBase();
@@ -77,6 +80,7 @@ fastify.post('/api/memory/query-context', async (request, reply) => {
   try {
     const { query, top_k } = request.body;
     const result = await knowledgeBase.queryMemoryContext(query, top_k);
+    await queryExporter.exportQueryContext({ query, result });
     return result;
   } catch (err) {
     reply.code(500);
@@ -110,7 +114,14 @@ fastify.get('/api/memory/reviews', async (request, reply) => {
   try {
     const { limit } = request.query;
     const result = await knowledgeBase.listMemoryReviews(parseInt(limit) || 50);
-    return { items: result };
+    const hint = result.length > 0
+      ? `当前有 ${result.length} 条待审核 wiki 候选。可选操作：publish（发布到 wiki）、keep_local（保留在 localmem）、discard（丢弃）、manual_only（手动管理）。先查看详情，再执行 action。`
+      : '';
+    return {
+      items: result,
+      hint,
+      available_actions: ['publish', 'keep_local', 'discard', 'manual_only'],
+    };
   } catch (err) {
     reply.code(500);
     return KnowledgeBasePresenter.presentError(err, 500);

@@ -5,6 +5,7 @@
 import { CollectionManager } from '../retrieval/collection-manager.js';
 import { logger, DEFAULT_TOP_K, CHROMA_DIR, INDEX_COLLECTIONS } from '../config.js';
 import { KnowledgeBaseSearchService } from '../api/search-service.js';
+import { QueryExporter } from '../api/query-exporter.js';
 
 export class SearchFacade {
   constructor(options = {}) {
@@ -14,6 +15,7 @@ export class SearchFacade {
     this.searchService = new KnowledgeBaseSearchService({
       collectionManager: this.collectionManager,
       memoryStore: this.memoryStore,
+      queryExporter: new QueryExporter(),
     });
   }
 

@@ -374,6 +374,7 @@ export class LocalMemoryStore {
 
   listMemoryReviews(limit = 50) {
     const items = this._store.listMemoryByState('wiki_candidate', limit);
+    const availableActions = ['publish', 'keep_local', 'discard', 'manual_only'];
     return items.map(item => ({
       memory_id: item.memory_id,
       review_id: item.memory_id,
@@ -383,6 +384,7 @@ export class LocalMemoryStore {
       updated_at: item.updated_at,
       reason: '',
       recommended_action: 'publish',
+      available_actions: [...availableActions],
       source_queue_type: 'wiki_candidate',
     }));
   }
@@ -490,9 +492,13 @@ export class LocalMemoryStore {
 
   _reviewSummaryCounts() {
     const wikiCandidate = this._store.listMemoryByState('wiki_candidate', 1).length;
+    const actionHint = wikiCandidate > 0
+      ? '可选操作：publish（发布到 wiki）、keep_local（保留在 localmem）、discard（丢弃）、manual_only（手动管理）。先 list_memory_reviews 查看，再 review_memory_candidate 执行 action。'
+      : '';
     return {
       pending_review_count: wikiCandidate,
       wiki_candidate_count: wikiCandidate,
+      review_hint: actionHint,
     };
   }
 
