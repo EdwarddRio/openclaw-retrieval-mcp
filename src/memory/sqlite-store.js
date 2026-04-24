@@ -530,6 +530,7 @@ export class SqliteStore {
     // Migrate old states to simplified tentative/kept model
     try {
       this.db.prepare("UPDATE memory_items SET state = 'kept' WHERE state IN ('local_only', 'manual_only') AND status = 'active'").run();
+      this.db.prepare("UPDATE memory_items SET state = 'tentative' WHERE state IN ('wiki_candidate', 'candidate_on_reuse') AND status = 'active'").run();
       // Delete discarded/archived items (they were soft-deleted before, now we hard-delete)
       this.db.prepare("DELETE FROM memory_items WHERE state = 'discarded' OR status IN ('archived', 'discarded')").run();
       // Clean up orphaned aliases
