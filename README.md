@@ -80,6 +80,27 @@ tentative ──用户确认──→ kept（永久保留）
 - **Canonical Key SHA1 去重**：相同语义的记忆只存一份
 - **每日写入限流**：自动来源每天最多 20 条
 
+#### 待审核记忆提醒
+
+tentative 记忆不会主动弹窗通知，但通过**心跳兜底脚本**实现被动提醒：
+
+```
+心跳触发 → check-review-reminder.sh → 查 SQLite tentative 记忆
+  ├─ 有 tentative → 输出提醒文本 → 心跳推送给你
+  └─ 无 tentative → 输出空 → 继续 HEARTBEAT_OK
+```
+
+| 触发时机 | 机制 | 说明 |
+|---------|------|------|
+| 心跳 | `check-review-reminder.sh` | 查 SQLite，有 tentative 就输出提醒 |
+| 查询记忆 | `queryMemoryFull()` 返回 `tentative_items` | Agent 可选择提醒用户 |
+| 7天过期 | `_maybePeriodicCleanup()` → 硬删除 | 不留痕迹 |
+
+脚本位置：`/root/.openclaw/workspace/scripts/check-review-reminder.sh`
+
+- 默认输出纯文本提醒；无提醒时输出空
+- `check-review-reminder.sh json`：输出结构化 JSON，含 `age_days` 和 `expires_in_days`
+
 ### 3. LLM Wiki 编译 (`wiki_*` MCP 工具)
 
 基于 Karpathy LLM Wiki 模式的结构化知识库：

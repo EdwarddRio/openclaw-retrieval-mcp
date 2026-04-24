@@ -157,11 +157,32 @@ ORDER BY updated_at DESC LIMIT topK
 
 2 状态模型：
 
-- `tentative`：临时，7 天未确认自动清理
+- `tentative`：临时，7 天未确认自动清理（硬删除，不留痕迹）
 - `kept`：永久，用户确认后保留
-- 丢弃 = 硬删除（从 SQLite DELETE，不留痕迹）
+- 丢弃 = 硬删除（从 SQLite DELETE）
 
-**小白**：为什么不用软删除？
+**小白**：tentative 记忆会提醒我吗？7天就静默删了？
+
+**架构师**：不是完全静默。中间层自己不会弹通知，但有一个**心跳兜底脚本** `check-review-reminder.sh` 做被动提醒：
+
+```
+心跳触发（每 6 小时）→ 跑 check-review-reminder.sh
+  → 查 SQLite: SELECT ... WHERE state = 'tentative' AND status = 'active'
+  → 有结果 → 输出提醒文本，心跳不回 HEARTBEAT_OK，而是推送给你
+  → 无结果 → 输出空，心跳正常结束
+```
+
+另外，`queryMemoryFull()` 返回结果里会附带 `tentative_items` 列表，Agent 在对话中也可以提醒你。
+
+所以提醒有两条路：
+
+| 时机 | 链路 | 触发条件 |
+|------|------|---------|
+| 心跳 | `check-review-reminder.sh` → HEARTBEAT.md | 有 tentative 记忆 |
+| 对话 | `queryMemoryFull()` → `tentative_items` | Agent 查记忆时 |
+| 7天到期 | `_maybePeriodicCleanup()` → 硬删除 | 无需触发，自动执行 |
+
+**小白**：为什么不用 FTS5？
 
 **架构师**：之前的 7 态模型（tentative / local_only / manual_only / candidate_on_reuse / wiki_candidate / published / discarded）太复杂了。实际使用中，local_only 和 manual_only 没有语义差异，candidate_on_reuse 和 wiki_candidate 的提权路径也几乎没人用。简化为 2 态后，代码量减半，认知负担大幅降低。
 
