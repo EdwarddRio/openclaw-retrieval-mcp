@@ -15,6 +15,45 @@ const fastify = Fastify({
 
 const queryExporter = new QueryExporter();
 
+/**
+ * 根据检索结果生成洞察文本，供梦境系统消费。
+ * 只在有显著信号时返回非空字符串。
+ */
+function buildRetrospective(query, result) {
+  const {
+    matched_sessions = [],
+    matched_turns = [],
+    hits = [],
+    confidence = 0,
+    should_abstain = false,
+    abstain_reason = '',
+  } = result || {};
+
+  const staticHits = hits.filter(h => h.source !== 'memory' && h.collection !== 'memory');
+  const memoryHits = hits.filter(h => h.source === 'memory' || h.collection === 'memory');
+  const hasStatic = staticHits.length > 0;
+  const hasMemory = memoryHits.length > 0 || matched_sessions.length > 0 || matched_turns.length > 0;
+
+  // 完全无命中 → 知识缺口
+  if (!hasStatic && !hasMemory) {
+    return `[检索洞察] 查询"${query}"在中间层无任何命中。这可能是一个全新话题，建议记录到 wiki 或每日记忆。`;
+  }
+
+  // static 无命中但 memory 有 → 知识只在会话中，未沉淀到 wiki
+  if (!hasStatic && hasMemory) {
+    const sessions = matched_sessions.slice(0, 2).map(s => s.title || '未命名会话').join('、');
+    return `[检索洞察] 查询"${query}"在 static_kb 无命中，但 memory 中有 ${matched_sessions.length} 个相关会话（${sessions}）。说明相关知识只存在于临时对话中，未沉淀为长期记忆，建议提炼后写入 wiki。`;
+  }
+
+  // 低置信度 abstain → 检索质量不足
+  if (should_abstain && confidence < 0.5) {
+    return `[检索洞察] 查询"${query}"检索结果被系统主动弃权（${abstain_reason}），confidence=${confidence.toFixed(2)}。当前记忆/知识库对该查询覆盖不足。`;
+  }
+
+  // 正常命中，无需洞察
+  return null;
+}
+
 // Initialize knowledge base
 const knowledgeBase = new KnowledgeBase();
 await knowledgeBase.initializeEager();
@@ -78,12 +117,28 @@ fastify.post('/api/memory/query', async (request, reply) => {
 
 fastify.post('/api/memory/query-context', async (request, reply) => {
   try {
-    const { query, top_k, include_debug } = request.body;
+    const { query, top_k, include_debug, session_id } = request.body;
     const result = await knowledgeBase.queryMemoryContext(query, top_k);
     if (include_debug && queryExporter) {
       await queryExporter.exportQueryContext({ query, result });
     }
-    return result;
+    
+    // 生成检索洞察，自动注入 session（如有 session_id）
+    const retrospective = buildRetrospective(query, result);
+    if (retrospective && session_id) {
+      try {
+        await knowledgeBase.appendSessionTurn({
+          sessionId: session_id,
+          role: 'system',
+          content: retrospective,
+          title: '检索洞察',
+        });
+      } catch (e) {
+        fastify.log.warn({ msg: 'retrospective append failed', err: e.message });
+      }
+    }
+    
+    return { ...result, retrospective };
   } catch (err) {
     reply.code(500);
     return KnowledgeBasePresenter.presentError(err, 500);

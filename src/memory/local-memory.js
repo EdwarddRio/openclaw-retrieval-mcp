@@ -600,6 +600,7 @@ export class LocalMemoryStore {
       path_hints: options.path_hints || [],
       collection_hints: options.collection_hints || [],
       facts,
+      semanticEnabled: !isAutoSource,
     });
 
     if (plan.strategy === 'keep_existing') {

@@ -49,6 +49,7 @@ export async function planKnowledgeUpdate({
   pathHints = [],
   collectionHints = [],
   facts = [],
+  semanticEnabled = true,
 }) {
   const candidateProfile = _topicProfile(content, aliases, pathHints, collectionHints);
   const relatedFacts = [];
@@ -98,27 +99,29 @@ export async function planKnowledgeUpdate({
   }
 
   // Fallback to semantic (embedding-based) detection when lexical signals are weak
-  const semanticMatches = await _semanticRelatedFacts(candidateProfile, facts);
-  if (semanticMatches.length === 1) {
-    const mid = semanticMatches[0].memory_id || '';
-    return {
-      strategy: 'supersede_existing',
-      suggestedMemoryId: mid,
-      relatedMemoryIds: mid ? [mid] : [],
-      conflictMemoryIds: mid ? [mid] : [],
-    };
-  }
+  if (semanticEnabled) {
+    const semanticMatches = await _semanticRelatedFacts(candidateProfile, facts);
+    if (semanticMatches.length === 1) {
+      const mid = semanticMatches[0].memory_id || '';
+      return {
+        strategy: 'supersede_existing',
+        suggestedMemoryId: mid,
+        relatedMemoryIds: mid ? [mid] : [],
+        conflictMemoryIds: mid ? [mid] : [],
+      };
+    }
 
-  if (semanticMatches.length > 1) {
-    const mids = semanticMatches
-      .map(m => m.memory_id)
-      .filter(Boolean);
-    return {
-      strategy: 'resolve_conflict',
-      suggestedMemoryId: '',
-      relatedMemoryIds: mids,
-      conflictMemoryIds: mids,
-    };
+    if (semanticMatches.length > 1) {
+      const mids = semanticMatches
+        .map(m => m.memory_id)
+        .filter(Boolean);
+      return {
+        strategy: 'resolve_conflict',
+        suggestedMemoryId: '',
+        relatedMemoryIds: mids,
+        conflictMemoryIds: mids,
+      };
+    }
   }
 
   return {
