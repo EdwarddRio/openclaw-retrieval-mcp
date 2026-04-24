@@ -618,6 +618,51 @@ export class SqliteStore {
 
     return { oldMemoryId, newMemory: saved };
   }
+
+  // ========== Periodic cleanup ==========
+
+  cleanupOldTurns(maxAgeDays) {
+    const cutoff = new Date(Date.now() - maxAgeDays * 24 * 60 * 60 * 1000).toISOString();
+    const result = this.db.prepare(`DELETE FROM turns WHERE created_at < ?`).run(cutoff);
+    return { deleted: result.changes };
+  }
+
+  cleanupOldSessions(maxAgeDays) {
+    const cutoff = new Date(Date.now() - maxAgeDays * 24 * 60 * 60 * 1000).toISOString();
+    const result = this.db.prepare(`
+      DELETE FROM sessions
+      WHERE updated_at < ? AND status != 'active'
+      AND id NOT IN (SELECT DISTINCT session_id FROM turns)
+    `).run(cutoff);
+    return { deleted: result.changes };
+  }
+
+  cleanupOldMentions(maxAgeDays) {
+    const cutoff = new Date(Date.now() - maxAgeDays * 24 * 60 * 60 * 1000).toISOString();
+    const result = this.db.prepare(`DELETE FROM memory_mentions WHERE seen_at < ?`).run(cutoff);
+    return { deleted: result.changes };
+  }
+
+  cleanupOldEvents(maxAgeDays) {
+    const cutoff = new Date(Date.now() - maxAgeDays * 24 * 60 * 60 * 1000).toISOString();
+    const result = this.db.prepare(`DELETE FROM memory_events WHERE created_at < ?`).run(cutoff);
+    return { deleted: result.changes };
+  }
+
+  cleanupOldReviews(maxAgeDays) {
+    const cutoff = new Date(Date.now() - maxAgeDays * 24 * 60 * 60 * 1000).toISOString();
+    const result = this.db.prepare(`DELETE FROM memory_reviews WHERE created_at < ?`).run(cutoff);
+    return { deleted: result.changes };
+  }
+
+  cleanupExpiredTentative(ttlDays) {
+    const cutoff = new Date(Date.now() - ttlDays * 24 * 60 * 60 * 1000).toISOString();
+    const result = this.db.prepare(`
+      DELETE FROM memory_items
+      WHERE state = 'tentative' AND status = 'active' AND created_at < ?
+    `).run(cutoff);
+    return { deleted: result.changes };
+  }
 }
 
 export default SqliteStore;

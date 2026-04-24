@@ -54,8 +54,8 @@ export class KnowledgeBase {
     return this.memoryFacade.queryMemory(query, topK);
   }
 
-  queryMemoryContext(query, topK = 3) {
-    return this.memoryFacade.queryMemoryContext(query, topK);
+  queryMemoryContext(query, topK = 3, sessionId = null) {
+    return this.memoryFacade.queryMemoryContext(query, topK, sessionId);
   }
 
   saveMemoryChoice({ memoryId, choice, updatedAt }) {

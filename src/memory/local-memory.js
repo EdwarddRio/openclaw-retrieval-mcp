@@ -116,6 +116,7 @@ export class LocalMemoryStore {
   }
 
   queryMemoryFull(query, topK = 3, sessionId = null) {
+    this._maybePeriodicCleanup();
     const hits = this._store.queryMemory(query, topK);
     const tentativeItems = this._store.listMemoryByState('tentative', topK);
     const reviewQueue = this.listMemoryReviews(Math.max(topK * 3, 1));
@@ -168,7 +169,13 @@ export class LocalMemoryStore {
     };
   }
 
-  queryMemoryContext(query, topK = 3) {
+  queryMemoryContext(query, topK = 3, sessionId = null) {
+    this._maybePeriodicCleanup();
+    // 如果未传 sessionId，尝试获取当前活跃会话
+    if (!sessionId) {
+      const activeSession = this._store.getActiveSession ? this._store.getActiveSession() : null;
+      sessionId = activeSession?.session_id || null;
+    }
     const hits = this._store.queryMemory(query, topK * 2);
     const reviewQueue = this.listMemoryReviews(Math.max(topK * 3, 1));
     const reviewQueueSummary = this._reviewSummaryCounts();
@@ -177,6 +184,23 @@ export class LocalMemoryStore {
     const aliases = [...new Set(hits.flatMap(item => item.aliases || []))];
     const pathHints = [...new Set(hits.flatMap(item => item.path_hints || []))];
     const collectionHints = [...new Set(hits.flatMap(item => item.collection_hints || []))];
+
+    if (sessionId) {
+      const insight = this._buildRetrievalInsight({ query, hits, freshness, reviewQueue, reviewQueueSummary });
+      if (insight) {
+        try {
+          this.appendTurn({
+            session_id: sessionId,
+            role: 'system',
+            content: `[检索洞察] ${insight}`,
+            references: { synthetic: 'retrieval_summary', insight_type: 'memory_query' },
+          });
+        } catch (err) {
+          logger.warn(`Insight injection failed: ${err.message}`);
+        }
+      }
+    }
+
     return {
       query,
       matched_sessions: [],
@@ -220,6 +244,7 @@ export class LocalMemoryStore {
   }
 
   saveMemory(options) {
+    this._maybePeriodicCleanup();
     const {
       session_id,
       content,
@@ -521,6 +546,56 @@ export class LocalMemoryStore {
     if (minAge < 7) return { level: 'recent', note: 'Updated within a week', age_days: Math.floor(minAge) };
     if (minAge < 30) return { level: 'stale', note: 'Updated within a month', age_days: Math.floor(minAge) };
     return { level: 'old', note: 'Not updated recently', age_days: Math.floor(minAge) };
+  }
+
+  _buildRetrievalInsight({ query, hits, freshness, reviewQueueSummary }) {
+    const parts = [];
+    const hasHits = hits.length > 0;
+
+    if (!hasHits) {
+      parts.push(`记忆查询未命中任何结果（query: "${(query || '').slice(0, 60)}..."）。可能原因：记忆库为空、查询文本不匹配，或这是一个全新话题。`);
+    } else {
+      parts.push(`记忆查询命中 ${hits.length} 条结果，新鲜度 ${freshness.level}。`);
+    }
+
+    if (reviewQueueSummary.wiki_candidate_count > 0) {
+      parts.push(`当前有 ${reviewQueueSummary.wiki_candidate_count} 条 wiki_candidate 待审核。`);
+    }
+
+    if (freshness.level === 'stale' || freshness.level === 'old') {
+      parts.push(`注意：命中记忆已 ${freshness.age_days} 天未更新，可能已过时。`);
+    }
+
+    if (!hasHits && reviewQueueSummary.wiki_candidate_count > 0) {
+      parts.push(`建议：有相关候选记忆待审核，审核后可能改善查询结果。`);
+    }
+
+    return parts.join(' ');
+  }
+
+  _maybePeriodicCleanup() {
+    const now = Date.now();
+    const sixHours = 6 * 60 * 60 * 1000;
+    if (this._lastCleanupAt && (now - this._lastCleanupAt) < sixHours) {
+      return;
+    }
+    this._lastCleanupAt = now;
+    try {
+      const sessionAge = Math.min(this._factMaxAgeDays || 180, 60);
+      const turnResult = this._store.cleanupOldTurns(sessionAge);
+      const sessionResult = this._store.cleanupOldSessions(sessionAge);
+      const mentionResult = this._store.cleanupOldMentions(30);
+      const eventResult = this._store.cleanupOldEvents(30);
+      const reviewResult = this._store.cleanupOldReviews(90);
+      const tentativeResult = this._store.cleanupExpiredTentative(7);
+      logger.info(
+        `Periodic cleanup: turns=${turnResult.deleted}, sessions=${sessionResult.deleted}, ` +
+        `mentions=${mentionResult.deleted}, events=${eventResult.deleted}, ` +
+        `reviews=${reviewResult.deleted}, tentative=${tentativeResult.deleted}`
+      );
+    } catch (err) {
+      logger.warn(`Periodic cleanup failed: ${err.message}`);
+    }
   }
 
   /**

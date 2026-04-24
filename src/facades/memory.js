@@ -13,8 +13,8 @@ export class MemoryFacade {
     return this.localMemory.queryMemoryFull(query, topK, sessionId);
   }
 
-  queryMemoryContext(query, topK = 3) {
-    return this.localMemory.queryMemoryContext(query, topK);
+  queryMemoryContext(query, topK = 3, sessionId = null) {
+    return this.localMemory.queryMemoryContext(query, topK, sessionId);
   }
 
   saveMemoryChoice({ memoryId, choice, updatedAt }) {
