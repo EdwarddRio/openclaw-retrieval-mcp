@@ -16,9 +16,11 @@ import {
   MEMORY_QUERY_INPUT_SCHEMA,
 } from './api/contract.js';
 
+/** 知识库实例，MCP 工具调用的核心后端 */
 const knowledgeBase = new KnowledgeBase();
 await knowledgeBase.initializeEager();
 
+/** MCP 服务器实例，通过 stdio 传输协议暴露工具 */
 const server = new Server(
   {
     name: 'openclaw-context-engine',
@@ -285,6 +287,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
   };
 });
 
+/**
+ * 处理 MCP 工具调用请求，根据工具名路由到对应的 KnowledgeBase 方法
+ * @param {Object} request - MCP 请求对象
+ * @param {Object} request.params - 请求参数
+ * @param {string} request.params.name - 工具名称
+ * @param {Object} request.params.arguments - 工具参数
+ */
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
 
@@ -450,6 +459,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 });
 
+/** stdio 传输层，用于与 MCP 客户端通信 */
 const transport = new StdioServerTransport();
 await server.connect(transport);
 console.error('MCP server started');

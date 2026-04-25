@@ -3,15 +3,20 @@
  * Architecture: localMem + LLMWiki. Semantic (embedding-based) detection removed.
  */
 
+/** 分词正则：匹配英文/数字/下划线片段或中文字符片段 */
 const TOKEN_RE = /[A-Za-z0-9_]+|[\u4e00-\u9fff]+/g;
+/** 大驼峰类名正则：匹配常见后缀（Service、Manager、Config 等）的 Java 风格类名 */
 const CAMEL_CASE_RE = /(?<![A-Za-z0-9_])[A-Z][A-Za-z0-9]*(?:Service|Action|Mapper|ConfigManager|Impl|Exception|Result|Type|Helper|Controller|Manager|Handler|Factory|Builder|Constants|Config)(?![A-Za-z0-9_])/g;
+/** 蛇形命名正则：匹配 snake_case 标识符 */
 const SNAKE_CASE_RE = /\b[a-z0-9]+(?:_[a-z0-9]+)+\b/g;
 
+/** 主题分词停用词，这些词在主题匹配时被忽略 */
 const TOPIC_STOPWORDS = new Set([
   '以后', '必须', '统一', '不要', '优先', '默认', '约定', '建议', '应该', '需要', '可以',
   '当前', '这个', '那个', '这样', '进行', '处理', '相关', '问题', '方案', '新增',
 ]);
 
+/** 记忆状态优先级排序权重，kept > tentative */
 const MEMORY_STATE_PRIORITY = {
   tentative: 1,
   kept: 2,
@@ -94,6 +99,14 @@ export async function planKnowledgeUpdate({
 // Topic profile & relation
 // ------------------------------------------------------------------
 
+/**
+ * 构建主题画像，包含归一化文本、别名、路径、集合、语义文本和 token 集合
+ * @param {string} content - 记忆内容
+ * @param {string[]} aliases - 别名列表
+ * @param {string[]} pathHints - 路径提示列表
+ * @param {string[]} collectionHints - 集合提示列表
+ * @returns {{ normalizedText: string, aliases: Set<string>, paths: Set<string>, collections: Set<string>, semanticText: string, tokens: Set<string> }}
+ */
 function _topicProfile(content, aliases, pathHints, collectionHints) {
   return {
     normalizedText: _normalizeText(content),
@@ -105,6 +118,12 @@ function _topicProfile(content, aliases, pathHints, collectionHints) {
   };
 }
 
+/**
+ * 判断候选记忆与已有事实是否属于同一主题，以及文本是否完全相同
+ * @param {Object} candidateProfile - 候选记忆的主题画像
+ * @param {Object} fact - 已有记忆事实
+ * @returns {{ sameTopic: boolean, sameText: boolean }}
+ */
 function _topicRelation(candidateProfile, fact) {
   const factProfile = _topicProfile(
     fact.content || '',
@@ -153,6 +172,14 @@ function _topicRelation(candidateProfile, fact) {
 // Helpers
 // ------------------------------------------------------------------
 
+/**
+ * 将内容、别名、路径提示、集合提示拼接为语义文本，用于主题匹配
+ * @param {string} content - 记忆内容
+ * @param {string[]} aliases - 别名列表
+ * @param {string[]} pathHints - 路径提示列表
+ * @param {string[]} collectionHints - 集合提示列表
+ * @returns {string} 拼接后的语义文本
+ */
 function _buildSemanticText(content, aliases, pathHints, collectionHints) {
   const parts = [];
   if (content) parts.push(content.trim());
@@ -173,6 +200,14 @@ function _buildSemanticText(content, aliases, pathHints, collectionHints) {
   return parts.filter(Boolean).join(' ').trim();
 }
 
+/**
+ * 从内容、别名、路径、集合中提取主题 token，过滤停用词和单字符
+ * @param {string} content - 记忆内容
+ * @param {string[]} aliases - 别名列表
+ * @param {string[]} pathHints - 路径提示列表
+ * @param {string[]} collectionHints - 集合提示列表
+ * @returns {string[]} 去重后的小写 token 列表
+ */
 function _topicTokens(content, aliases, pathHints, collectionHints) {
   const values = [content];
   values.push(...aliases.filter(Boolean));
@@ -200,6 +235,11 @@ function _topicTokens(content, aliases, pathHints, collectionHints) {
   return tokens;
 }
 
+/**
+ * 归一化文本：合并空白、去除首尾空白、转小写
+ * @param {string} text - 原始文本
+ * @returns {string} 归一化后的文本
+ */
 function _normalizeText(text) {
   return String(text || '')
     .replace(/\s+/g, ' ')
@@ -207,6 +247,11 @@ function _normalizeText(text) {
     .toLowerCase();
 }
 
+/**
+ * 归一化路径：反斜杠转正斜杠、去除首尾空白、转小写
+ * @param {string} pathHint - 原始路径
+ * @returns {string} 归一化后的路径
+ */
 function _normalizePath(pathHint) {
   return String(pathHint || '')
     .replace(/\\/g, '/')
@@ -214,6 +259,11 @@ function _normalizePath(pathHint) {
     .toLowerCase();
 }
 
+/**
+ * 从文本中提取别名（大驼峰类名和蛇形命名标识符）
+ * @param {string} text - 原始文本
+ * @returns {string[]} 去重后的别名列表
+ */
 function _extractAliases(text) {
   const aliases = [];
   for (const pattern of [CAMEL_CASE_RE, SNAKE_CASE_RE]) {
@@ -225,6 +275,11 @@ function _extractAliases(text) {
   return aliases;
 }
 
+/**
+ * 对记忆事实排序：优先级(kept>tentative) > 命中次数 > 更新时间 > ID
+ * @param {Array<Object>} facts - 待排序的记忆事实列表
+ * @returns {Array<Object>} 排序后的列表
+ */
 function _sortedFacts(facts) {
   return [...facts].sort((a, b) => {
     const pa = MEMORY_STATE_PRIORITY[a.state] || 0;
@@ -240,6 +295,12 @@ function _sortedFacts(facts) {
   });
 }
 
+/**
+ * 计算两个 Set 的交集
+ * @param {Set} a - 集合 A
+ * @param {Set} b - 集合 B
+ * @returns {Set} 交集结果
+ */
 function _setIntersect(a, b) {
   const result = new Set();
   for (const item of a) {

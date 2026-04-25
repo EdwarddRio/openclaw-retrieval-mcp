@@ -14,17 +14,21 @@ import path from 'path';
 import { logger, PROJECT_ROOT } from '../config.js';
 import { WikiManifest } from './manifest.js';
 
-// LLMWiki root is always at workspace/LLMWiki/
+// LLMWiki 根目录，始终位于 workspace/LLMWiki/
 const LLMWIKI_DIR = path.join(PROJECT_ROOT, 'LLMWiki');
 
 export class WikiCompiler {
+  /**
+   * @param {Object} options - 配置选项
+   * @param {string} options.llmwikiDir - LLMWiki 目录路径，默认为 workspace/LLMWiki
+   */
   constructor(options = {}) {
-    this._llmwikiDir = options.llmwikiDir || LLMWIKI_DIR;
-    this._rawDir = path.join(this._llmwikiDir, 'raw');
-    this._wikiDir = path.join(this._llmwikiDir, 'wiki');
-    this._schemaPath = path.join(this._llmwikiDir, 'schema.md');
-    this._sourcesPath = path.join(this._llmwikiDir, 'raw-sources.json');
-    this._manifestPath = path.join(this._llmwikiDir, 'wiki-manifest.json');
+    this._llmwikiDir = options.llmwikiDir || LLMWIKI_DIR; // LLMWiki 根目录
+    this._rawDir = path.join(this._llmwikiDir, 'raw'); // 原始素材目录
+    this._wikiDir = path.join(this._llmwikiDir, 'wiki'); // 编译输出目录
+    this._schemaPath = path.join(this._llmwikiDir, 'schema.md'); // Wiki 页面 Schema
+    this._sourcesPath = path.join(this._llmwikiDir, 'raw-sources.json'); // 数据源配置文件
+    this._manifestPath = path.join(this._llmwikiDir, 'wiki-manifest.json'); // 编译清单
     this._manifest = new WikiManifest(this._manifestPath);
   }
 
@@ -451,6 +455,11 @@ export class WikiCompiler {
     return result;
   }
 
+  /**
+   * 递归遍历目录，收集所有 .md 文件（排除 node_modules/.git 等）
+   * @param {string} dir - 要遍历的目录路径
+   * @returns {string[]} 找到的 Markdown 文件绝对路径列表
+   */
   _walkMarkdown(dir) {
     const results = [];
     const IGNORE = new Set(['node_modules', '.git', 'dist', 'build', '__pycache__', 'venv', '.venv']);
@@ -476,6 +485,10 @@ export class WikiCompiler {
     return results;
   }
 
+  /**
+   * 列出 wiki 目录下所有已编译的 Markdown 页面（排除 index.md）
+   * @returns {string[]} 页面文件名列表（排序后）
+   */
   _listWikiPages() {
     if (!fs.existsSync(this._wikiDir)) return [];
     return fs.readdirSync(this._wikiDir)

@@ -3,9 +3,12 @@
  */
 
 // ========== API Version & Endpoints ==========
+/** API 主版本号 */
 export const API_VERSION = '1';
+/** API 路由前缀 */
 export const API_PREFIX = '/api';
 
+/** 搜索相关端点路径 */
 export const SEARCH_ENDPOINTS = {
   SEARCH: `${API_PREFIX}/search`,
   SEARCH_SYNC: `${API_PREFIX}/search/sync`,
@@ -13,6 +16,7 @@ export const SEARCH_ENDPOINTS = {
   COLLECTIONS: `${API_PREFIX}/collections`,
 };
 
+/** 记忆相关端点路径 */
 export const MEMORY_ENDPOINTS = {
   SESSIONS: `${API_PREFIX}/memory/sessions`,
   SESSION: `${API_PREFIX}/memory/sessions/:session_id`,
@@ -24,11 +28,13 @@ export const MEMORY_ENDPOINTS = {
   STATS: `${API_PREFIX}/memory/stats`,
 };
 
+/** 健康检查端点路径 */
 export const HEALTH_ENDPOINTS = {
   HEALTH: `${API_PREFIX}/health`,
   READY: `${API_PREFIX}/health/ready`,
 };
 
+/** 所有 API 端点的合集 */
 export const API_ENDPOINTS = {
   ...SEARCH_ENDPOINTS,
   ...MEMORY_ENDPOINTS,
@@ -37,6 +43,7 @@ export const API_ENDPOINTS = {
 
 // ========== Request Contracts (Class-based with validate) ==========
 
+/** 搜索请求模型 */
 export class SearchRequest {
   constructor(options = {}) {
     this.query = options.query || '';
@@ -50,6 +57,10 @@ export class SearchRequest {
     this.include_debug = options.include_debug || false;
   }
 
+  /**
+   * 验证请求参数
+   * @returns {{ valid: boolean, errors: string[] }}
+   */
   validate() {
     const errors = [];
     if (!this.query || this.query.trim().length === 0) {
@@ -62,12 +73,17 @@ export class SearchRequest {
   }
 }
 
+/** 记忆查询请求模型 */
 export class MemoryQueryRequest {
   constructor(options = {}) {
     this.query = options.query || '';
     this.top_k = options.top_k || 3;
   }
 
+  /**
+   * 验证请求参数
+   * @returns {{ valid: boolean, errors: string[] }}
+   */
   validate() {
     const errors = [];
     if (!this.query || this.query.trim().length === 0) {
@@ -77,6 +93,7 @@ export class MemoryQueryRequest {
   }
 }
 
+/** 记忆保存请求模型 */
 export class MemorySaveRequest {
   constructor(options = {}) {
     this.session_id = options.session_id || null;
@@ -88,6 +105,10 @@ export class MemorySaveRequest {
     this.source = options.source || 'manual';
   }
 
+  /**
+   * 验证请求参数
+   * @returns {{ valid: boolean, errors: string[] }}
+   */
   validate() {
     const errors = [];
     if (!this.session_id) {
@@ -100,6 +121,7 @@ export class MemorySaveRequest {
   }
 }
 
+/** 基准测试结果请求模型 */
 export class BenchmarkResultRequest {
   constructor(options = {}) {
     this.suite_name = options.suite_name || '';
@@ -114,6 +136,7 @@ export class BenchmarkResultRequest {
   }
 }
 
+/** 会话轮次请求模型 */
 export class SessionTurnRequest {
   constructor(options = {}) {
     this.session_id = options.session_id || '';
@@ -126,6 +149,7 @@ export class SessionTurnRequest {
   }
 }
 
+/** 创建记忆会话请求模型 */
 export class StartMemorySessionRequest {
   constructor(options = {}) {
     this.project_id = options.project_id || 'default';
@@ -135,6 +159,7 @@ export class StartMemorySessionRequest {
   }
 }
 
+/** 导入对话记录会话请求模型 */
 export class ImportTranscriptSessionRequest {
   constructor(options = {}) {
     this.transcript_path = options.transcript_path || null;
@@ -149,6 +174,7 @@ export class ImportTranscriptSessionRequest {
 
 // ========== Response DTOs ==========
 
+/** 搜索结果条目 DTO */
 export class SearchResultItem {
   constructor(options = {}) {
     this.content = options.content || '';
@@ -163,6 +189,7 @@ export class SearchResultItem {
   }
 }
 
+/** 搜索响应 DTO */
 export class SearchResponse {
   constructor(options = {}) {
     this.query = options.query || '';
@@ -174,6 +201,7 @@ export class SearchResponse {
   }
 }
 
+/** 记忆条目 DTO */
 export class MemoryItem {
   constructor(options = {}) {
     this.memory_id = options.memory_id || '';
@@ -190,6 +218,7 @@ export class MemoryItem {
   }
 }
 
+/** 记忆搜索响应 DTO */
 export class MemorySearchResponse {
   constructor(options = {}) {
     this.query = options.query || '';
@@ -199,6 +228,7 @@ export class MemorySearchResponse {
   }
 }
 
+/** 健康检查响应 DTO */
 export class HealthResponse {
   constructor(options = {}) {
     this.status = options.status || 'healthy';
@@ -207,6 +237,7 @@ export class HealthResponse {
   }
 }
 
+/** 错误响应 DTO */
 export class ErrorResponse {
   constructor(options = {}) {
     this.error = options.error || 'Internal Server Error';
@@ -218,6 +249,7 @@ export class ErrorResponse {
 
 // ========== MCP Tool Input Schemas ==========
 
+/** 搜索工具 MCP 输入参数 Schema */
 export const SEARCH_TOOL_INPUT_SCHEMA = {
   type: 'object',
   properties: {
@@ -232,6 +264,7 @@ export const SEARCH_TOOL_INPUT_SCHEMA = {
   required: ['query'],
 };
 
+/** 记忆查询 MCP 输入参数 Schema */
 export const MEMORY_QUERY_INPUT_SCHEMA = {
   type: 'object',
   properties: {
@@ -243,6 +276,11 @@ export const MEMORY_QUERY_INPUT_SCHEMA = {
 
 // ========== Call Builders ==========
 
+/**
+ * 构建搜索调用参数，从 payload 中提取并填充默认值
+ * @param {Object} payload - 原始请求参数
+ * @returns {Object} 标准化的搜索调用参数
+ */
 export function buildSearchCall(payload) {
   return {
     query: payload.query || '',
@@ -255,6 +293,11 @@ export function buildSearchCall(payload) {
   };
 }
 
+/**
+ * 构建记忆查询调用参数
+ * @param {Object} payload - 原始请求参数
+ * @returns {Object} 标准化的记忆查询参数
+ */
 export function buildMemoryQueryCall(payload) {
   return {
     query: payload.query || '',

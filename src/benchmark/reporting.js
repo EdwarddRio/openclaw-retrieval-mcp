@@ -6,6 +6,12 @@
 import fs from 'fs';
 import path from 'path';
 
+/**
+ * 生成基准测试报告（JSON + Markdown 双格式），同时输出 latest 副本
+ * @param {Object} suiteResult - 套件运行结果
+ * @param {string} reportDir - 报告输出目录
+ * @returns {Promise<{ jsonPath: string, mdPath: string }>} 输出文件路径
+ */
 export async function generateReport(suiteResult, reportDir) {
   if (!fs.existsSync(reportDir)) {
     fs.mkdirSync(reportDir, { recursive: true });
@@ -30,6 +36,11 @@ export async function generateReport(suiteResult, reportDir) {
   return { jsonPath, mdPath };
 }
 
+/**
+ * 将套件结果渲染为 Markdown 格式报告
+ * @param {Object} result - 套件运行结果
+ * @returns {string} Markdown 格式文本
+ */
 function _renderMarkdown(result) {
   const { suite_name, description, executed_at, cases, metrics } = result;
   const lines = [];

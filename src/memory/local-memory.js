@@ -18,10 +18,12 @@ import { planKnowledgeUpdate } from './governance.js';
 //   kept      — permanent, user-confirmed, persists in SQLite indefinitely
 // Discarding a memory = hard DELETE from the database.
 // Wiki is independently managed by the LLMWiki compiler.
+/** 允许保存的记忆状态：tentative（暂定）和 kept（已确认） */
 const SAVEABLE_STATES = new Set([
   'tentative', 'kept',
 ]);
 
+/** 用户显式要求记忆的关键词列表 */
 const EXPLICIT_MEMORY_SIGNALS = [
   '记住', '记下来', '以后都这样', '这个规则', '别忘了',
   '记住这个', '以后注意', '固定规则', '以后统一',
@@ -31,7 +33,16 @@ const EXPLICIT_MEMORY_SIGNALS = [
   'remember this', 'note this', 'keep this',
 ];
 
+/**
+ * 本地记忆存储，提供高层记忆操作（自动分诊、日写入限额、时间线集成）
+ */
 export class LocalMemoryStore {
+  /**
+   * @param {Object} options - 配置选项
+   * @param {string} [options.rootDir] - 存储根目录，默认 LOCALMEM_DIR
+   * @param {string} [options.projectRoot] - 项目根目录，用于路径提示过滤
+   * @param {number} [options.factMaxAgeDays] - 事实最大保留天数
+   */
   constructor(options = {}) {
     const rootDir = options.rootDir || LOCALMEM_DIR;
     this._root = path.resolve(rootDir);
@@ -45,10 +56,24 @@ export class LocalMemoryStore {
     this._store = new SqliteStore(this._dbPath);
   }
 
+  /** 关闭数据库连接 */
   close() {
     this._store.close();
   }
 
+  /**
+   * 追加一条对话轮次
+   * @param {Object} options - 轮次选项
+   * @param {string} options.session_id - 会话 ID
+   * @param {string} options.role - 角色（user/assistant/system）
+   * @param {string} options.content - 内容
+   * @param {string} [options.project_id] - 项目 ID
+   * @param {string} [options.title] - 标题
+   * @param {string} [options.created_at] - 创建时间
+   * @param {Object} [options.references] - 引用信息
+   * @param {boolean} [options.skip_if_same_as_last] - 若与最后一条轮次相同则跳过
+   * @returns {Object} 追加的轮次对象
+   */
   appendTurn(options) {
     const { session_id, role, content, project_id, title, created_at, references, skip_if_same_as_last } = options;
 
@@ -68,6 +93,15 @@ export class LocalMemoryStore {
     }));
   }
 
+  /**
+   * 获取或创建活跃会话：若指定 session_id 则查找该会话，否则按 project_id 查找活跃会话
+   * @param {Object} [options] - 选项
+   * @param {string} [options.project_id] - 项目 ID
+   * @param {string} [options.title] - 会话标题
+   * @param {string} [options.created_at] - 创建时间
+   * @param {string} [options.session_id] - 指定会话 ID
+   * @returns {string} 会话 ID
+   */
   getOrCreateActiveSession(options = {}) {
     const { project_id, title, created_at, session_id } = options;
 
@@ -91,6 +125,15 @@ export class LocalMemoryStore {
     return session.session_id;
   }
 
+  /**
+   * 创建新会话
+   * @param {Object} [options] - 选项
+   * @param {string} [options.project_id] - 项目 ID
+   * @param {string} [options.title] - 会话标题
+   * @param {string} [options.created_at] - 创建时间
+   * @param {string} [options.session_id] - 指定会话 ID
+   * @returns {Object} 创建的会话对象
+   */
   startNewSession(options = {}) {
     const { project_id, title, created_at, session_id } = options;
     return this._store.createSession(new ChatSession({
@@ -101,6 +144,7 @@ export class LocalMemoryStore {
     }));
   }
 
+  /** 重置活跃会话：关闭当前活跃会话并创建新会话 */
   resetActiveSession() {
     const active = this._store.getActiveSession();
     if (active) {
@@ -109,14 +153,33 @@ export class LocalMemoryStore {
     return this._store.createSession(new ChatSession({}));
   }
 
+  /**
+   * 查询记忆（简单版）
+   * @param {string} query - 查询文本
+   * @param {number} [topK=3] - 返回结果数量上限
+   * @param {string} [sessionId] - 会话 ID（未使用）
+   * @returns {Array<Object>} 匹配的记忆条目列表
+   */
   queryMemory(query, topK = 3, sessionId = null) {
     return this._store.queryMemory(query, topK);
   }
 
+  /**
+   * 列出所有活跃记忆事实
+   * @param {number} [limit=1000] - 返回数量上限
+   * @returns {Array<Object>} 活跃记忆事实列表
+   */
   listActiveFacts(limit = 1000) {
     return this._store.listActiveFacts(limit);
   }
 
+  /**
+   * 完整记忆查询，返回命中结果、暂定条目、新鲜度信息和弃权信号
+   * @param {string} query - 查询文本
+   * @param {number} [topK=3] - 返回结果数量上限
+   * @param {string} [sessionId] - 会话 ID（未使用）
+   * @returns {{ hits: Array, tentative_items: Array, freshness: Object, abstention_signals: Object, memory_context: Object }}
+   */
   queryMemoryFull(query, topK = 3, sessionId = null) {
     this._maybePeriodicCleanup();
     const hits = this._store.queryMemory(query, topK);
@@ -166,6 +229,13 @@ export class LocalMemoryStore {
     };
   }
 
+  /**
+   * 记忆上下文查询，返回匹配结果和上下文信息，并注入检索洞察到当前会话
+   * @param {string} query - 查询文本
+   * @param {number} [topK=3] - 返回结果数量上限
+   * @param {string} [sessionId] - 会话 ID
+   * @returns {Object} 记忆上下文对象，包含 aliases、path_hints、freshness_level 等
+   */
   queryMemoryContext(query, topK = 3, sessionId = null) {
     this._maybePeriodicCleanup();
     // 如果未传 sessionId，尝试获取当前活跃会话
@@ -236,6 +306,19 @@ export class LocalMemoryStore {
     };
   }
 
+  /**
+   * 保存一条记忆，支持日写入限额检查、路径提示过滤和去重
+   * @param {Object} options - 保存选项
+   * @param {string} options.session_id - 会话 ID
+   * @param {string} options.content - 记忆内容
+   * @param {string[]} [options.aliases] - 别名列表
+   * @param {string[]} [options.path_hints] - 路径提示列表
+   * @param {string[]} [options.collection_hints] - 集合提示列表
+   * @param {string} [options.state] - 状态（tentative/kept）
+   * @param {string} [options.source] - 来源（manual/auto_triage/user_explicit/auto_draft）
+   * @param {string} [options.created_at] - 创建时间
+   * @returns {Object} 保存后的记忆对象，日限额到达时返回 rate_limited 状态
+   */
   saveMemory(options) {
     this._maybePeriodicCleanup();
     const {
@@ -307,10 +390,21 @@ export class LocalMemoryStore {
     return saved;
   }
 
+  /**
+   * 获取单条记忆
+   * @param {string} memoryId - 记忆 ID
+   * @returns {Object|null} 记忆对象，不存在时返回 null
+   */
   getMemory(memoryId) {
     return this._store.getMemory(memoryId);
   }
 
+  /**
+   * 更新记忆内容
+   * @param {string} memoryId - 记忆 ID
+   * @param {string} content - 新内容
+   * @returns {boolean} 是否更新成功
+   */
   updateMemoryContent(memoryId, content) {
     const updated = this._store.updateMemoryContent(memoryId, content);
     if (updated) {
@@ -320,6 +414,11 @@ export class LocalMemoryStore {
     return updated;
   }
 
+  /**
+   * 删除记忆（硬删除），先记录删除事件再执行删除
+   * @param {string} memoryId - 记忆 ID
+   * @returns {boolean} 是否删除成功
+   */
   deleteMemory(memoryId) {
     // Record event before deletion (memory won't exist after)
     this._store.addEvent({
@@ -331,6 +430,10 @@ export class LocalMemoryStore {
     return this._store.deleteMemory(memoryId);
   }
 
+  /**
+   * 获取存储统计信息
+   * @returns {Object} 统计摘要，包含 total、active、tentative、kept、sessions、active_session_id
+   */
   stats() {
     const stats = this._store.statsSummary ? this._store.statsSummary() : {};
     return {
@@ -339,6 +442,13 @@ export class LocalMemoryStore {
     };
   }
 
+  /**
+   * 获取记忆时间线事件
+   * @param {Object} [options] - 查询选项
+   * @param {string} [options.memory_id] - 按 ID 过滤的记忆
+   * @param {number} [options.limit=50] - 返回数量上限
+   * @returns {Object} 时间线对象，包含 filters、event_count、events
+   */
   getMemoryTimeline(options = {}) {
     const { memory_id, limit = 50 } = options;
     const events = this._store.getTimeline(memory_id, limit);
@@ -357,6 +467,14 @@ export class LocalMemoryStore {
 
   // ========== Memory Choice (tentative → kept, or discard = DELETE) ==========
 
+  /**
+   * 保存用户对记忆的决策：keep（tentative→kept 永久保留）或 discard（硬删除）
+   * @param {Object} params - 决策参数
+   * @param {string} params.memoryId - 记忆 ID
+   * @param {string} params.choice - 决策类型（keep/discard）
+   * @param {string} [params.updatedAt] - 更新时间
+   * @returns {Object} 决策结果对象
+   */
   saveMemoryChoice({ memoryId, choice, updatedAt }) {
     const current = this._store.getMemory(memoryId);
     if (!current) {
@@ -387,6 +505,11 @@ export class LocalMemoryStore {
 
 
 
+  /**
+   * 计算命中结果的新鲜度信息
+   * @param {Array<Object>} hits - 命中的记忆列表
+   * @returns {{ level: string, note: string, age_days: number|null }} 新鲜度级别（fresh/recent/stale/old/none/unknown）
+   */
   _freshnessPayload(hits) {
     if (!hits || hits.length === 0) {
       return { level: 'none', note: 'No memory hits', age_days: null };
@@ -408,6 +531,14 @@ export class LocalMemoryStore {
     return { level: 'old', note: 'Not updated recently', age_days: Math.floor(minAge) };
   }
 
+  /**
+   * 构建检索洞察文本，用于注入到会话中
+   * @param {Object} params - 参数
+   * @param {string} params.query - 查询文本
+   * @param {Array} params.hits - 命中结果
+   * @param {Object} params.freshness - 新鲜度信息
+   * @returns {string} 洞察文本
+   */
   _buildRetrievalInsight({ query, hits, freshness }) {
     const parts = [];
     const hasHits = hits.length > 0;
@@ -425,6 +556,9 @@ export class LocalMemoryStore {
     return parts.join(' ');
   }
 
+  /**
+   * 定期清理过期数据（每 6 小时执行一次）：清理旧轮次、旧会话、旧事件、过期暂定记忆
+   */
   _maybePeriodicCleanup() {
     const now = Date.now();
     const sixHours = 6 * 60 * 60 * 1000;
@@ -555,6 +689,12 @@ export class LocalMemoryStore {
     return this.saveMemory(options);
   }
 
+  /**
+   * 替代旧记忆：删除旧记忆并插入新记忆，记录替代事件
+   * @param {string} oldMemoryId - 旧记忆 ID
+   * @param {Object} options - 新记忆选项
+   * @returns {Object} 替代结果，包含 oldMemoryId 和 newMemory
+   */
   supersedeMemory(oldMemoryId, options) {
     const memoryId = `${options.session_id || 'manual'}-${crypto.randomBytes(4).toString('hex')}`;
     const now = options.created_at || isoNow();
@@ -587,6 +727,12 @@ export class LocalMemoryStore {
     });
   }
 
+  /**
+   * 判断内容是否值得保留为记忆候选（长度、信号词过滤）
+   * @param {string} content - 待判断内容
+   * @param {Object} [sideLlmGateway] - 侧边 LLM 网关（预留参数）
+   * @returns {boolean} 是否值得保留
+   */
   _shouldKeepCandidate(content, sideLlmGateway) {
     if (!content || content.length < TRIAGE_MIN_CONTENT_LENGTH) return false;
     const cleaned = content.trim();
@@ -603,11 +749,22 @@ export class LocalMemoryStore {
     return cleaned.length >= 30;
   }
 
+  /**
+   * 检测文本中是否包含显式记忆请求关键词
+   * @param {string} text - 用户文本
+   * @returns {boolean} 是否包含显式记忆请求
+   */
   _containsExplicitMemoryRequest(text) {
     const lowered = text.toLowerCase();
     return EXPLICIT_MEMORY_SIGNALS.some(s => lowered.includes(s.toLowerCase()));
   }
 
+  /**
+   * 从用户消息中提取记忆内容，若含显式记忆请求且存在上文则优先提取上文
+   * @param {string} content - 当前用户消息
+   * @param {string} [previousContent] - 上一条消息内容
+   * @returns {string|null} 提取的记忆内容，不适合记忆时返回 null
+   */
   _extractMemoryFromUserMessage(content, previousContent = '') {
     const cleaned = this._cleanUserMessage(content);
     if (cleaned.length > 500) return cleaned.slice(0, 500);
@@ -621,6 +778,11 @@ export class LocalMemoryStore {
     return null;
   }
 
+  /**
+   * 清洗用户消息：移除系统提醒、附件标签、代码块
+   * @param {string} text - 原始消息文本
+   * @returns {string} 清洗后的文本
+   */
   _cleanUserMessage(text) {
     const hasCodeBlock = text.includes('```');
     let cleaned = text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '');
@@ -632,6 +794,11 @@ export class LocalMemoryStore {
     return cleaned;
   }
 
+  /**
+   * 过滤路径提示：去除无效路径并去重
+   * @param {string[]} pathHints - 原始路径提示列表
+   * @returns {string[]} 过滤去重后的路径提示列表
+   */
   _filterPathHints(pathHints) {
     return (pathHints || []).filter(hint => {
       if (!hint || !path.isAbsolute(hint)) return true;
@@ -644,6 +811,7 @@ export class LocalMemoryStore {
     }).filter((hint, index, self) => self.indexOf(hint) === index);
   }
 
+  /** 确保存储目录和状态文件存在 */
   _ensureLayout() {
     if (!fs.existsSync(this._root)) {
       fs.mkdirSync(this._root, { recursive: true });
@@ -662,6 +830,10 @@ export class LocalMemoryStore {
 
 
 
+  /**
+   * 写入状态文件（合并更新）
+   * @param {Object} [extra] - 需要更新的额外状态字段
+   */
   _writeState(extra = {}) {
     let current = {};
     try {

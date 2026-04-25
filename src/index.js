@@ -11,16 +11,17 @@ import { KnowledgeBasePresenter } from './api/presenter.js';
 import { QueryExporter } from './api/query-exporter.js';
 
 const fastify = Fastify({
-  logger: true,
+  logger: true, // 启用 Fastify 内置请求日志
 });
 
-const queryExporter = new QueryExporter();
+const queryExporter = new QueryExporter(); // 查询上下文调试导出器
 
 // Initialize knowledge base
-const knowledgeBase = new KnowledgeBase();
+const knowledgeBase = new KnowledgeBase(); // 知识库组合门面，聚合所有子模块
 
 // ========== Memory Endpoints ==========
 
+/** 查询记忆 */
 fastify.post('/api/memory/query', async (request, reply) => {
   try {
     const { query, top_k } = request.body;
@@ -32,6 +33,7 @@ fastify.post('/api/memory/query', async (request, reply) => {
   }
 });
 
+/** 查询记忆上下文（含会话关联），可选导出调试信息 */
 fastify.post('/api/memory/query-context', async (request, reply) => {
   try {
     const { query, top_k, session_id, include_debug } = request.body;
@@ -46,6 +48,7 @@ fastify.post('/api/memory/query-context', async (request, reply) => {
   }
 });
 
+/** 获取记忆时间线 */
 fastify.get('/api/memory/timeline', async (request, reply) => {
   try {
     const { memory_id, session_id, limit } = request.query;
@@ -57,6 +60,7 @@ fastify.get('/api/memory/timeline', async (request, reply) => {
   }
 });
 
+/** 追加一轮对话到当前会话 */
 fastify.post('/api/memory/turn', async (request, reply) => {
   try {
     const { session_id, role, content, project_id, title, created_at, references } = request.body;
@@ -70,6 +74,7 @@ fastify.post('/api/memory/turn', async (request, reply) => {
   }
 });
 
+/** 启动新的记忆会话 */
 fastify.post('/api/memory/session/start', async (request, reply) => {
   try {
     const { project_id, title, created_at, session_id } = request.body;
@@ -81,6 +86,7 @@ fastify.post('/api/memory/session/start', async (request, reply) => {
   }
 });
 
+/** 重置当前活跃会话 */
 fastify.post('/api/memory/session/reset', async (request, reply) => {
   try {
     const result = await knowledgeBase.resetMemorySession();
@@ -91,6 +97,7 @@ fastify.post('/api/memory/session/reset', async (request, reply) => {
   }
 });
 
+/** 导入外部对话记录为会话 */
 fastify.post('/api/memory/session/import-transcript', async (request, reply) => {
   try {
     const { transcript_path, transcript_id, transcripts_root, project_id, title, created_at, session_id } = request.body;
@@ -105,6 +112,7 @@ fastify.post('/api/memory/session/import-transcript', async (request, reply) => 
   }
 });
 
+/** 保存记忆（可选走治理流程） */
 fastify.post('/api/memory/save', async (request, reply) => {
   try {
     const { session_id, content, state, aliases, path_hints, collection_hints, source, use_governance } = request.body;
@@ -121,6 +129,7 @@ fastify.post('/api/memory/save', async (request, reply) => {
   }
 });
 
+/** 治理流程：预览知识更新计划（不实际写入） */
 fastify.post('/api/memory/governance/plan-update', async (request, reply) => {
   try {
     const { content, aliases, path_hints, collection_hints } = request.body;
@@ -136,6 +145,7 @@ fastify.post('/api/memory/governance/plan-update', async (request, reply) => {
 
 // ========== Health Endpoints ==========
 
+/** 完整健康快照 */
 fastify.get('/api/health', async (request, reply) => {
   try {
     const result = await knowledgeBase.healthSnapshot();
@@ -146,6 +156,7 @@ fastify.get('/api/health', async (request, reply) => {
   }
 });
 
+/** 就绪探针：仅返回 status 和 timestamp */
 fastify.get('/api/health/ready', async (request, reply) => {
   try {
     const result = await knowledgeBase.healthSnapshot();
@@ -158,6 +169,7 @@ fastify.get('/api/health/ready', async (request, reply) => {
 
 // ========== Benchmark Endpoints ==========
 
+/** 记录一次基准测试结果 */
 fastify.post('/api/benchmarks/record', async (request, reply) => {
   try {
     const result = await knowledgeBase.recordBenchmarkResult(request.body);
@@ -168,6 +180,7 @@ fastify.post('/api/benchmarks/record', async (request, reply) => {
   }
 });
 
+/** 获取最新基准测试结果 */
 fastify.get('/api/benchmarks/latest', async (request, reply) => {
   try {
     const { suite_name } = request.query;
@@ -179,6 +192,7 @@ fastify.get('/api/benchmarks/latest', async (request, reply) => {
   }
 });
 
+/** 获取基准测试历史记录 */
 fastify.get('/api/benchmarks/history', async (request, reply) => {
   try {
     const { suite_name, limit } = request.query;
@@ -190,6 +204,7 @@ fastify.get('/api/benchmarks/history', async (request, reply) => {
   }
 });
 
+/** 执行基准测试套件 */
 fastify.post('/api/benchmarks/run', async (request, reply) => {
   try {
     const { suite_name } = request.body || {};
@@ -203,6 +218,7 @@ fastify.post('/api/benchmarks/run', async (request, reply) => {
 
 // ========== Wiki Endpoints ==========
 
+/** 搜索 Wiki 页面 */
 fastify.post('/api/wiki/search', async (request, reply) => {
   try {
     const { query, top_k } = request.body;
@@ -214,6 +230,7 @@ fastify.post('/api/wiki/search', async (request, reply) => {
   }
 });
 
+/** 检查 Wiki 是否需要重新编译 */
 fastify.get('/api/wiki/check-stale', async (request, reply) => {
   try {
     const result = knowledgeBase.wikiIsStale();
@@ -224,6 +241,7 @@ fastify.get('/api/wiki/check-stale', async (request, reply) => {
   }
 });
 
+/** 获取 Wiki 编译状态 */
 fastify.get('/api/wiki/status', async (request, reply) => {
   try {
     const result = knowledgeBase.wikiGetStatus();
@@ -235,6 +253,10 @@ fastify.get('/api/wiki/status', async (request, reply) => {
 });
 
 // Start server
+/**
+ * 启动 HTTP 服务器
+ * @returns {Promise<void>}
+ */
 const start = async () => {
   try {
     await fastify.listen({ host: HTTP_HOST, port: HTTP_PORT });

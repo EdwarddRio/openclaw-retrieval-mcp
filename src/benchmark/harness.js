@@ -8,12 +8,23 @@ import { computeHitRate, computeRecall, computeDiversity, aggregateMetrics } fro
 import { generateReport } from './reporting.js';
 
 export class BenchmarkHarness {
+  /**
+   * @param {Object} options - 配置选项
+   * @param {Function} options.searchFn - 搜索函数，接收查询参数返回搜索结果
+   * @param {string} options.scenariosDir - 场景定义文件目录
+   * @param {string} options.reportDir - 报告输出目录
+   */
   constructor({ searchFn, scenariosDir, reportDir }) {
-    this.searchFn = searchFn;
-    this.scenariosDir = scenariosDir;
-    this.reportDir = reportDir;
+    this.searchFn = searchFn; // 搜索函数引用
+    this.scenariosDir = scenariosDir; // 场景目录
+    this.reportDir = reportDir; // 报告目录
   }
 
+  /**
+   * 运行基准测试套件
+   * @param {string|null} suiteName - 指定要运行的套件名，null 表示运行全部
+   * @returns {Promise<Array>} 各套件运行结果列表
+   */
   async runSuite(suiteName = null) {
     const suites = discoverScenarioSuites(this.scenariosDir);
     let targetSuites = suites;
@@ -34,6 +45,11 @@ export class BenchmarkHarness {
     return allResults;
   }
 
+  /**
+   * 执行单个场景套件：逐条运行用例、计算指标、生成报告
+   * @param {ScenarioSuite} suite - 场景套件对象
+   * @returns {Promise<Object>} 套件运行结果（含 cases、metrics 等）
+   */
   async _runScenarioSuite(suite) {
     const caseResults = [];
 

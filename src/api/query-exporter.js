@@ -10,29 +10,44 @@ import { DEBUG_EXPORT_DIR } from '../config.js';
  *   - latest-query-context.json (memory context query results)
  */
 export class QueryExporter {
+  /**
+   * @param {Object} options - 配置选项
+   * @param {string} options.exportDir - 导出目录路径，默认使用 DEBUG_EXPORT_DIR
+   */
   constructor(options = {}) {
     this.exportDir = options.exportDir || DEBUG_EXPORT_DIR;
     this.ensureDir();
   }
 
+  /** 确保导出目录存在 */
   ensureDir() {
     if (!fs.existsSync(this.exportDir)) {
       fs.mkdirSync(this.exportDir, { recursive: true });
     }
   }
 
+  /** 返回当前日期字符串，格式 YYYY-MM-DD，用于按日期归档 */
   dateDir() {
     const d = new Date();
     const pad = (n) => String(n).padStart(2, '0');
     return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
   }
 
+  /**
+   * 导出搜索调试信息到 JSON 和 Markdown 文件
+   * @param {Object} params - 导出参数
+   * @param {string} params.query - 搜索查询文本
+   * @param {Object} params.plan - 搜索执行计划
+   * @param {Array} params.results - 搜索结果列表
+   * @param {number} params.timing_ms - 搜索耗时（毫秒）
+   * @param {Object|null} params.memory_context - 记忆上下文（可选）
+   */
   async exportSearch({ query, plan, results, timing_ms, memory_context = null }) {
     this.ensureDir();
 
-    const staticResults = results.filter(r => r.source !== 'memory' && r.collection !== 'memory');
-    const memoryResults = results.filter(r => r.source === 'memory' || r.collection === 'memory');
-    const collections = [...new Set(staticResults.map(r => r.collection).filter(Boolean))];
+    const staticResults = results.filter(r => r.source !== 'memory' && r.collection !== 'memory'); // 非记忆的静态结果
+    const memoryResults = results.filter(r => r.source === 'memory' || r.collection === 'memory'); // 记忆来源的结果
+    const collections = [...new Set(staticResults.map(r => r.collection).filter(Boolean))]; // 去重后的集合名列表
 
     const payload = {
       query,
@@ -67,6 +82,12 @@ export class QueryExporter {
     fs.writeFileSync(mdPath, mdContent, 'utf-8');
   }
 
+  /**
+   * 导出查询上下文调试信息
+   * @param {Object} params - 导出参数
+   * @param {string} params.query - 查询文本
+   * @param {Object} params.result - 查询上下文结果
+   */
   async exportQueryContext({ query, result }) {
     this.ensureDir();
 
@@ -101,6 +122,11 @@ export class QueryExporter {
     fs.writeFileSync(datedJson, JSON.stringify(payload, null, 2), 'utf-8');
   }
 
+  /**
+   * 根据置信度分数返回等级标签
+   * @param {number} score - 置信度分数 (0-1)
+   * @returns {string} 置信度等级（high/medium/low/none）
+   */
   confidenceLevel(score) {
     if (score >= 0.85) return 'high';
     if (score >= 0.6) return 'medium';
@@ -108,6 +134,11 @@ export class QueryExporter {
     return 'none';
   }
 
+  /**
+   * 将搜索结果 payload 渲染为可读的 Markdown 文本
+   * @param {Object} payload - 搜索导出数据
+   * @returns {string} Markdown 格式的调试报告
+   */
   buildMarkdown(payload) {
     const lines = [
       `# Query Debug Export`,

@@ -12,7 +12,10 @@ function tokenize(text) {
 }
 
 /**
- * Compute hit rate: fraction of expected hits that appear in results.
+ * 计算命中率：期望命中项在结果中出现的比例
+ * @param {Array} results - 搜索结果列表
+ * @param {string[]} expectedHits - 期望命中的模式列表
+ * @returns {number|null} 命中率 (0-1)，无期望时返回 null
  */
 export function computeHitRate(results, expectedHits) {
   if (!expectedHits || expectedHits.length === 0) return null;
@@ -31,8 +34,11 @@ export function computeHitRate(results, expectedHits) {
 }
 
 /**
- * Compute recall: fraction of expected recalls that appear in results.
- * (synonymous with hit rate in many contexts, but kept separate for semantic clarity)
+ * 计算召回率：期望召回项在结果中出现的比例
+ * （与命中率语义相似，但保留独立接口以区分语义）
+ * @param {Array} results - 搜索结果列表
+ * @param {string[]} expectedRecalls - 期望召回的模式列表
+ * @returns {number|null} 召回率 (0-1)，无期望时返回 null
  */
 export function computeRecall(results, expectedRecalls) {
   if (!expectedRecalls || expectedRecalls.length === 0) return null;
@@ -40,8 +46,10 @@ export function computeRecall(results, expectedRecalls) {
 }
 
 /**
- * Compute diversity using Jaccard dissimilarity of token sets.
- * Higher = more diverse.
+ * 使用 Jaccard 相异度计算结果多样性
+ * 值越高表示结果越多样化
+ * @param {Array} results - 搜索结果列表
+ * @returns {number} 多样性分数 (0-1)
  */
 export function computeDiversity(results) {
   if (!results || results.length <= 1) return 1.0;
@@ -69,7 +77,9 @@ export function computeDiversity(results) {
 }
 
 /**
- * Aggregate metrics across cases.
+ * 汇总所有用例的指标，计算平均值和极值
+ * @param {Array} caseResults - 各用例结果列表
+ * @returns {Object} 汇总指标（含 case_count, pass_rate, avg_hit_rate 等）
  */
 export function aggregateMetrics(caseResults) {
   const hitRates = caseResults.map(c => c.hit_rate).filter(v => v !== null);

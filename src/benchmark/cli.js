@@ -13,6 +13,10 @@ import { BENCHMARKS_DIR } from '../config.js';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+/**
+ * 解析命令行参数
+ * @returns {{ suite: string|null, reportDir: string, scenariosDir: string }}
+ */
 function parseArgs() {
   const args = process.argv.slice(2);
   const options = {
@@ -28,6 +32,10 @@ function parseArgs() {
   return options;
 }
 
+/**
+ * 主入口：初始化 KnowledgeBase、运行基准测试套件、输出结果
+ * @returns {Promise<void>}
+ */
 async function main() {
   const options = parseArgs();
 

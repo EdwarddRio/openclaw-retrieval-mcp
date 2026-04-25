@@ -10,18 +10,26 @@ import path from 'path';
 import fs from 'fs';
 import os from 'os';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+const __filename = fileURLToPath(import.meta.url); // 当前模块文件的绝对路径
+const __dirname = path.dirname(__filename); // 当前模块所在目录
 
 // 加载 .env 文件
 dotenv.config({ path: path.join(__dirname, '../config/context-engine.env') });
 
 // ========== 路径常量 ==========
-export const PROJECT_ROOT = path.resolve(process.env.PROJECT_ROOT || path.join(__dirname, '..'));
-export const CONTEXT_ENGINE_DIR = path.join(__dirname, '..');
-export const RUNTIME_DIR = path.resolve(process.env.CONTEXT_ENGINE_RUNTIME_DIR || path.join(CONTEXT_ENGINE_DIR, 'runtime'));
+export const PROJECT_ROOT = path.resolve(process.env.PROJECT_ROOT || path.join(__dirname, '..')); // 项目根目录
+export const CONTEXT_ENGINE_DIR = path.join(__dirname, '..'); // context-engine 包根目录
+export const RUNTIME_DIR = path.resolve(process.env.CONTEXT_ENGINE_RUNTIME_DIR || path.join(CONTEXT_ENGINE_DIR, 'runtime')); // 运行时数据目录，存放数据库、日志等
 
 // ========== 运行时路径辅助函数 ==========
+/**
+ * 准备运行时路径：优先使用 runtime 目录下的路径，若不存在则从旧路径迁移
+ * @param {string} relativePath - 相对于根目录的子路径
+ * @param {object} [options] - 可选配置
+ * @param {string} [options.baseDir] - 旧路径的基础目录，默认为 CONTEXT_ENGINE_DIR
+ * @param {string} [options.runtimeDir] - 新路径的运行时目录，默认为 RUNTIME_DIR
+ * @returns {string} 最终的绝对路径
+ */
 export function prepareRuntimePath(relativePath, { baseDir = CONTEXT_ENGINE_DIR, runtimeDir = RUNTIME_DIR } = {}) {
   if (!fs.existsSync(runtimeDir)) {
     fs.mkdirSync(runtimeDir, { recursive: true });
@@ -57,27 +65,28 @@ export function prepareRuntimePath(relativePath, { baseDir = CONTEXT_ENGINE_DIR,
 }
 
 // ========== 环境变量驱动的配置 ==========
-export const MANIFEST_PATH = prepareRuntimePath('index_manifest.json');
-export const DEBUG_EXPORT_DIR = prepareRuntimePath('debug/queries');
-export const DEBUG_EXPORT_ENABLED = true;
-export const DEBUG_EXPORT_HISTORY_LIMIT = parseInt(process.env.DEBUG_EXPORT_HISTORY_LIMIT || '20', 10);
-export const BENCHMARKS_DIR = prepareRuntimePath('benchmarks');
-export const MCP_LOG_RETENTION_DAYS = parseInt(process.env.MCP_LOG_RETENTION_DAYS || '3', 10);
-export const DEBUG_EXPORT_MAX_AGE_DAYS = parseInt(process.env.DEBUG_EXPORT_MAX_AGE_DAYS || '3', 10);
-export const LOCALMEM_DIR = prepareRuntimePath('localmem');
-export const LOCALMEM_SESSION_MAX_AGE_DAYS = parseInt(process.env.LOCALMEM_SESSION_MAX_AGE_DAYS || '60', 10);
-export const LOCALMEM_FACT_MAX_AGE_DAYS = parseInt(process.env.LOCALMEM_FACT_MAX_AGE_DAYS || '180', 10);
-export const MCP_LOG_PATH = prepareRuntimePath('mcp.log');
+export const MANIFEST_PATH = prepareRuntimePath('index_manifest.json'); // Wiki 索引清单文件路径
+export const DEBUG_EXPORT_DIR = prepareRuntimePath('debug/queries'); // 调试查询导出目录
+export const DEBUG_EXPORT_ENABLED = true; // 是否启用调试导出
+export const DEBUG_EXPORT_HISTORY_LIMIT = parseInt(process.env.DEBUG_EXPORT_HISTORY_LIMIT || '20', 10); // 调试导出历史记录上限
+export const BENCHMARKS_DIR = prepareRuntimePath('benchmarks'); // 基准测试数据目录
+export const MCP_LOG_RETENTION_DAYS = parseInt(process.env.MCP_LOG_RETENTION_DAYS || '3', 10); // MCP 日志保留天数
+export const DEBUG_EXPORT_MAX_AGE_DAYS = parseInt(process.env.DEBUG_EXPORT_MAX_AGE_DAYS || '3', 10); // 调试导出文件最大保留天数
+export const LOCALMEM_DIR = prepareRuntimePath('localmem'); // 本地记忆根目录，SQLite 数据库存放在此
+export const LOCALMEM_SESSION_MAX_AGE_DAYS = parseInt(process.env.LOCALMEM_SESSION_MAX_AGE_DAYS || '60', 10); // 会话最大保留天数
+export const LOCALMEM_FACT_MAX_AGE_DAYS = parseInt(process.env.LOCALMEM_FACT_MAX_AGE_DAYS || '180', 10); // 事实记忆最大保留天数
+export const MCP_LOG_PATH = prepareRuntimePath('mcp.log'); // MCP 协议日志文件路径
 export const CURSOR_PROJECTS_DIR = process.env.CURSOR_PROJECTS_DIR
   ? path.resolve(process.env.CURSOR_PROJECTS_DIR)
-  : path.join(os.homedir(), '.cursor', 'projects');
-export const LOCALMEM_AUTO_TRANSCRIPT_SYNC_ENABLED = process.env.LOCALMEM_AUTO_TRANSCRIPT_SYNC_ENABLED !== '0';
+  : path.join(os.homedir(), '.cursor', 'projects'); // Cursor 编辑器项目目录，用于定位对话记录
+export const LOCALMEM_AUTO_TRANSCRIPT_SYNC_ENABLED = process.env.LOCALMEM_AUTO_TRANSCRIPT_SYNC_ENABLED !== '0'; // 是否启用对话记录自动同步
 export const LOCALMEM_AUTO_TRANSCRIPT_MAX_AGE_SECONDS = parseInt(
   process.env.LOCALMEM_AUTO_TRANSCRIPT_MAX_AGE_SECONDS || '1800',
   10
-);
+); // 自动同步的对话记录最大存活秒数
 
 // ========== Winston 日志 ==========
+/** Winston 日志实例，默认输出到控制台，带时间戳和级别 */
 export const logger = winston.createLogger({
   level: 'info',
   format: winston.format.combine(
@@ -90,6 +99,14 @@ export const logger = winston.createLogger({
 });
 
 // ========== 日志处理器 ==========
+/**
+ * 创建带保留策略的文件日志处理器
+ * @param {string} logPath - 日志文件路径
+ * @param {object} [options] - 可选配置
+ * @param {number} [options.retentionDays=3] - 日志文件保留天数
+ * @param {string} [options.encoding='utf-8'] - 文件编码
+ * @returns {winston.transports.File} Winston 文件传输实例
+ */
 export function buildRetainedLogHandler(logPath, { retentionDays = 3, encoding = 'utf-8' } = {}) {
   const dir = path.dirname(logPath);
   if (!fs.existsSync(dir)) {
@@ -104,6 +121,10 @@ export function buildRetainedLogHandler(logPath, { retentionDays = 3, encoding =
 }
 
 // ========== 部署摘要 ==========
+/**
+ * 构建部署摘要信息，包含当前运行时配置概况
+ * @returns {object} 部署摘要对象
+ */
 export function buildDeploymentSummary() {
   return {
     project_root: PROJECT_ROOT,
@@ -117,5 +138,5 @@ export function buildDeploymentSummary() {
 }
 
 // ========== HTTP 服务器配置 ==========
-export const HTTP_HOST = process.env.HTTP_HOST || '127.0.0.1';
-export const HTTP_PORT = parseInt(process.env.HTTP_PORT || '8901', 10);
+export const HTTP_HOST = process.env.HTTP_HOST || '127.0.0.1'; // HTTP 服务监听地址
+export const HTTP_PORT = parseInt(process.env.HTTP_PORT || '8901', 10); // HTTP 服务监听端口

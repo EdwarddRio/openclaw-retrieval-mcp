@@ -6,6 +6,12 @@
 import { SearchResponse, SearchResultItem, MemoryItem, MemorySearchResponse, HealthResponse, ErrorResponse } from './contract.js';
 
 export class KnowledgeBasePresenter {
+/**
+ * 格式化搜索结果列表为标准响应
+ * @param {Array} searchResults - 原始搜索结果数组
+ * @param {Object} options - 附加选项（query, top_k, timing_ms, debug）
+ * @returns {SearchResponse} 格式化后的搜索响应
+ */
   static presentSearchResults(searchResults, options = {}) {
     const { query, top_k, timing_ms, debug } = options;
 
@@ -21,6 +27,11 @@ export class KnowledgeBasePresenter {
     });
   }
 
+  /**
+   * 格式化单条搜索结果，分数保留四位小数
+   * @param {Object} result - 原始搜索结果
+   * @returns {SearchResultItem}
+   */
   static presentSearchResultItem(result) {
     return new SearchResultItem({
       content: result.content,
@@ -35,6 +46,11 @@ export class KnowledgeBasePresenter {
     });
   }
 
+  /**
+   * 格式化单条记忆条目
+   * @param {Object} memory - 原始记忆数据
+   * @returns {MemoryItem}
+   */
   static presentMemoryItem(memory) {
     return new MemoryItem({
       memory_id: memory.memory_id,
@@ -51,6 +67,12 @@ export class KnowledgeBasePresenter {
     });
   }
 
+  /**
+   * 格式化记忆搜索结果列表
+   * @param {Object} searchResults - 包含 items 和 total_matched 的搜索结果
+   * @param {Object} options - 附加选项（query, top_k）
+   * @returns {MemorySearchResponse}
+   */
   static presentMemorySearchResults(searchResults, options = {}) {
     const { query, top_k } = options;
     const items = (searchResults.items || []).map(item => this.presentMemoryItem(item));
@@ -63,6 +85,11 @@ export class KnowledgeBasePresenter {
     });
   }
 
+  /**
+   * 格式化健康检查响应
+   * @param {Object} options - 可覆盖的字段
+   * @returns {HealthResponse}
+   */
   static presentHealth(options = {}) {
     return new HealthResponse({
       status: 'healthy',
@@ -71,6 +98,12 @@ export class KnowledgeBasePresenter {
     });
   }
 
+  /**
+   * 格式化错误响应
+   * @param {Error} error - 错误对象
+   * @param {number} statusCode - HTTP 状态码
+   * @returns {ErrorResponse}
+   */
   static presentError(error, statusCode = 500) {
     return new ErrorResponse({
       error: error.name || 'Internal Server Error',
@@ -79,6 +112,11 @@ export class KnowledgeBasePresenter {
     });
   }
 
+  /**
+   * 格式化统计信息，附加当前时间戳
+   * @param {Object} stats - 统计数据
+   * @returns {Object} 含 timestamp 的统计对象
+   */
   static presentStats(stats) {
     return {
       ...stats,
@@ -86,6 +124,11 @@ export class KnowledgeBasePresenter {
     };
   }
 
+  /**
+   * 格式化会话信息
+   * @param {Object} session - 会话数据
+   * @returns {Object} 格式化后的会话对象
+   */
   static presentSession(session) {
     return {
       session_id: session.session_id,
@@ -99,6 +142,11 @@ export class KnowledgeBasePresenter {
     };
   }
 
+  /**
+   * 格式化会话轮次
+   * @param {Object} turn - 轮次数据
+   * @returns {Object} 格式化后的轮次对象
+   */
   static presentTurn(turn) {
     return {
       turn_id: turn.turn_id,
@@ -111,6 +159,11 @@ export class KnowledgeBasePresenter {
     };
   }
 
+  /**
+   * 格式化时间线数据
+   * @param {Object} timeline - 时间线数据
+   * @returns {Object} 格式化后的事件时间线
+   */
   static presentTimeline(timeline) {
     return {
       filters: timeline.filters,

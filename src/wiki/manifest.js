@@ -9,11 +9,15 @@ import crypto from 'crypto';
 import { logger } from '../config.js';
 
 export class WikiManifest {
+  /**
+   * @param {string} manifestPath - 清单 JSON 文件路径
+   */
   constructor(manifestPath) {
-    this._path = manifestPath;
-    this._data = { files: {} };
+    this._path = manifestPath; // 清单文件路径
+    this._data = { files: {} }; // 文件条目映射：{ [filePath]: { hash, wikiPage, sourceId, lastCompiled } }
   }
 
+  /** 从磁盘加载清单文件，加载失败时重置为空 */
   load() {
     if (fs.existsSync(this._path)) {
       try {
@@ -26,6 +30,7 @@ export class WikiManifest {
     }
   }
 
+  /** 将当前清单数据写入磁盘 */
   save() {
     const dir = path.dirname(this._path);
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
@@ -95,10 +100,16 @@ export class WikiManifest {
     delete this._data.files[filePath];
   }
 
+  /**
+   * 获取指定文件的清单条目
+   * @param {string} filePath - 文件路径
+   * @returns {Object|null} 条目对象或 null
+   */
   getEntry(filePath) {
     return this._data.files[filePath] || null;
   }
 
+  /** 获取所有文件条目的浅拷贝 */
   get allEntries() {
     return { ...this._data.files };
   }

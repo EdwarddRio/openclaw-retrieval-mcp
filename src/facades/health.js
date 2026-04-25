@@ -6,11 +6,20 @@
 import { buildDeploymentSummary } from '../config.js';
 
 export class HealthFacade {
+  /**
+   * 健康检查门面，聚合 localmem 和 benchmark 组件的健康状态
+   * @param {object} memoryFacade - 记忆操作门面实例
+   * @param {object} benchmarkFacade - 基准测试门面实例
+   */
   constructor(memoryFacade, benchmarkFacade) {
     this.memoryFacade = memoryFacade;
     this.benchmarkFacade = benchmarkFacade;
   }
 
+  /**
+   * 生成完整健康快照，并行检查 localmem 和 benchmark
+   * @returns {Promise<object>} 包含 status/localmem/benchmarks/deployment/stale_flags/timestamp 的快照
+   */
   async healthSnapshot() {
     const [localmem, benchmarks] = await Promise.all([
       this.healthLocalmem(),
@@ -35,6 +44,10 @@ export class HealthFacade {
     };
   }
 
+  /**
+   * 检查本地记忆模块健康状态
+   * @returns {object} { healthy: boolean, stats?: object, error?: string }
+   */
   healthLocalmem() {
     try {
       const store = this.memoryFacade.localMemory;
@@ -48,6 +61,10 @@ export class HealthFacade {
     }
   }
 
+  /**
+   * 检查基准测试模块健康状态
+   * @returns {object} { healthy: boolean, latest_benchmark?: object, error?: string }
+   */
   healthBenchmarks() {
     try {
       const latest = this.benchmarkFacade.latestBenchmark();
