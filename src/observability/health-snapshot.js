@@ -1,20 +1,20 @@
 /**
  * Health snapshot builder.
- * ChromaDB and Embedding components removed — retrieval is BM25-only.
+ * Architecture: localMem (SQLite) + LLMWiki (keyword search, compiled pages).
  */
 
-export function buildHealthSnapshot({ collections, localmem, benchmarks }) {
+export function buildHealthSnapshot({ localmem, benchmarks, wiki }) {
   const allHealthy =
-    (collections?.healthy !== false) &&
-    (localmem?.healthy !== false);
+    (localmem?.healthy !== false) &&
+    (benchmarks?.healthy !== false);
 
   return {
     status: allHealthy ? 'healthy' : 'degraded',
     components: {
-      collections: collections || { healthy: false },
       localmem: localmem || { healthy: false },
       benchmarks: benchmarks || { healthy: false },
-      retrieval_mode: 'bm25_only',
+      wiki: wiki || { healthy: false },
+      retrieval_mode: 'wiki_search',
     },
     timestamp: new Date().toISOString(),
   };

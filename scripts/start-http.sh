@@ -14,18 +14,6 @@ fi
 # Check dependencies
 echo "Checking dependencies..."
 
-# Check ChromaDB
-if ! curl -sf http://localhost:8000/api/v1/heartbeat > /dev/null 2>&1; then
-  echo "Warning: ChromaDB is not running at http://localhost:8000"
-  echo "Start it with: chromadb run --host localhost --port 8000"
-fi
-
-# Check Embedding Service
-if ! curl -sf http://localhost:8902/health > /dev/null 2>&1; then
-  echo "Warning: Embedding service is not running at http://localhost:8902"
-  echo "Start it with: cd embedding-service && python app.py"
-fi
-
 # Start HTTP server
 echo "Starting OpenClaw Context Engine HTTP server..."
 cd "$PROJECT_DIR"

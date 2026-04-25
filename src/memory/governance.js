@@ -1,9 +1,7 @@
 /**
- * Memory governance - conflict detection, knowledge update planning,
- * and semantic deduplication ported from rule-engine/memory/governance.py.
+ * Memory governance - conflict detection and knowledge update planning.
+ * Architecture: localMem + LLMWiki. Semantic (embedding-based) detection removed.
  */
-
-// Embedding client removed — semantic detection disabled in favor of LLM Wiki pattern
 
 const TOKEN_RE = /[A-Za-z0-9_]+|[\u4e00-\u9fff]+/g;
 const CAMEL_CASE_RE = /(?<![A-Za-z0-9_])[A-Z][A-Za-z0-9]*(?:Service|Action|Mapper|ConfigManager|Impl|Exception|Result|Type|Helper|Controller|Manager|Handler|Factory|Builder|Constants|Config)(?![A-Za-z0-9_])/g;
@@ -18,13 +16,6 @@ const MEMORY_STATE_PRIORITY = {
   tentative: 1,
   kept: 2,
 };
-
-const SEMANTIC_MATCH_THRESHOLD = 0.83;
-const SEMANTIC_CONFLICT_MARGIN = 0.03;
-const SEMANTIC_MAX_CONFLICT_CANDIDATES = 3;
-
-// In-memory embedding cache (ephemeral, process lifetime)
-const SEMANTIC_EMBEDDING_CACHE = new Map();
 
 /**
  * Plan how a new memory candidate should be integrated into the knowledge base.
@@ -43,7 +34,6 @@ export async function planKnowledgeUpdate({
   pathHints = [],
   collectionHints = [],
   facts = [],
-  semanticEnabled = false,
 }) {
   const candidateProfile = _topicProfile(content, aliases, pathHints, collectionHints);
   const relatedFacts = [];
@@ -90,32 +80,6 @@ export async function planKnowledgeUpdate({
       relatedMemoryIds,
       conflictMemoryIds: relatedMemoryIds,
     };
-  }
-
-  // Fallback to semantic (embedding-based) detection when lexical signals are weak
-  if (semanticEnabled) {
-    const semanticMatches = await _semanticRelatedFacts(candidateProfile, facts);
-    if (semanticMatches.length === 1) {
-      const mid = semanticMatches[0].memory_id || '';
-      return {
-        strategy: 'supersede_existing',
-        suggestedMemoryId: mid,
-        relatedMemoryIds: mid ? [mid] : [],
-        conflictMemoryIds: mid ? [mid] : [],
-      };
-    }
-
-    if (semanticMatches.length > 1) {
-      const mids = semanticMatches
-        .map(m => m.memory_id)
-        .filter(Boolean);
-      return {
-        strategy: 'resolve_conflict',
-        suggestedMemoryId: '',
-        relatedMemoryIds: mids,
-        conflictMemoryIds: mids,
-      };
-    }
   }
 
   return {
@@ -180,24 +144,10 @@ function _topicRelation(candidateProfile, fact) {
 }
 
 // ------------------------------------------------------------------
-// Semantic conflict detection (embedding-based)
+// Semantic conflict detection — REMOVED
+// Embedding-based detection was disabled when static_kb/ChromaDB was removed.
+// Lexical/token matching in planKnowledgeUpdate handles conflict detection.
 // ------------------------------------------------------------------
-
-async function _semanticRelatedFacts(candidateProfile, facts) {
-  // Semantic detection disabled — no longer using embedding service.
-  // Lexical/token matching in planKnowledgeUpdate handles conflict detection.
-  return [];
-}
-
-async function _enrichFactsWithSemanticCache(facts, cachedFacts = []) {
-  // No-op: semantic enrichment disabled (no embedding service)
-  return facts.map(f => ({ ...f, semantic_text: '', semantic_embedding: [] }));
-}
-
-async function _encodeSemanticTexts(texts) {
-  // No-op: encoding disabled (no embedding service)
-  return new Map();
-}
 
 // ------------------------------------------------------------------
 // Helpers
@@ -273,22 +223,6 @@ function _extractAliases(text) {
     }
   }
   return aliases;
-}
-
-function _cosineSimilarity(left, right) {
-  let numerator = 0;
-  let leftNorm = 0;
-  let rightNorm = 0;
-  const len = Math.min(left.length, right.length);
-  for (let i = 0; i < len; i++) {
-    const l = Number(left[i]);
-    const r = Number(right[i]);
-    numerator += l * r;
-    leftNorm += l * l;
-    rightNorm += r * r;
-  }
-  if (leftNorm <= 0 || rightNorm <= 0) return 0.0;
-  return numerator / (Math.sqrt(leftNorm) * Math.sqrt(rightNorm));
 }
 
 function _sortedFacts(facts) {
