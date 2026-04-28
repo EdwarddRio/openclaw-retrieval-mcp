@@ -595,12 +595,15 @@ export class LocalMemoryStore {
     const candidates = [];
 
     if (role === 'assistant' && this._shouldKeepCandidate(content, side_llm_gateway)) {
+      const aliases = this._extractAliasesFromContent(content);
       if (persist) {
         const saved = await this.saveMemoryWithGovernance({
           session_id,
           content: content.trim(),
+          aliases,
           state: 'tentative',
           source: 'auto_triage',
+            sideLlmGateway: side_llm_gateway,
         });
         candidates.push(saved);
       } else {
@@ -608,6 +611,7 @@ export class LocalMemoryStore {
           memory_id: `tentative:${session_id}:${canonicalKeyForText(content).slice(0, 12)}`,
           session_id,
           content: content.trim(),
+          aliases,
           state: 'tentative',
           canonical_key: canonicalKeyForText(content),
         });
@@ -617,12 +621,15 @@ export class LocalMemoryStore {
     if (role === 'user' && this._containsExplicitMemoryRequest(content)) {
       const extracted = this._extractMemoryFromUserMessage(content, previous_content);
       if (extracted && this._shouldKeepCandidate(extracted, side_llm_gateway)) {
+        const aliases = this._extractAliasesFromContent(extracted);
         if (persist) {
           const saved = await this.saveMemoryWithGovernance({
             session_id,
             content: extracted,
+            aliases,
             state: 'tentative',
             source: 'user_explicit',
+            sideLlmGateway: side_llm_gateway,
           });
           saved._user_feedback = `我已记住：${extracted.slice(0, 50)}`;
           if (extracted.length >= 500) {
@@ -634,8 +641,10 @@ export class LocalMemoryStore {
             memory_id: `tentative:${session_id}:${canonicalKeyForText(extracted).slice(0, 12)}`,
             session_id,
             content: extracted,
+            aliases,
             state: 'tentative',
             source: 'user_explicit',
+            sideLlmGateway: side_llm_gateway,
             canonical_key: canonicalKeyForText(extracted),
           });
         }
@@ -652,6 +661,7 @@ export class LocalMemoryStore {
   async saveMemoryWithGovernance(options) {
     const source = options.source || 'manual';
     const isAutoSource = ['auto_triage', 'auto_draft'].includes(source);
+    const sideLlmGateway = options.sideLlmGateway || null;
 
     if (!isAutoSource) {
       return this.saveMemory(options);
@@ -664,6 +674,7 @@ export class LocalMemoryStore {
       path_hints: options.path_hints || [],
       collection_hints: options.collection_hints || [],
       facts,
+      sideLlmGateway,
     });
 
     if (plan.strategy === 'keep_existing') {
@@ -752,17 +763,49 @@ export class LocalMemoryStore {
       return true;
     }
 
-    return cleaned.length >= 15;
+    // 🔥 收紧 assistant 过滤：必须包含结构化信号
+    const ASSISTANT_VALUE_PATTERNS = [
+      /【.*】/,           // 有标题块
+      /^(步骤|流程|规则|方案|配置|模板|错误|注意|教训|建议|修复|完成|更新|删除|创建|推送)/,
+      /已(修复|完成|更新|删除|创建|推送)/,
+      /(禁止|必须|优先|默认|统一|固定).{2,30}/,
+      /^(##|###|\d+\.)\s+/, // Markdown 标题/列表
+    ];
+    return ASSISTANT_VALUE_PATTERNS.some(p => p.test(cleaned));
   }
 
   /**
-   * 检测文本中是否包含显式记忆请求关键词
+   * 检测文本中是否包含显式记忆请求关键词（含隐性偏好、决策信号）
    * @param {string} text - 用户文本
-   * @returns {boolean} 是否包含显式记忆请求
+   * @returns {boolean} 是否包含记忆请求信号
    */
   _containsExplicitMemoryRequest(text) {
     const lowered = text.toLowerCase();
-    return EXPLICIT_MEMORY_SIGNALS.some(s => lowered.includes(s.toLowerCase()));
+    // 1. 原有显式信号
+    if (EXPLICIT_MEMORY_SIGNALS.some(s => lowered.includes(s.toLowerCase()))) return true;
+    
+    // 2. 隐性偏好信号（组合匹配）
+    const IMPLICIT_PREFERENCE_PATTERNS = [
+      /不要\s*.{2,20}(美股|港股|推送|覆盖|包含|看)/,
+      /不用\s*.{2,20}(美股|港股|指数|数据|看|管)/,
+      /以后.{0,5}(都|统一|只|默认).{2,20}/,
+      /只.{0,3}(保留|看|发|推送|包含).{2,20}/,
+      /太(长|啰嗦|复杂).{0,10}(以后|下次|统一)/,
+      /固定.{0,5}(标题|格式|时间|来源|规则)/,
+      /默认.{0,5}(只|不|用).{2,20}/,
+      /统一.{0,5}(只|不|用|改).{2,20}/,
+    ];
+    if (IMPLICIT_PREFERENCE_PATTERNS.some(p => p.test(text))) return true;
+    
+    // 3. 决策信号
+    const DECISION_PATTERNS = [
+      /^我.{0,5}(决定|确认|同意|选|用).{2,30}/,
+      /^(就|按|用|选).{2,30}(这个|方案|这个规则)/,
+      /^(确定|定了|可以|行).{0,10}$/,
+    ];
+    if (DECISION_PATTERNS.some(p => p.test(text))) return true;
+    
+    return false;
   }
 
   /**
@@ -814,6 +857,61 @@ export class LocalMemoryStore {
       if (hint.includes('node_modules')) return false;
       return self.indexOf(hint) === index;
     });
+  }
+
+  /**
+   * 从内容中提取别名（动态中文词 + 标题标签 + 代码标识符）
+   * @param {string} content - 记忆内容
+   * @returns {string[]} 别名列表
+   */
+  _extractAliasesFromContent(content) {
+    const aliases = [];
+    
+    // 1. 【xxx】主题标签
+    const brackets = content.match(/【([^】]+)】/g) || [];
+    aliases.push(...brackets.map(m => m.slice(1, -1).trim()));
+    
+    // 2. 大驼峰/蛇形命名（复用现有 _extractAliases）
+    const codeIds = _extractAliases(content);
+    aliases.push(...codeIds);
+    
+    // 3. 动态中文词提取（无需维护词表）
+    const dynamicKeywords = this._extractChineseKeywords(content);
+    aliases.push(...dynamicKeywords);
+    
+    return [...new Set(aliases)].slice(0, 10);
+  }
+
+  /**
+   * 从内容中提取中文关键词（2-6字连续中文字符 + 词频统计）
+   * @param {string} text - 原始文本
+   * @returns {string[]} 高频中文关键词列表
+   */
+  _extractChineseKeywords(text) {
+    if (!text) return [];
+    
+    const STOPWORDS = new Set([
+      '的', '了', '是', '我', '你', '在', '有', '个', '为', '与', '及', '或',
+      '一个', '没有', '可以', '进行', '处理', '相关', '问题', '方案', '新增',
+      '这个', '那个', '这样', '然后', '现在', '今天', '明天',
+      '什么', '怎么', '如何', '为什么', '是否', '多少', '哪些',
+    ]);
+    
+    // 提取所有 2-6 字连续中文字符串
+    const matches = text.match(/[\u4e00-\u9fff]{2,6}/g) || [];
+    
+    // 统计词频
+    const freq = {};
+    for (const word of matches) {
+      if (STOPWORDS.has(word)) continue;
+      freq[word] = (freq[word] || 0) + 1;
+    }
+    
+    // 按频率排序，取前 5 个
+    return Object.entries(freq)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 5)
+      .map(([word]) => word);
   }
 
   /** 确保存储目录和状态文件存在 */

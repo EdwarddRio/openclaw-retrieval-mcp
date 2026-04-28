@@ -12,7 +12,6 @@ const SNAKE_CASE_RE = /\b[a-z0-9]+(?:_[a-z0-9]+)+\b/g;
 
 /** 主题分词停用词，这些词在主题匹配时被忽略 */
 const TOPIC_STOPWORDS = new Set([
-  '以后', '必须', '统一', '不要', '优先', '默认', '约定', '建议', '应该', '需要', '可以',
   '当前', '这个', '那个', '这样', '进行', '处理', '相关', '问题', '方案', '新增',
 ]);
 
@@ -39,6 +38,7 @@ export async function planKnowledgeUpdate({
   pathHints = [],
   collectionHints = [],
   facts = [],
+  sideLlmGateway = null,
 }) {
   const candidateProfile = _topicProfile(content, aliases, pathHints, collectionHints);
   const relatedFacts = [];
@@ -71,6 +71,22 @@ export async function planKnowledgeUpdate({
 
   if (relatedMemoryIds.length === 1) {
     const onlyFact = sortedRelated[0];
+    // 🔥 LLM 语义兜底：当 token 匹配不确定时，调用 LLM 二次判断
+    if (sideLlmGateway) {
+      const llmDecision = await _llmSemanticCompare({
+        candidate: content,
+        existing: onlyFact.content || '',
+        sideLlmGateway,
+      });
+      if (llmDecision.sameIntent) {
+        return {
+          strategy: 'keep_existing',
+          suggestedMemoryId: relatedMemoryIds[0],
+          relatedMemoryIds,
+          conflictMemoryIds: [],
+        };
+      }
+    }
     const exactOverlap = candidateProfile.normalizedText &&
       (onlyFact.content || '').toLowerCase().includes(candidateProfile.normalizedText);
     if (exactOverlap) {
@@ -91,6 +107,22 @@ export async function planKnowledgeUpdate({
   }
 
   if (relatedMemoryIds.length > 1) {
+    // 🔥 LLM 语义兜底：多条相关时，检查是否与第一条同意图
+    if (sideLlmGateway) {
+      const llmDecision = await _llmSemanticCompare({
+        candidate: content,
+        existing: sortedRelated[0].content || '',
+        sideLlmGateway,
+      });
+      if (llmDecision.sameIntent) {
+        return {
+          strategy: 'keep_existing',
+          suggestedMemoryId: sortedRelated[0].memory_id || '',
+          relatedMemoryIds,
+          conflictMemoryIds: [],
+        };
+      }
+    }
     return {
       strategy: 'resolve_conflict',
       suggestedMemoryId: '',
@@ -159,7 +191,7 @@ function _topicRelation(candidateProfile, fact) {
   const tokenOverlap = _setIntersect(candidateProfile.tokens, factProfile.tokens);
 
   let sameTopic = aliasOverlap.size > 0 || pathOverlap.size > 0;
-  if (!sameTopic && tokenOverlap.size >= 3) {
+  if (!sameTopic && tokenOverlap.size >= 2) {
     sameTopic = true;
   }
   if (!sameTopic && tokenOverlap.size >= 2 && collectionOverlap.size > 0) {
@@ -327,3 +359,38 @@ function _setIntersect(a, b) {
 // localMem now serves as permanent SQLite storage only.
 // Wiki is independently managed by the LLMWiki compiler.
 // ------------------------------------------------------------------
+
+/**
+ * LLM 语义兜底：判断两条记忆是否表达同一意图
+ * @param {Object} params
+ * @param {string} params.candidate - 候选记忆内容
+ * @param {string} params.existing - 已有记忆内容
+ * @param {Object} params.sideLlmGateway - LLM 网关（需支持 chat/completions）
+ * @returns {Promise<{sameIntent: boolean, confidence: number}>}
+ */
+async function _llmSemanticCompare({ candidate, existing, sideLlmGateway }) {
+  try {
+    const prompt = `判断以下两条记忆是否表达同一意图或规则。只输出 JSON：\n\n候选："${candidate.slice(0, 200)}"\n已有："${existing.slice(0, 200)}"\n\n输出格式：{"sameIntent": true/false, "confidence": 0.0-1.0}`;
+    
+    const response = await sideLlmGateway.chat({
+      model: 'k2p6',
+      messages: [{ role: 'user', content: prompt }],
+      temperature: 0.1,
+      max_tokens: 100,
+    });
+    
+    const text = response?.choices?.[0]?.message?.content || '';
+    const match = text.match(/\{[^}]*\}/);
+    if (match) {
+      const parsed = JSON.parse(match[0]);
+      return {
+        sameIntent: Boolean(parsed.sameIntent),
+        confidence: Number(parsed.confidence) || 0.5,
+      };
+    }
+  } catch (err) {
+    // LLM 判断失败时不阻断，降级为词法匹配结果
+    console.warn(`[governance] LLM semantic compare failed: ${err.message}`);
+  }
+  return { sameIntent: false, confidence: 0 };
+}
