@@ -5,7 +5,9 @@
  */
 
 import Fastify from 'fastify';
-import { HTTP_HOST, HTTP_PORT } from './config.js';
+import fs from 'fs';
+import net from 'net';
+import { HTTP_HOST, HTTP_PORT, HTTP_SOCKET_PATH, API_SECRET } from './config.js';
 import { KnowledgeBase } from './knowledge-base.js';
 import { KnowledgeBasePresenter } from './api/presenter.js';
 import { QueryExporter } from './api/query-exporter.js';
@@ -13,6 +15,16 @@ import { QueryExporter } from './api/query-exporter.js';
 const fastify = Fastify({
   logger: true, // 启用 Fastify 内置请求日志
 });
+
+// 轻量级 Bearer Token 认证（未配置时跳过，兼容现有部署）
+if (API_SECRET) {
+  fastify.addHook('onRequest', async (request, reply) => {
+    const auth = request.headers.authorization || '';
+    if (!auth.startsWith('Bearer ') || auth.slice(7) !== API_SECRET) {
+      reply.code(401).send({ error: 'Unauthorized' });
+    }
+  });
+}
 
 const queryExporter = new QueryExporter(); // 查询上下文调试导出器
 
@@ -143,6 +155,58 @@ fastify.post('/api/memory/governance/plan-update', async (request, reply) => {
   }
 });
 
+// ========== Review Endpoints ==========
+
+/** 列出待审核记忆 */
+fastify.get('/api/memory/reviews', async (request, reply) => {
+  try {
+    const { limit } = request.query;
+    const items = knowledgeBase.listReviews(parseInt(limit) || 50);
+    return { reviews: items, count: items.length };
+  } catch (err) {
+    reply.code(500);
+    return KnowledgeBasePresenter.presentError(err, 500);
+  }
+});
+
+/** 评估待审核记忆 */
+fastify.post('/api/memory/reviews/:id/evaluate', async (request, reply) => {
+  try {
+    const { id } = request.params;
+    const { evaluation } = request.body;
+    const result = knowledgeBase.evaluateReview(id, evaluation);
+    return { success: true, ...result };
+  } catch (err) {
+    reply.code(500);
+    return KnowledgeBasePresenter.presentError(err, 500);
+  }
+});
+
+/** 提升待审核记忆为永久 */
+fastify.post('/api/memory/reviews/:id/promote', async (request, reply) => {
+  try {
+    const { id } = request.params;
+    const { evaluation } = request.body || {};
+    const result = knowledgeBase.promoteReview(id, evaluation || null);
+    return { success: true, ...result };
+  } catch (err) {
+    reply.code(500);
+    return KnowledgeBasePresenter.presentError(err, 500);
+  }
+});
+
+/** 丢弃待审核记忆 */
+fastify.post('/api/memory/reviews/:id/discard', async (request, reply) => {
+  try {
+    const { id } = request.params;
+    const result = knowledgeBase.discardReview(id);
+    return { success: true, ...result };
+  } catch (err) {
+    reply.code(500);
+    return KnowledgeBasePresenter.presentError(err, 500);
+  }
+});
+
 // ========== Health Endpoints ==========
 
 /** 完整健康快照 */
@@ -252,19 +316,181 @@ fastify.get('/api/wiki/status', async (request, reply) => {
   }
 });
 
+// ========== Rebuild Endpoint ==========
+
+/** 重建 localMem 索引（梦境循环 Deep Sleep 使用） */
+fastify.post('/api/rebuild', async (request, reply) => {
+  try {
+    const result = await knowledgeBase.rebuildLocalMem();
+    return { success: true, ...result };
+  } catch (err) {
+    reply.code(500);
+    return KnowledgeBasePresenter.presentError(err, 500);
+  }
+});
+
+/** 重建 localMem 索引（GET 版本，兼容无 body 调用） */
+fastify.get('/api/rebuild', async (request, reply) => {
+  try {
+    const result = await knowledgeBase.rebuildLocalMem();
+    return { success: true, ...result };
+  } catch (err) {
+    reply.code(500);
+    return KnowledgeBasePresenter.presentError(err, 500);
+  }
+});
+
+// ========== Legacy Bridge Endpoints (兼容 rule-engine-bridge) ==========
+
+/** 保存记忆取舍决策 */
+fastify.post('/api/memory/choice', async (request, reply) => {
+  try {
+    const { memory_id, choice, updated_at } = request.body;
+    const result = knowledgeBase.saveMemoryChoice({ memoryId: memory_id, choice, updatedAt: updated_at });
+    return { success: true, ...result };
+  } catch (err) {
+    reply.code(500);
+    return KnowledgeBasePresenter.presentError(err, 500);
+  }
+});
+
+/** Review 通用入口（兼容 rule-engine-bridge） */
+fastify.post('/api/memory/review', async (request, reply) => {
+  try {
+    const { memory_id, action, publish_target, updated_at } = request.body;
+    if (action === 'promote' || action === 'keep') {
+      const result = knowledgeBase.promoteReview(memory_id);
+      return { success: true, ...result };
+    }
+    if (action === 'discard') {
+      const result = knowledgeBase.discardReview(memory_id);
+      return { success: true, ...result };
+    }
+    reply.code(400);
+    return { success: false, error: `Unsupported review action: ${action}` };
+  } catch (err) {
+    reply.code(500);
+    return KnowledgeBasePresenter.presentError(err, 500);
+  }
+});
+
+// ========== Metrics ==========
+const metrics = {
+  startTime: Date.now(),
+  requestCount: 0,
+  errorCount: 0,
+  memoryQueryCount: 0,
+  memoryTurnCount: 0,
+};
+
+fastify.addHook('onResponse', async (request, reply) => {
+  metrics.requestCount += 1;
+  if (reply.statusCode >= 500) {
+    metrics.errorCount += 1;
+  }
+  if (request.url.startsWith('/api/memory/query')) {
+    metrics.memoryQueryCount += 1;
+  }
+  if (request.url === '/api/memory/turn') {
+    metrics.memoryTurnCount += 1;
+  }
+});
+
+/** 基础 metrics 端点 */
+fastify.get('/metrics', async (request, reply) => {
+  const mem = process.memoryUsage();
+  const uptime = Date.now() - metrics.startTime;
+  return {
+    uptime_ms: uptime,
+    requests_total: metrics.requestCount,
+    errors_total: metrics.errorCount,
+    memory_queries_total: metrics.memoryQueryCount,
+    memory_turns_total: metrics.memoryTurnCount,
+    process: {
+      rss_mb: Math.round(mem.rss / 1024 / 1024),
+      heap_used_mb: Math.round(mem.heapUsed / 1024 / 1024),
+      heap_total_mb: Math.round(mem.heapTotal / 1024 / 1024),
+      external_mb: Math.round(mem.external / 1024 / 1024),
+    },
+  };
+});
+
 // Start server
+let socketServer = null;
+
 /**
- * 启动 HTTP 服务器
+ * 启动 HTTP 服务器（TCP + Unix Domain Socket 双栈）
  * @returns {Promise<void>}
  */
 const start = async () => {
   try {
+    // TCP 入口（供网关使用）
     await fastify.listen({ host: HTTP_HOST, port: HTTP_PORT });
     console.log(`HTTP server listening on ${HTTP_HOST}:${HTTP_PORT}`);
+
+    // Unix Domain Socket 入口（供本地工具使用，可选）
+    // 使用 TCP 透明代理实现，零 HTTP 解析开销，绕过 Fastify 单实例 listen 限制
+    if (HTTP_SOCKET_PATH) {
+      try {
+        if (fs.existsSync(HTTP_SOCKET_PATH)) {
+          fs.unlinkSync(HTTP_SOCKET_PATH);
+        }
+        socketServer = net.createServer((clientSocket) => {
+          const serverSocket = net.connect(HTTP_PORT, HTTP_HOST);
+          clientSocket.pipe(serverSocket);
+          serverSocket.pipe(clientSocket);
+          clientSocket.on('error', (err) => {
+            console.error(`[UnixSocket] client error: ${err.message}`);
+          });
+          serverSocket.on('error', (err) => {
+            console.error(`[UnixSocket] upstream connection error: ${err.message}`);
+            clientSocket.destroy();
+          });
+          clientSocket.on('close', () => {
+            serverSocket.end();
+          });
+          serverSocket.on('close', () => {
+            clientSocket.end();
+          });
+        });
+        socketServer.listen(HTTP_SOCKET_PATH, () => {
+          fs.chmodSync(HTTP_SOCKET_PATH, 0o600);
+          console.log(`Unix socket proxy listening on ${HTTP_SOCKET_PATH} -> ${HTTP_HOST}:${HTTP_PORT}`);
+        });
+      } catch (sockErr) {
+        console.warn(`Unix socket start failed: ${sockErr.message}`);
+      }
+    }
   } catch (err) {
     fastify.log.error(err);
     process.exit(1);
   }
 };
+
+/**
+ * Graceful shutdown：关闭 HTTP 服务器、Unix Socket、数据库连接
+ */
+async function shutdown(signal) {
+  console.log(`[shutdown] received ${signal}, closing gracefully...`);
+  try {
+    if (socketServer) {
+      socketServer.close();
+      socketServer = null;
+    }
+    if (fs.existsSync(HTTP_SOCKET_PATH)) {
+      fs.unlinkSync(HTTP_SOCKET_PATH);
+    }
+    await knowledgeBase.close();
+    await fastify.close();
+    console.log('[shutdown] closed successfully');
+    process.exit(0);
+  } catch (err) {
+    console.error(`[shutdown] error during close: ${err.message}`);
+    process.exit(1);
+  }
+}
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
 
 start();

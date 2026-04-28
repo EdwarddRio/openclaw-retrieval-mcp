@@ -41,7 +41,6 @@ async function main() {
 
   console.log('Initializing KnowledgeBase...');
   const kb = new KnowledgeBase();
-  await kb.initializeEager();
 
   const harness = new BenchmarkHarness({
     searchFn: (opts) => kb.search(opts),

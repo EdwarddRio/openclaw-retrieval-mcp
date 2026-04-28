@@ -128,6 +128,8 @@ export class SqliteStore {
   constructor(dbPath = null) {
     this.dbPath = dbPath || path.join(LOCALMEM_DIR, 'localmem.db');
     this.db = null;
+    this._stmtCache = new Map();
+    this._lastCheckpointAt = 0;
     this._connectSync();
   }
 
@@ -144,14 +146,111 @@ export class SqliteStore {
     this.db = new DbClass(this.dbPath);
     this.db.pragma('journal_mode = WAL');
     this._migrate();
+    this._maybeCheckpoint();
     return this.db;
   }
 
   /** 关闭数据库连接 */
   close() {
     if (this.db) {
+      this._stmtCache.clear();
+      this._maybeCheckpoint();
       this.db.close();
       this.db = null;
+    }
+  }
+
+  /**
+   * 获取或缓存 prepared statement，避免重复编译 SQL
+   * @param {string} sql - SQL 语句
+   * @returns {Object} better-sqlite3 prepared statement
+   */
+  _getStmt(sql) {
+    if (this._stmtCache.has(sql)) {
+      return this._stmtCache.get(sql);
+    }
+    const stmt = this.db.prepare(sql);
+    this._stmtCache.set(sql, stmt);
+    return stmt;
+  }
+
+  /**
+   * 数据库健康检查：验证连接可用性、WAL 大小、表完整性
+   * @returns {{ healthy: boolean, walSizeMb: number, tables: string[], error?: string }}
+   */
+  healthCheck() {
+    try {
+      // 验证连接
+      this.db.prepare('SELECT 1').get();
+      // 验证关键表存在
+      const tables = this.db.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all().map(r => r.name);
+      const required = ['sessions', 'turns', 'memory_items', 'memory_events', 'memory_aliases'];
+      const missing = required.filter(t => !tables.includes(t));
+      if (missing.length > 0) {
+        return { healthy: false, walSizeMb: 0, tables, error: `Missing tables: ${missing.join(', ')}` };
+      }
+      // WAL 大小
+      const walSize = this.getWalSize();
+      return { healthy: true, walSizeMb: walSize.walSizeMb, tables };
+    } catch (err) {
+      return { healthy: false, walSizeMb: 0, tables: [], error: err.message };
+    }
+  }
+
+  /**
+   * 获取 WAL 文件大小
+   * @returns {{ walSizeMb: number, logFrames: number, checkpointedFrames: number }}
+   */
+  getWalSize() {
+    try {
+      const info = this.db.prepare('PRAGMA wal_checkpoint(PASSIVE)').get();
+      const walPath = `${this.dbPath}-wal`;
+      let walSizeMb = 0;
+      if (fs.existsSync(walPath)) {
+        walSizeMb = Math.round(fs.statSync(walPath).size / 1024 / 1024 * 100) / 100;
+      }
+      return {
+        walSizeMb,
+        logFrames: info?.log || 0,
+        checkpointedFrames: info?.checkpointed || 0,
+      };
+    } catch (err) {
+      return { walSizeMb: 0, logFrames: 0, checkpointedFrames: 0 };
+    }
+  }
+
+  /**
+   * 执行 WAL checkpoint，将 WAL 中的修改合并回主数据库并截断 WAL 文件
+   * 每次连接/关闭时自动调用，外部也可显式调用
+   */
+  checkpoint() {
+    if (!this.db) return;
+    try {
+      const result = this.db.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get();
+      if (result && result.checkpointed > 0) {
+        // eslint-disable-next-line no-console
+        console.log(`SQLite WAL checkpoint: log=${result.log}, checkpointed=${result.checkpointed}`);
+      }
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn(`WAL checkpoint failed: ${err.message}`);
+    }
+  }
+
+  /** 尝试 checkpoint：若 WAL 较大或距上次 checkpoint 超过 1 小时 */
+  _maybeCheckpoint() {
+    if (!this.db) return;
+    try {
+      const now = Date.now();
+      const oneHour = 60 * 60 * 1000;
+      const walInfo = this.getWalSize();
+      const shouldCheckpoint = walInfo.walSizeMb > 10 || walInfo.logFrames > 1000 || (now - this._lastCheckpointAt) > oneHour;
+      if (shouldCheckpoint) {
+        this.checkpoint();
+        this._lastCheckpointAt = now;
+      }
+    } catch {
+      // 忽略
     }
   }
 
@@ -230,8 +329,7 @@ export class SqliteStore {
    * @returns {Object|null} 会话对象，不存在时返回 null
    */
   getSession(sessionId) {
-    const stmt = this.db.prepare('SELECT * FROM sessions WHERE id = ?');
-    const row = stmt.get(sessionId);
+    const row = this._getStmt('SELECT * FROM sessions WHERE id = ?').get(sessionId);
     return row ? this._rowToSession(row) : null;
   }
 
@@ -241,11 +339,10 @@ export class SqliteStore {
    * @returns {Object|null} 活跃会话对象
    */
   getActiveSession(projectId = 'default') {
-    const stmt = this.db.prepare(`
+    const row = this._getStmt(`
       SELECT * FROM sessions WHERE project_id = ? AND status = 'active'
       ORDER BY updated_at DESC LIMIT 1
-    `);
-    const row = stmt.get(projectId);
+    `).get(projectId);
     return row ? this._rowToSession(row) : null;
   }
 
@@ -319,7 +416,7 @@ export class SqliteStore {
     );
 
     // Update session updated_at
-    this.db.prepare('UPDATE sessions SET updated_at = ? WHERE id = ?')
+    this._getStmt('UPDATE sessions SET updated_at = ? WHERE id = ?')
       .run(turn.created_at, turn.session_id);
 
     return turn;
@@ -332,11 +429,10 @@ export class SqliteStore {
    * @returns {Array<Object>} 轮次列表
    */
   getTurns(sessionId, limit = 50) {
-    const stmt = this.db.prepare(`
+    return this._getStmt(`
       SELECT * FROM turns WHERE session_id = ?
       ORDER BY created_at DESC LIMIT ?
-    `);
-    return stmt.all(sessionId, limit).map(r => this._rowToTurn(r));
+    `).all(sessionId, limit).map(r => this._rowToTurn(r));
   }
 
   /**
@@ -345,10 +441,9 @@ export class SqliteStore {
    * @returns {Object|null} 最后一条轮次对象
    */
   getLastTurn(sessionId) {
-    const stmt = this.db.prepare(`
+    const row = this._getStmt(`
       SELECT * FROM turns WHERE session_id = ? ORDER BY created_at DESC LIMIT 1
-    `);
-    const row = stmt.get(sessionId);
+    `).get(sessionId);
     return row ? this._rowToTurn(row) : null;
   }
 
@@ -411,13 +506,13 @@ export class SqliteStore {
     );
 
     // Sync aliases table
-    this.db.prepare('DELETE FROM memory_aliases WHERE memory_id = ?').run(memory.memory_id);
-    const aliasStmt = this.db.prepare('INSERT INTO memory_aliases (memory_id, alias) VALUES (?, ?)');
+    this._getStmt('DELETE FROM memory_aliases WHERE memory_id = ?').run(memory.memory_id);
+    const aliasStmt = this._getStmt('INSERT INTO memory_aliases (memory_id, alias) VALUES (?, ?)');
     for (const alias of (memory.aliases || [])) {
       aliasStmt.run(memory.memory_id, alias);
     }
 
-    return this._rowToMemory(this.db.prepare('SELECT * FROM memory_items WHERE id = ?').get(memory.memory_id));
+    return this._rowToMemory(this._getStmt('SELECT * FROM memory_items WHERE id = ?').get(memory.memory_id));
   }
 
   /**
@@ -426,8 +521,7 @@ export class SqliteStore {
    * @returns {Object|null} 记忆对象
    */
   getMemory(memoryId) {
-    const stmt = this.db.prepare('SELECT * FROM memory_items WHERE id = ?');
-    const row = stmt.get(memoryId);
+    const row = this._getStmt('SELECT * FROM memory_items WHERE id = ?').get(memoryId);
     return row ? this._rowToMemory(row) : null;
   }
 
@@ -443,10 +537,15 @@ export class SqliteStore {
     if (!query || !query.trim()) return [];
 
     // Build WHERE clause: each token must appear in content
-    const terms = query.trim().split(/\s+/).filter(t => t.length > 0);
+    let terms = query.trim().split(/\s+/).filter(t => t.length > 0);
     if (terms.length === 0) return [];
 
-    const conditions = terms.map(() => 'content LIKE ?').join(' AND ');
+    // 中文无空格 fallback：若整句无空格且含中文，按单字切分以提升召回
+    if (terms.length === 1 && terms[0].length > 1 && /[\u4e00-\u9fff]/.test(terms[0])) {
+      terms = [...terms[0]].filter(c => /[\u4e00-\u9fff]/.test(c));
+    }
+
+    const conditions = terms.map(() => 'content LIKE ?').join(' OR ');
     const params = terms.map(t => `%${t}%`);
 
     const stmt = this.db.prepare(`
@@ -455,7 +554,15 @@ export class SqliteStore {
       ORDER BY updated_at DESC
       LIMIT ?
     `);
-    return stmt.all(...params, topK).map(r => this._rowToMemory(r));
+    const rows = stmt.all(...params, topK * 5).map(r => this._rowToMemory(r));
+    // 二次排序：命中 token 越多越靠前，其次按 updated_at 倒序
+    rows.sort((a, b) => {
+      const scoreA = terms.filter(t => (a.content || '').includes(t)).length;
+      const scoreB = terms.filter(t => (b.content || '').includes(t)).length;
+      if (scoreB !== scoreA) return scoreB - scoreA;
+      return (b.updated_at || '').localeCompare(a.updated_at || '');
+    });
+    return rows.slice(0, topK);
   }
 
   /**
@@ -508,7 +615,7 @@ export class SqliteStore {
    * @param {Object} [extra] - 额外需要更新的字段
    */
   updateMemoryState(memoryId, state, extra = {}) {
-    const allowed = ['state', 'status', 'last_choice', 'updated_at'];
+    const allowed = ['state', 'status', 'last_choice'];
     const fields = [];
     const values = [];
     for (const [k, v] of Object.entries(extra)) {
@@ -529,16 +636,29 @@ export class SqliteStore {
   }
 
   /**
+   * 评估记忆：存储 LLM 评估结果到 evaluation_json 字段
+   * @param {string} memoryId - 记忆 ID
+   * @param {Object} evaluation - 评估结果 { score, reasoning, recommendation }
+   * @returns {boolean} 是否更新成功
+   */
+  evaluateMemory(memoryId, evaluation) {
+    const stmt = this.db.prepare(`
+      UPDATE memory_items SET evaluation_json = ?, updated_at = ? WHERE id = ?
+    `);
+    const result = stmt.run(JSON.stringify(evaluation || {}), new Date().toISOString(), memoryId);
+    return result.changes > 0;
+  }
+
+  /**
    * 硬删除记忆条目（同时清理别名记录）
    * @param {string} memoryId - 记忆 ID
    * @returns {boolean} 是否删除成功
    */
   deleteMemory(memoryId) {
     // Clean up aliases first
-    this.db.prepare('DELETE FROM memory_aliases WHERE memory_id = ?').run(memoryId);
+    this._getStmt('DELETE FROM memory_aliases WHERE memory_id = ?').run(memoryId);
     // Hard delete the memory item
-    const stmt = this.db.prepare('DELETE FROM memory_items WHERE id = ?');
-    const result = stmt.run(memoryId);
+    const result = this._getStmt('DELETE FROM memory_items WHERE id = ?').run(memoryId);
     return result.changes > 0;
   }
 
@@ -606,11 +726,11 @@ export class SqliteStore {
    * @returns {{ total: number, active: number, tentative: number, kept: number, sessions: number }}
    */
   statsSummary() {
-    const total = this.db.prepare("SELECT COUNT(*) as c FROM memory_items").get().c;
-    const active = this.db.prepare("SELECT COUNT(*) as c FROM memory_items WHERE status = 'active' AND state IN ('tentative', 'kept')").get().c;
-    const tentative = this.db.prepare("SELECT COUNT(*) as c FROM memory_items WHERE state = 'tentative' AND status = 'active'").get().c;
-    const kept = this.db.prepare("SELECT COUNT(*) as c FROM memory_items WHERE state = 'kept' AND status = 'active'").get().c;
-    const sessions = this.db.prepare("SELECT COUNT(*) as c FROM sessions").get().c;
+    const total = this._getStmt("SELECT COUNT(*) as c FROM memory_items").get().c;
+    const active = this._getStmt("SELECT COUNT(*) as c FROM memory_items WHERE status = 'active' AND state IN ('tentative', 'kept')").get().c;
+    const tentative = this._getStmt("SELECT COUNT(*) as c FROM memory_items WHERE state = 'tentative' AND status = 'active'").get().c;
+    const kept = this._getStmt("SELECT COUNT(*) as c FROM memory_items WHERE state = 'kept' AND status = 'active'").get().c;
+    const sessions = this._getStmt("SELECT COUNT(*) as c FROM sessions").get().c;
     return { total, active, tentative, kept, sessions };
   }
 
@@ -633,13 +753,12 @@ export class SqliteStore {
    * @returns {Array<Object>} 活跃记忆列表
    */
   listActiveFacts(limit = 1000) {
-    const stmt = this.db.prepare(`
+    return this._getStmt(`
       SELECT * FROM memory_items
       WHERE status = 'active' AND state IN ('tentative', 'kept')
       ORDER BY updated_at DESC
       LIMIT ?
-    `);
-    return stmt.all(limit).map(r => this._rowToMemory(r));
+    `).all(limit).map(r => this._rowToMemory(r));
   }
 
   /**
@@ -676,7 +795,7 @@ export class SqliteStore {
    */
   cleanupOldTurns(maxAgeDays) {
     const cutoff = new Date(Date.now() - maxAgeDays * 24 * 60 * 60 * 1000).toISOString();
-    const result = this.db.prepare(`DELETE FROM turns WHERE created_at < ?`).run(cutoff);
+    const result = this._getStmt(`DELETE FROM turns WHERE created_at < ?`).run(cutoff);
     return { deleted: result.changes };
   }
 
@@ -687,7 +806,7 @@ export class SqliteStore {
    */
   cleanupOldSessions(maxAgeDays) {
     const cutoff = new Date(Date.now() - maxAgeDays * 24 * 60 * 60 * 1000).toISOString();
-    const result = this.db.prepare(`
+    const result = this._getStmt(`
       DELETE FROM sessions
       WHERE updated_at < ? AND status != 'active'
       AND id NOT IN (SELECT DISTINCT session_id FROM turns)
@@ -702,7 +821,7 @@ export class SqliteStore {
    */
   cleanupOldEvents(maxAgeDays) {
     const cutoff = new Date(Date.now() - maxAgeDays * 24 * 60 * 60 * 1000).toISOString();
-    const result = this.db.prepare(`DELETE FROM memory_events WHERE created_at < ?`).run(cutoff);
+    const result = this._getStmt(`DELETE FROM memory_events WHERE created_at < ?`).run(cutoff);
     return { deleted: result.changes };
   }
 
@@ -713,7 +832,7 @@ export class SqliteStore {
    */
   cleanupExpiredTentative(ttlDays) {
     const cutoff = new Date(Date.now() - ttlDays * 24 * 60 * 60 * 1000).toISOString();
-    const result = this.db.prepare(`
+    const result = this._getStmt(`
       DELETE FROM memory_items
       WHERE state = 'tentative' AND status = 'active' AND created_at < ?
     `).run(cutoff);

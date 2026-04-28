@@ -32,12 +32,21 @@ export class HealthFacade {
     if (benchmarks.available === false) staleFlags.push('benchmark_missing');
     else if (benchmarks.stale) staleFlags.push('benchmark_stale');
 
+    const governance = {
+      pending_review_count: localmem.stats?.tentative || 0,
+      wiki_candidate_count: 0,
+    };
+    if (governance.pending_review_count > 0) {
+      staleFlags.push('review_queue_backlog');
+    }
+
     const status = staleFlags.length > 0 ? 'stale' : 'ready';
 
     return {
       status: allHealthy ? status : 'degraded',
       localmem,
       benchmarks,
+      governance,
       deployment: buildDeploymentSummary(),
       stale_flags: staleFlags,
       timestamp: new Date().toISOString(),
@@ -46,15 +55,19 @@ export class HealthFacade {
 
   /**
    * 检查本地记忆模块健康状态
-   * @returns {object} { healthy: boolean, stats?: object, error?: string }
+   * @returns {object} { healthy: boolean, stats?: object, db?: object, error?: string }
    */
   healthLocalmem() {
     try {
       const store = this.memoryFacade.localMemory;
       const stats = store.stats ? store.stats() : {};
+      const dbHealth = store._store && store._store.healthCheck ? store._store.healthCheck() : null;
+      const walInfo = store._store && store._store.getWalSize ? store._store.getWalSize() : null;
+      const healthy = dbHealth ? dbHealth.healthy : true;
       return {
-        healthy: true,
+        healthy,
         stats,
+        db: dbHealth ? { wal_size_mb: walInfo?.walSizeMb, tables: dbHealth.tables } : null,
       };
     } catch (err) {
       return { healthy: false, error: err.message };
@@ -70,10 +83,11 @@ export class HealthFacade {
       const latest = this.benchmarkFacade.latestBenchmark();
       return {
         healthy: true,
+        available: true,
         latest_benchmark: latest,
       };
     } catch (err) {
-      return { healthy: false, error: err.message };
+      return { healthy: false, available: false, error: err.message };
     }
   }
 }

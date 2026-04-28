@@ -279,8 +279,9 @@ export class WikiCompiler {
     const enrichedPages = pages.map(p => {
       if (p.sourceId) return p;
       // Look up sourceId from manifest by matching wikiPage name
+      const expectedName = p.name || (p.title ? p.title + '.md' : '');
       const entry = Object.values(this._manifest.allEntries)
-        .find(e => e.wikiPage === (p.name || p.title + '.md'));
+        .find(e => e.wikiPage === expectedName);
       return {
         ...p,
         sourceId: entry?.sourceId || p.sourceId || '',
@@ -364,8 +365,9 @@ export class WikiCompiler {
       let score = 0;
       for (const term of terms) {
         // Title match counts more
-        const titleCount = (title.match(new RegExp(term, 'g')) || []).length;
-        const contentCount = (content.match(new RegExp(term, 'g')) || []).length;
+        const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const titleCount = (title.match(new RegExp(escaped, 'g')) || []).length;
+        const contentCount = (content.match(new RegExp(escaped, 'g')) || []).length;
         score += titleCount * 5 + contentCount;
       }
 

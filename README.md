@@ -145,6 +145,7 @@ tentative 记忆不会主动弹窗通知，但通过**心跳兜底脚本**实现
 |------|------|------|
 | GET | `/api/health` | 完整健康快照 |
 | GET | `/api/health/ready` | 快速就绪检查 |
+| GET | `/metrics` | 服务指标（请求数、内存、运行时长） |
 | POST | `/api/benchmarks/record` | 记录结果 |
 | GET | `/api/benchmarks/latest` | 最新结果 |
 | GET | `/api/benchmarks/history` | 历史记录 |
@@ -231,7 +232,23 @@ journalctl --user -u openclaw-context-engine.service -f
 
 # 重启
 systemctl --user restart openclaw-context-engine.service
+
+# 查看实时指标
+curl http://127.0.0.1:8901/metrics
+
+# 健康检查
+curl http://127.0.0.1:8901/api/health/ready
 ```
+
+### Graceful Shutdown
+
+服务接收 `SIGTERM` / `SIGINT` 时会按序关闭：
+1. Unix Socket 代理停止并清理 socket 文件
+2. Fastify HTTP 服务关闭（等待正在处理的请求）
+3. SQLite 数据库连接关闭（自动执行 WAL checkpoint）
+4. 进程退出
+
+避免直接 `kill -9`，防止 WAL 数据丢失。
 
 ## 与旧架构的对比
 
@@ -247,6 +264,8 @@ systemctl --user restart openclaw-context-engine.service
 | 丢弃记忆 | 软删除（status=discarded） | 硬删除 |
 | 服务架构 | 三服务协作 | 单服务 |
 | 部署 | systemd 三服务链 | systemd 单服务 |
+| 可观测性 | 基础日志 | Metrics 端点 + WAL 健康检查 |
+| SQL 优化 | 每次重新 prepare | Prepared Statement 缓存 |
 
 ## 许可证
 

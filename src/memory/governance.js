@@ -70,11 +70,23 @@ export async function planKnowledgeUpdate({
   }
 
   if (relatedMemoryIds.length === 1) {
+    const onlyFact = sortedRelated[0];
+    const exactOverlap = candidateProfile.normalizedText &&
+      (onlyFact.content || '').toLowerCase().includes(candidateProfile.normalizedText);
+    if (exactOverlap) {
+      return {
+        strategy: 'supersede_existing',
+        suggestedMemoryId: relatedMemoryIds[0],
+        relatedMemoryIds,
+        conflictMemoryIds: [relatedMemoryIds[0]],
+      };
+    }
+    // 相关性不足，降级为人工审阅
     return {
-      strategy: 'supersede_existing',
-      suggestedMemoryId: relatedMemoryIds[0],
+      strategy: 'resolve_conflict',
+      suggestedMemoryId: '',
       relatedMemoryIds,
-      conflictMemoryIds: [relatedMemoryIds[0]],
+      conflictMemoryIds: relatedMemoryIds,
     };
   }
 

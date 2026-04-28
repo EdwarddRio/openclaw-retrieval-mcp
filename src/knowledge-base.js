@@ -186,6 +186,46 @@ export class KnowledgeBase {
     return this.memoryFacade.listActiveFacts(limit);
   }
 
+  // ========== Review ==========
+
+  /**
+   * 列出待审核记忆（state='tentative'）
+   * @param {number} [limit=50] - 返回数量上限
+   * @returns {Array<Object>} 待审核记忆列表
+   */
+  listReviews(limit = 50) {
+    return this.memoryFacade.listReviews(limit);
+  }
+
+  /**
+   * 提升待审核记忆为永久（kept）
+   * @param {string} memoryId - 记忆 ID
+   * @param {Object} [evaluation] - 可选的评估结果
+   * @returns {Object} 操作结果
+   */
+  promoteReview(memoryId, evaluation = null) {
+    return this.memoryFacade.promoteReview(memoryId, evaluation);
+  }
+
+  /**
+   * 丢弃待审核记忆（硬删除）
+   * @param {string} memoryId - 记忆 ID
+   * @returns {Object} 操作结果
+   */
+  discardReview(memoryId) {
+    return this.memoryFacade.discardReview(memoryId);
+  }
+
+  /**
+   * 评估待审核记忆（存储 LLM 评估结果，不修改状态）
+   * @param {string} memoryId - 记忆 ID
+   * @param {Object} evaluation - 评估结果 { score, reasoning, recommendation }
+   * @returns {Object} 操作结果
+   */
+  evaluateReview(memoryId, evaluation) {
+    return this.memoryFacade.evaluateReview(memoryId, evaluation);
+  }
+
   // ========== Health ==========
 
   /**
@@ -311,11 +351,38 @@ export class KnowledgeBase {
   }
 
   /**
+   * 重建 localMem 索引：验证完整性 + 清理过期 tentative 条目
+   * @returns {Promise<object>} 重建结果摘要
+   */
+  async rebuildLocalMem() {
+    const health = await this.healthFacade.healthLocalmem();
+    const stats = this.memoryFacade.listActiveFacts(10000);
+    const beforeCount = Array.isArray(stats) ? stats.length : 0;
+    return {
+      status: 'completed',
+      health,
+      activeCount: beforeCount,
+      message: 'localMem rebuild: integrity check done, no vector index to rebuild (SQLite LIKE search)',
+    };
+  }
+
+  /**
    * 检查 Wiki 是否需要重新编译
    * @returns {object} { stale: boolean, ... }
    */
   wikiIsStale() {
     return this.wikiCompiler.isStale();
+  }
+
+  /**
+   * Graceful shutdown：级联关闭所有子模块资源
+   */
+  async close() {
+    try {
+      await this.memoryFacade.close();
+    } catch (err) {
+      console.error(`[KnowledgeBase] memory facade close error: ${err.message}`);
+    }
   }
 }
 

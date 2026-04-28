@@ -7,7 +7,7 @@ import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import { v4 as uuidv4 } from 'uuid';
-import { logger, LOCALMEM_DIR, LOCALMEM_FACT_MAX_AGE_DAYS, PROJECT_ROOT } from '../config.js';
+import { logger, LOCALMEM_DIR, LOCALMEM_FACT_MAX_AGE_DAYS, PROJECT_ROOT, LOCALMEM_DAILY_WRITE_LIMIT } from '../config.js';
 import { SqliteStore } from './sqlite-store.js';
 import { ChatTurn, ChatSession, MemoryFact, isoNow, canonicalKeyForText, TRIAGE_CONFIRM_SIGNALS, TRIAGE_DISCARD_SIGNALS, TRIAGE_MIN_CONTENT_LENGTH, TRIAGE_MAX_CONTENT_LENGTH } from './models.js';
 import { planKnowledgeUpdate } from './governance.js';
@@ -29,8 +29,11 @@ const EXPLICIT_MEMORY_SIGNALS = [
   '记住这个', '以后注意', '固定规则', '以后统一',
   '这个很重要', '帮我存一下', '记一下', '这个别忘了',
   '帮我记着', '存一下', '留个底', '备注一下', '这个要留档',
+  '决定', '确认', '以后', '规则', '禁止', '必须', '约定',
+  '优先', '默认', '统一', '固定', '一直', '每次', '任何',
   'always', 'never', 'must', 'from now on', 'make sure',
   'remember this', 'note this', 'keep this',
+  'decide', 'confirm', 'rule', 'forbid', 'prohibit',
 ];
 
 /**
@@ -47,7 +50,7 @@ export class LocalMemoryStore {
     const rootDir = options.rootDir || LOCALMEM_DIR;
     this._root = path.resolve(rootDir);
     this._projectRoot = options.projectRoot || PROJECT_ROOT;
-    this._dbPath = path.join(this._root, 'memory.db');
+    this._dbPath = path.join(this._root, 'context-engine.db');
     this._statePath = path.join(this._root, 'meta', 'state.json');
     
     this._factMaxAgeDays = options.factMaxAgeDays || LOCALMEM_FACT_MAX_AGE_DAYS;
@@ -58,7 +61,10 @@ export class LocalMemoryStore {
 
   /** 关闭数据库连接 */
   close() {
-    this._store.close();
+    if (this._store) {
+      this._store.close();
+      this._store = null;
+    }
   }
 
   /**
@@ -338,10 +344,10 @@ export class LocalMemoryStore {
     }
 
     // Daily write limit for auto sources
-    if (['auto_triage', 'user_explicit', 'auto_draft'].includes(source)) {
+    if (['auto_triage', 'auto_draft'].includes(source)) {
       const dailyCount = this._store.getDailyWriteCount ? this._store.getDailyWriteCount() : 0;
-      if (dailyCount >= 20) {
-        logger.warn(`Daily write limit reached (${dailyCount}), skipping auto memory`);
+      if (dailyCount >= LOCALMEM_DAILY_WRITE_LIMIT) {
+        logger.warn(`Daily write limit reached (${dailyCount}/${LOCALMEM_DAILY_WRITE_LIMIT}), skipping auto memory`);
         return {
           memory_id: '',
           content: content.trim(),
@@ -557,12 +563,12 @@ export class LocalMemoryStore {
   }
 
   /**
-   * 定期清理过期数据（每 6 小时执行一次）：清理旧轮次、旧会话、旧事件、过期暂定记忆
+   * 定期清理过期数据（每 24 小时执行一次）：清理旧轮次、旧会话、旧事件、过期暂定记忆
    */
   _maybePeriodicCleanup() {
     const now = Date.now();
-    const sixHours = 6 * 60 * 60 * 1000;
-    if (this._lastCleanupAt && (now - this._lastCleanupAt) < sixHours) {
+    const twentyFourHours = 24 * 60 * 60 * 1000;
+    if (this._lastCleanupAt && (now - this._lastCleanupAt) < twentyFourHours) {
       return;
     }
     this._lastCleanupAt = now;
@@ -645,7 +651,7 @@ export class LocalMemoryStore {
    */
   async saveMemoryWithGovernance(options) {
     const source = options.source || 'manual';
-    const isAutoSource = ['auto_triage', 'user_explicit', 'auto_draft'].includes(source);
+    const isAutoSource = ['auto_triage', 'auto_draft'].includes(source);
 
     if (!isAutoSource) {
       return this.saveMemory(options);
@@ -746,7 +752,7 @@ export class LocalMemoryStore {
       return true;
     }
 
-    return cleaned.length >= 30;
+    return cleaned.length >= 15;
   }
 
   /**
@@ -800,15 +806,14 @@ export class LocalMemoryStore {
    * @returns {string[]} 过滤去重后的路径提示列表
    */
   _filterPathHints(pathHints) {
-    return (pathHints || []).filter(hint => {
-      if (!hint || !path.isAbsolute(hint)) return true;
-      try {
-        path.relative(this._projectRoot, path.resolve(hint));
-        return true;
-      } catch {
-        return false;
-      }
-    }).filter((hint, index, self) => self.indexOf(hint) === index);
+    return (pathHints || []).filter((hint, index, self) => {
+      if (!hint) return false;
+      // 只保留相对路径，拒绝绝对路径、上级目录跳转和敏感目录
+      if (path.isAbsolute(hint)) return false;
+      if (hint.includes('..')) return false;
+      if (hint.includes('node_modules')) return false;
+      return self.indexOf(hint) === index;
+    });
   }
 
   /** 确保存储目录和状态文件存在 */
@@ -829,6 +834,100 @@ export class LocalMemoryStore {
   }
 
 
+
+  // ========== Review API ==========
+
+  /**
+   * 列出待审核记忆（state='tentative'）
+   * @param {number} [limit=50] - 返回数量上限
+   * @returns {Array<Object>} 待审核记忆列表
+   */
+  listReviews(limit = 50) {
+    this._maybePeriodicCleanup();
+    return this._store.listMemoryByState('tentative', limit);
+  }
+
+  /**
+   * 提升待审核记忆为永久（kept）
+   * @param {string} memoryId - 记忆 ID
+   * @param {Object} [evaluation] - 可选的评估结果
+   * @returns {Object} 操作结果
+   */
+  promoteReview(memoryId, evaluation = null) {
+    this._maybePeriodicCleanup();
+    const memory = this._store.getMemory(memoryId);
+    if (!memory) throw new Error(`Memory not found: ${memoryId}`);
+    if (memory.state !== 'tentative') throw new Error(`Memory is not in tentative state: ${memory.state}`);
+
+    const autoPromoted = Boolean(
+      evaluation && typeof evaluation.score === 'number' && evaluation.score >= 0.8
+    );
+
+    if (evaluation) {
+      this._store.evaluateMemory(memoryId, evaluation);
+    }
+    this._store.updateMemoryState(memoryId, 'kept', { state: 'kept' });
+    this._store.addEvent({
+      memory_id: memoryId,
+      event_type: autoPromoted ? 'review_auto_promoted' : 'review_promoted',
+      created_at: new Date().toISOString(),
+      event_data: {
+        evaluation,
+        previous_state: 'tentative',
+        auto_promoted: autoPromoted,
+        score: evaluation?.score ?? null,
+      },
+    });
+    return {
+      success: true,
+      memory_id: memoryId,
+      action: 'promoted',
+      state: 'kept',
+      auto_promoted: autoPromoted,
+      score: evaluation?.score ?? null,
+    };
+  }
+
+  /**
+   * 丢弃待审核记忆（硬删除）
+   * @param {string} memoryId - 记忆 ID
+   * @returns {Object} 操作结果
+   */
+  discardReview(memoryId) {
+    this._maybePeriodicCleanup();
+    const memory = this._store.getMemory(memoryId);
+    if (!memory) throw new Error(`Memory not found: ${memoryId}`);
+
+    this._store.addEvent({
+      memory_id: memoryId,
+      event_type: 'review_discarded',
+      created_at: new Date().toISOString(),
+      event_data: { previous_state: memory.state },
+    });
+    this._store.deleteMemory(memoryId);
+    return { success: true, memory_id: memoryId, action: 'discarded' };
+  }
+
+  /**
+   * 评估待审核记忆（存储 LLM 评估结果，不修改状态）
+   * @param {string} memoryId - 记忆 ID
+   * @param {Object} evaluation - 评估结果 { score, reasoning, recommendation }
+   * @returns {Object} 操作结果
+   */
+  evaluateReview(memoryId, evaluation) {
+    this._maybePeriodicCleanup();
+    const memory = this._store.getMemory(memoryId);
+    if (!memory) throw new Error(`Memory not found: ${memoryId}`);
+
+    this._store.evaluateMemory(memoryId, evaluation);
+    this._store.addEvent({
+      memory_id: memoryId,
+      event_type: 'review_evaluated',
+      created_at: new Date().toISOString(),
+      event_data: { evaluation },
+    });
+    return { success: true, memory_id: memoryId, evaluation };
+  }
 
   /**
    * 写入状态文件（合并更新）

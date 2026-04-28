@@ -67,7 +67,7 @@ export function prepareRuntimePath(relativePath, { baseDir = CONTEXT_ENGINE_DIR,
 // ========== 环境变量驱动的配置 ==========
 export const MANIFEST_PATH = prepareRuntimePath('index_manifest.json'); // Wiki 索引清单文件路径
 export const DEBUG_EXPORT_DIR = prepareRuntimePath('debug/queries'); // 调试查询导出目录
-export const DEBUG_EXPORT_ENABLED = true; // 是否启用调试导出
+export const DEBUG_EXPORT_ENABLED = process.env.DEBUG_EXPORT_ENABLED === '1'; // 是否启用调试导出，默认关闭，需显式开启
 export const DEBUG_EXPORT_HISTORY_LIMIT = parseInt(process.env.DEBUG_EXPORT_HISTORY_LIMIT || '20', 10); // 调试导出历史记录上限
 export const BENCHMARKS_DIR = prepareRuntimePath('benchmarks'); // 基准测试数据目录
 export const MCP_LOG_RETENTION_DAYS = parseInt(process.env.MCP_LOG_RETENTION_DAYS || '3', 10); // MCP 日志保留天数
@@ -84,6 +84,11 @@ export const LOCALMEM_AUTO_TRANSCRIPT_MAX_AGE_SECONDS = parseInt(
   process.env.LOCALMEM_AUTO_TRANSCRIPT_MAX_AGE_SECONDS || '1800',
   10
 ); // 自动同步的对话记录最大存活秒数
+export const LOCALMEM_DAILY_WRITE_LIMIT = parseInt(
+  process.env.LOCALMEM_DAILY_WRITE_LIMIT || '50',
+  10
+); // 自动 triage 每日写入上限
+export const HTTP_SOCKET_PATH = process.env.HTTP_SOCKET_PATH || '/tmp/openclaw-engine.sock'; // Unix Domain Socket 路径，为空时禁用
 
 // ========== Winston 日志 ==========
 /** Winston 日志实例，默认输出到控制台，带时间戳和级别 */
@@ -140,3 +145,4 @@ export function buildDeploymentSummary() {
 // ========== HTTP 服务器配置 ==========
 export const HTTP_HOST = process.env.HTTP_HOST || '127.0.0.1'; // HTTP 服务监听地址
 export const HTTP_PORT = parseInt(process.env.HTTP_PORT || '8901', 10); // HTTP 服务监听端口
+export const API_SECRET = process.env.OPENCLAW_API_SECRET || ''; // HTTP API 认证密钥，为空时不校验

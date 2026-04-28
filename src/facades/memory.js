@@ -197,6 +197,53 @@ export class MemoryFacade {
   listActiveFacts(limit) {
     return this.localMemory.listActiveFacts(limit);
   }
+
+  // ========== Review API ==========
+
+  /**
+   * 列出待审核记忆（state='tentative'）
+   * @param {number} [limit=50] - 返回数量上限
+   * @returns {Array<Object>} 待审核记忆列表
+   */
+  listReviews(limit = 50) {
+    return this.localMemory.listReviews(limit);
+  }
+
+  /**
+   * 提升待审核记忆为永久（kept）
+   * @param {string} memoryId - 记忆 ID
+   * @param {Object} [evaluation] - 可选的评估结果
+   * @returns {Object} 操作结果
+   */
+  promoteReview(memoryId, evaluation = null) {
+    return this.localMemory.promoteReview(memoryId, evaluation);
+  }
+
+  /**
+   * 丢弃待审核记忆（硬删除）
+   * @param {string} memoryId - 记忆 ID
+   * @returns {Object} 操作结果
+   */
+  discardReview(memoryId) {
+    return this.localMemory.discardReview(memoryId);
+  }
+
+  /**
+   * 评估待审核记忆（存储 LLM 评估结果，不修改状态）
+   * @param {string} memoryId - 记忆 ID
+   * @param {Object} evaluation - 评估结果 { score, reasoning, recommendation }
+   * @returns {Object} 操作结果
+   */
+  evaluateReview(memoryId, evaluation) {
+    return this.localMemory.evaluateReview(memoryId, evaluation);
+  }
+
+  /**
+   * 关闭底层存储连接
+   */
+  async close() {
+    return this.localMemory.close();
+  }
 }
 
 export default MemoryFacade;
