@@ -225,7 +225,9 @@ export class WikiCompiler {
    * @param {string} options.sourceId - Source ID from raw-sources.json
    */
   saveWikiPage({ sourcePath, wikiPageName, content, sourceId }) {
-    const wikiFilePath = path.join(this._wikiDir, wikiPageName);
+    const safePageName = this._normalizeWikiPageName(wikiPageName);
+    const safeSourcePath = this._resolveAllowedSourcePath(sourcePath);
+    const wikiFilePath = path.join(this._wikiDir, safePageName);
     const dir = path.dirname(wikiFilePath);
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 
@@ -234,19 +236,19 @@ export class WikiCompiler {
     fs.writeFileSync(wikiFilePath, mergedContent, 'utf-8');
 
     // Update manifest (store sourceId)
-    const hash = WikiManifest.fileHash(sourcePath);
-    this._manifest.markCompiled(sourcePath, hash, wikiPageName, sourceId || '');
+    const hash = WikiManifest.fileHash(safeSourcePath);
+    this._manifest.markCompiled(safeSourcePath, hash, safePageName, sourceId || '');
     this._manifest.save();
 
-    logger.info(`Wiki page saved: ${wikiPageName} (from ${sourcePath})`);
+    logger.info(`Wiki page saved: ${safePageName} (from ${safeSourcePath})`);
 
     this._searchCache = null;
     this._searchCacheTime = 0;
 
     return {
-      wikiPage: wikiPageName,
+      wikiPage: safePageName,
       wikiPath: wikiFilePath,
-      sourcePath,
+      sourcePath: safeSourcePath,
       sourceId,
     };
   }
@@ -255,17 +257,18 @@ export class WikiCompiler {
    * Remove a wiki page when its source is deleted.
    */
   removeWikiPage(wikiPageName) {
-    const wikiFilePath = path.join(this._wikiDir, wikiPageName);
+    const safePageName = this._normalizeWikiPageName(wikiPageName);
+    const wikiFilePath = path.join(this._wikiDir, safePageName);
     if (fs.existsSync(wikiFilePath)) {
       fs.unlinkSync(wikiFilePath);
-      logger.info(`Wiki page removed: ${wikiPageName}`);
+      logger.info(`Wiki page removed: ${safePageName}`);
     }
 
     // Clean up manifest entry for this wiki page
     this._manifest.load();
     const entries = this._manifest.allEntries;
     for (const [sourcePath, entry] of Object.entries(entries)) {
-      if (entry.wikiPage === wikiPageName) {
+      if (entry.wikiPage === safePageName) {
         this._manifest.removeEntry(sourcePath);
         break;
       }
@@ -281,11 +284,17 @@ export class WikiCompiler {
    * If pages array is provided, use it. Otherwise auto-derive from manifest.
    * @param {Array} pages - Array of { name, title, sourceId, lastCompiled }
    */
-  updateIndex(pages) {
+  updateIndex(pages = null) {
     this._manifest.load();
+    const sourcePages = Array.isArray(pages) && pages.length > 0
+      ? pages
+      : this._listWikiPages().map(name => ({
+        name,
+        title: name.replace(/\.md$/, ''),
+      }));
 
     // Auto-fill sourceId from manifest when not provided by caller
-    const enrichedPages = pages.map(p => {
+    const enrichedPages = sourcePages.map(p => {
       if (p.sourceId) return p;
       // Look up sourceId from manifest by matching wikiPage name
       const expectedName = p.name || (p.title ? p.title + '.md' : '');
@@ -435,6 +444,36 @@ export class WikiCompiler {
   }
 
   // ========== Private helpers ==========
+
+  _normalizeWikiPageName(wikiPageName) {
+    const name = String(wikiPageName || '').trim();
+    if (!name || path.isAbsolute(name) || name.includes('/') || name.includes('\\') || name.includes('..')) {
+      throw new Error('Invalid wikiPageName');
+    }
+    if (!name.endsWith('.md')) {
+      throw new Error('wikiPageName must end with .md');
+    }
+    return name;
+  }
+
+  _resolveAllowedSourcePath(sourcePath) {
+    const resolved = path.resolve(sourcePath || '');
+    const realSource = fs.realpathSync(resolved);
+    const knownFiles = this.scanAllSources();
+    if (knownFiles.length === 0) return realSource;
+
+    const allowed = knownFiles.some(file => {
+      try {
+        return fs.realpathSync(file.path) === realSource;
+      } catch {
+        return false;
+      }
+    });
+    if (!allowed) {
+      throw new Error('sourcePath is not configured in raw-sources.json');
+    }
+    return realSource;
+  }
 
   /**
    * Merge human-edited regions from existing wiki file into new compiled content.

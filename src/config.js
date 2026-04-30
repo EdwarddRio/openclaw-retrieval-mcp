@@ -88,7 +88,9 @@ export const LOCALMEM_DAILY_WRITE_LIMIT = parseInt(
   process.env.LOCALMEM_DAILY_WRITE_LIMIT || '50',
   10
 ); // 自动 triage 每日写入上限
-export const HTTP_SOCKET_PATH = process.env.HTTP_SOCKET_PATH || '/tmp/openclaw-engine.sock'; // Unix Domain Socket 路径，为空时禁用
+export const HTTP_SOCKET_PATH = Object.prototype.hasOwnProperty.call(process.env, 'HTTP_SOCKET_PATH')
+  ? process.env.HTTP_SOCKET_PATH
+  : '/tmp/openclaw-engine.sock'; // Unix Domain Socket 路径，为空时禁用
 
 // ========== Winston 日志 ==========
 /** Winston 日志实例，默认输出到控制台，带时间戳和级别 */

@@ -112,7 +112,7 @@ export class LocalMemoryStore {
    * @returns {Object} 追加的轮次对象
    */
   appendTurn(options) {
-    const { session_id, role, content, project_id, title, created_at, references, skip_if_same_as_last } = options;
+    const { session_id, role, content, created_at, references, skip_if_same_as_last } = options;
 
     if (skip_if_same_as_last) {
       const lastTurn = this._store.getLastTurn ? this._store.getLastTurn(session_id) : null;
@@ -198,7 +198,7 @@ export class LocalMemoryStore {
    * @returns {Array<Object>} 匹配的记忆条目列表
    */
   queryMemory(query, topK = 3, sessionId = null) {
-    return this._store.queryMemory(query, topK);
+    return this._store.queryMemory(query, topK, sessionId);
   }
 
   /**
@@ -218,7 +218,7 @@ export class LocalMemoryStore {
    * @returns {{ hits: Array, tentative_items: Array, freshness: Object, abstention_signals: Object, memory_context: Object }}
    */
   queryMemoryFull(query, topK = 3, sessionId = null) {
-    const hits = this._store.queryMemory(query, topK);
+    const hits = this._store.queryMemory(query, topK, sessionId);
     for (const hit of hits) {
       hit._relevanceScore = computeRelevanceScore(query, hit, RELEVANCE_WEIGHTS.search);
     }
@@ -233,8 +233,8 @@ export class LocalMemoryStore {
     const computedConfidence = this._computeConfidence(query, hits);
     const memoryContext = {
       query,
-      matched_sessions: [],
-      matched_turns: [],
+      matched_sessions: this._buildMatchedSessions(sessionId, query, topK),
+      matched_turns: this._store.queryTurns(query, topK, sessionId),
       aliases: [...new Set(hits.flatMap(item => item.aliases || []))],
       path_hints: [...new Set(hits.flatMap(item => item.path_hints || []))],
       collection_hints: [...new Set(hits.flatMap(item => item.collection_hints || []))],
@@ -283,25 +283,28 @@ export class LocalMemoryStore {
    * @returns {Object} 记忆上下文对象，包含 aliases、path_hints、freshness_level 等
    */
   queryMemoryContext(query, topK = 3, sessionId = null) {
+    let insightSessionId = sessionId;
     if (!sessionId) {
       const activeSession = this._store.getActiveSession ? this._store.getActiveSession() : null;
-      sessionId = activeSession?.session_id || null;
+      insightSessionId = activeSession?.session_id || null;
     }
-    const hits = this._store.queryMemory(query, topK * 2);
+    const hits = this._store.queryMemory(query, topK * 2, sessionId);
+    const matchedTurns = this._store.queryTurns(query, topK, sessionId);
+    const matchedSessions = this._buildMatchedSessions(sessionId, query, topK);
     const freshness = this._freshnessPayload(hits);
     const memoryIds = hits.map(h => h.memory_id);
     const aliases = [...new Set(hits.flatMap(item => item.aliases || []))];
     const pathHints = [...new Set(hits.flatMap(item => item.path_hints || []))];
     const collectionHints = [...new Set(hits.flatMap(item => item.collection_hints || []))];
 
-    if (sessionId) {
+    if (insightSessionId) {
       const insight = this._buildRetrievalInsight({ query, hits, freshness });
       if (insight) {
         try {
-          const recentInsightCount = this._store.getRecentInsightCount(sessionId);
+          const recentInsightCount = this._store.getRecentInsightCount(insightSessionId);
           if (recentInsightCount < 3) {
             this.appendTurn({
-              session_id: sessionId,
+              session_id: insightSessionId,
               role: 'system',
               content: `[检索洞察] ${insight}`,
               references: { synthetic: 'retrieval_summary', insight_type: 'memory_query' },
@@ -319,8 +322,8 @@ export class LocalMemoryStore {
     return {
       query,
       hits,
-      matched_sessions: [],
-      matched_turns: [],
+      matched_sessions: matchedSessions,
+      matched_turns: matchedTurns,
       aliases,
       path_hints: pathHints,
       collection_hints: collectionHints,
@@ -348,13 +351,33 @@ export class LocalMemoryStore {
       agentic_rerank_applied: false,
       summary: {
         total_hits: hits.length,
-        session_hits: 0,
+        session_hits: matchedTurns.length,
         memory_hits: hits.length,
         has_high_confidence: computedConfidence >= 0.7,
-        has_relevant_sessions: false,
+        has_relevant_sessions: matchedTurns.length > 0,
         has_relevant_memories: hits.length > 0,
+        session_filter_applied: Boolean(sessionId),
       },
     };
+  }
+
+  _buildMatchedSessions(sessionId, query, topK = 3) {
+    const turns = this._store.queryTurns(query, topK, sessionId);
+    if (turns.length === 0) return [];
+    const grouped = new Map();
+    for (const turn of turns) {
+      if (!grouped.has(turn.session_id)) grouped.set(turn.session_id, []);
+      grouped.get(turn.session_id).push(turn);
+    }
+    return [...grouped.entries()].map(([id, matchedTurns]) => {
+      const session = this._store.getSession(id);
+      return {
+        session_id: id,
+        title: session?.title || '',
+        project_id: session?.project_id || 'default',
+        matched_turns: matchedTurns,
+      };
+    });
   }
 
   /**
@@ -517,10 +540,10 @@ export class LocalMemoryStore {
    * @returns {Object} 时间线对象，包含 filters、event_count、events
    */
   getMemoryTimeline(options = {}) {
-    const { memory_id, limit = 50 } = options;
+    const { memory_id, session_id, limit = 50 } = options;
     const events = this._store.getTimeline(memory_id, limit);
     return {
-      filters: { memory_id, limit },
+      filters: { memory_id, session_id, limit },
       event_count: events.length,
       events: events.map(e => ({
         event_id: e.id,
@@ -530,6 +553,95 @@ export class LocalMemoryStore {
         payload: e.payload_json ? JSON.parse(e.payload_json) : {},
       })),
     };
+  }
+
+  importTranscriptSession({ transcriptPath, transcriptId, transcriptsRoot: _transcriptsRoot, projectId, title, createdAt, sessionId }) {
+    const session = this.startNewSession({
+      project_id: projectId,
+      title: title || `Import: ${transcriptPath || transcriptId || 'transcript'}`,
+      created_at: createdAt,
+      session_id: sessionId,
+    });
+
+    if (!transcriptPath) {
+      return {
+        session_id: session.session_id,
+        imported_turn_count: 0,
+        status: 'created_empty_session',
+        warning: 'No transcript_path was provided. Only an empty session was created.',
+      };
+    }
+
+    const turns = this._parseTranscriptFile(transcriptPath);
+    for (const turn of turns) {
+      this.appendTurn({
+        session_id: session.session_id,
+        role: turn.role,
+        content: turn.content,
+        created_at: turn.created_at || createdAt,
+        references: { imported_from: transcriptPath, transcript_id: transcriptId || null },
+      });
+    }
+
+    return {
+      session_id: session.session_id,
+      imported_turn_count: turns.length,
+      status: turns.length > 0 ? 'imported' : 'created_empty_session',
+      warning: turns.length === 0 ? 'Transcript file was parsed but no turns were found.' : undefined,
+    };
+  }
+
+  _parseTranscriptFile(transcriptPath) {
+    const content = fs.readFileSync(transcriptPath, 'utf-8');
+    if (transcriptPath.endsWith('.jsonl')) {
+      return content.split(/\r?\n/)
+        .filter(Boolean)
+        .map(line => JSON.parse(line))
+        .map(item => ({
+          role: this._normalizeRole(item.role || item.type || 'user'),
+          content: String(item.content || item.text || item.message || '').trim(),
+          created_at: item.created_at || item.timestamp || null,
+        }))
+        .filter(turn => turn.content);
+    }
+    if (transcriptPath.endsWith('.json')) {
+      const parsed = JSON.parse(content);
+      const items = Array.isArray(parsed) ? parsed : (parsed.turns || parsed.messages || []);
+      return items.map(item => ({
+        role: this._normalizeRole(item.role || item.type || 'user'),
+        content: String(item.content || item.text || item.message || '').trim(),
+        created_at: item.created_at || item.timestamp || null,
+      })).filter(turn => turn.content);
+    }
+    return this._parseMarkdownTranscript(content);
+  }
+
+  _parseMarkdownTranscript(content) {
+    const turns = [];
+    const sections = content.split(/\n(?=#{1,6}\s+)/);
+    for (const section of sections) {
+      const match = section.match(/^#{1,6}\s*(user|assistant|system|用户|助手|系统)\b[^\n]*\n([\s\S]*)$/i);
+      if (!match) continue;
+      const body = match[2].trim();
+      if (!body) continue;
+      turns.push({ role: this._normalizeRole(match[1]), content: body });
+    }
+    if (turns.length > 0) return turns;
+    const lineTurns = [];
+    for (const line of content.split(/\r?\n/)) {
+      const match = line.match(/^\s*(user|assistant|system|用户|助手|系统)\s*[:：]\s*(.+)$/i);
+      if (match) {
+        lineTurns.push({ role: this._normalizeRole(match[1]), content: match[2].trim() });
+      }
+    }
+    return lineTurns;
+  }
+
+  _normalizeRole(role) {
+    const value = String(role || '').toLowerCase();
+    if (value === 'assistant' || value === '助手') return 'assistant';
+    if (value === 'system' || value === '系统') return 'system';
+    return 'user';
   }
 
   // ========== Memory Choice (tentative → kept, or discard = DELETE) ==========
@@ -657,11 +769,22 @@ export class LocalMemoryStore {
     }
   }
 
+  runMaintenanceCleanup() {
+    const previousCleanupAt = this._lastCleanupAt;
+    this._lastCleanupAt = 0;
+    try {
+      this._maybePeriodicCleanup();
+      return { ran: true, previous_cleanup_at: previousCleanupAt };
+    } catch (err) {
+      return { ran: false, error: err.message, previous_cleanup_at: previousCleanupAt };
+    }
+  }
+
   /**
    * Auto-triage a conversation turn for memory extraction (async, with governance).
    */
   async autoTriageTurn(options) {
-    const { session_id, role, content, previous_role, previous_content, persist = true, side_llm_gateway } = options;
+    const { session_id, role, content, previous_content, persist = true, side_llm_gateway } = options;
     const candidates = [];
 
     if (role === 'assistant' && this._shouldKeepCandidate(content) && this._isKnowledgeAssertion(content)) {
@@ -873,13 +996,13 @@ export class LocalMemoryStore {
 
     if (cleaned.startsWith('```') && cleaned.endsWith('```')) return false;
 
-    if (cleaned.length < 30) return false;
+    if (cleaned.length < 15) return false;
 
-    if (/(禁止|必须|优先|默认|统一|固定|约定|规则).{5,}/.test(cleaned)) return true;
+    if (/(禁止|必须|优先|默认|统一|固定|约定|规则).{3,}/.test(cleaned)) return true;
 
     if (/【[^】]+】/.test(cleaned)) return true;
 
-    const mdMatch = /^(##|###)\s+(.+)\n([\s\S]{50,})/.exec(cleaned);
+    const mdMatch = /^(##|###)\s+(.+)\n([\s\S]{30,})/.exec(cleaned);
     if (mdMatch) return true;
 
     return false;

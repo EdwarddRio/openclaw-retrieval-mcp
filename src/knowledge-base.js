@@ -371,7 +371,7 @@ export class KnowledgeBase {
     return this.wikiCompiler.searchWiki(query, topK);
   }
 
-  async search({ query, top_k = 5, include_wiki = true, include_debug = false }) {
+  async search({ query, top_k = 5, include_wiki = true }) {
     const memResult = await this.queryMemory(query, top_k);
     const memHits = memResult.hits || [];
     let wikiResults = [];
@@ -391,13 +391,19 @@ export class KnowledgeBase {
    */
   async rebuildLocalMem() {
     const health = await this.healthFacade.healthLocalmem();
+    const cleanup = this.memoryFacade.localMemory.runMaintenanceCleanup
+      ? this.memoryFacade.localMemory.runMaintenanceCleanup()
+      : { ran: false, error: 'cleanup_not_available' };
     const stats = this.memoryFacade.listActiveFacts(10000);
     const beforeCount = Array.isArray(stats) ? stats.length : 0;
+    const wikiStale = this.wikiIsStale();
     return {
       status: 'completed',
       health,
+      cleanup,
       activeCount: beforeCount,
-      message: 'localMem rebuild: integrity check done, no vector index to rebuild (SQLite LIKE search)',
+      wiki_stale: wikiStale,
+      message: 'localMem maintenance check completed. SQLite LIKE search has no vector index to rebuild.',
     };
   }
 

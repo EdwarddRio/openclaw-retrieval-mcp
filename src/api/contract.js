@@ -113,6 +113,8 @@ export class SessionTurnRequest {
     this.session_id = options.session_id || '';
     this.role = options.role || '';
     this.content = options.content || '';
+    this.previous_role = options.previous_role || '';
+    this.previous_content = options.previous_content || '';
     this.project_id = options.project_id || 'default';
     this.title = options.title || '';
     this.created_at = options.created_at || null;

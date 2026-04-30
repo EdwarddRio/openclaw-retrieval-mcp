@@ -35,6 +35,11 @@ function successResponse(data) {
   return { success: true, data };
 }
 
+function isPathInsideRoot(rootPath, targetPath) {
+  const relative = path.relative(rootPath, targetPath);
+  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
 // 轻量级 Bearer Token 认证（未配置时跳过，兼容现有部署）
 if (API_SECRET) {
   fastify.addHook('onRequest', async (request, reply) => {
@@ -153,7 +158,11 @@ fastify.post('/api/memory/query', { preHandler: [validateBody(MemoryQueryRequest
 /** 查询记忆上下文（含会话关联），可选导出调试信息 */
 fastify.post('/api/memory/query-context', async (request, reply) => {
   try {
-    const { query, top_k, session_id, include_debug } = request.body;
+    const { query, top_k, session_id, include_debug } = request.body || {};
+    if (!query || !String(query).trim()) {
+      reply.code(400);
+      return { success: false, error: 'query is required' };
+    }
     const result = await knowledgeBase.queryMemoryContext(query, top_k, session_id);
     if (include_debug && queryExporter) {
       await queryExporter.exportQueryContext({ query, result });
@@ -168,10 +177,12 @@ fastify.post('/api/memory/query-context', async (request, reply) => {
       updated_at: h.updated_at,
     }));
 
-    return {
+    const response = {
       query,
       hits: memHits,
       total: memHits.length,
+      matched_sessions: result.matched_sessions || [],
+      matched_turns: result.matched_turns || [],
       freshness_level: result.freshness_level || 'unknown',
       context: {
         aliases: result.aliases || [],
@@ -185,6 +196,16 @@ fastify.post('/api/memory/query-context', async (request, reply) => {
         summary: result.summary || {},
       },
     };
+    metrics.lastQueryContext = {
+      query,
+      total: memHits.length,
+      matched_turn_count: (result.matched_turns || []).length,
+      confidence: result.confidence || 0,
+      should_abstain: result.should_abstain || false,
+      at: new Date().toISOString(),
+    };
+    fastify.log.info(`Query-context summary: query="${String(query).slice(0, 80)}" hits=${memHits.length} matched_turns=${(result.matched_turns || []).length} confidence=${result.confidence || 0}`);
+    return response;
   } catch (err) {
     reply.code(500);
     return KnowledgeBasePresenter.presentError(err, 500);
@@ -206,22 +227,24 @@ fastify.get('/api/memory/timeline', async (request, reply) => {
 /** 追加一轮对话到当前会话 */
 fastify.post('/api/memory/turn', { preHandler: [validateBody(SessionTurnRequest)] }, async (request, reply) => {
   try {
-    const { session_id, role, content, project_id, title, created_at, references } = request.body;
+    const { session_id, role, content, previous_role, previous_content, project_id, title, created_at, references } = request.body;
     const result = await knowledgeBase.appendSessionTurn({
       sessionId: session_id, role, content, projectId: project_id, title, createdAt: created_at, references,
     });
 
     if (!metrics.autoTriageDisabled) {
       knowledgeBase.memoryFacade.localMemory.autoTriageTurn({
-        session_id, role, content, persist: true, side_llm_gateway: sideLlmGateway,
-      }).then(() => {
+        session_id, role, content, previous_role, previous_content, persist: true, side_llm_gateway: sideLlmGateway,
+      }).then((candidates) => {
         metrics.autoTriageSuccessCount += 1;
         metrics.autoTriageConsecutiveFails = 0;
         metrics.autoTriageDisabled = false;
         metrics.autoTriageDisabledAt = null;
+        recordAutoTriageResult({ status: 'success', candidates: candidates || [] });
       }).catch(err => {
         metrics.autoTriageFailCount += 1;
         metrics.autoTriageConsecutiveFails += 1;
+        recordAutoTriageResult({ status: 'failed', error: err });
         fastify.log.warn(`autoTriage failed for turn (${metrics.autoTriageConsecutiveFails} consecutive): ${err.message}`);
         try {
           const store = knowledgeBase?.memoryFacade?.localMemory?._store;
@@ -239,6 +262,12 @@ fastify.post('/api/memory/turn', { preHandler: [validateBody(SessionTurnRequest)
         if (metrics.autoTriageConsecutiveFails >= 5 && !metrics.autoTriageDisabled) {
           metrics.autoTriageDisabled = true;
           metrics.autoTriageDisabledAt = new Date().toISOString();
+          knowledgeBase.memoryFacade.localMemory.store.storeMemoryEvent({
+            event_type: 'auto_triage_disabled',
+            payload_json: JSON.stringify({ disabled_at: metrics.autoTriageDisabledAt, consecutiveFails: metrics.autoTriageConsecutiveFails }),
+          }).catch(logErr => {
+            fastify.log.warn(`Failed to persist auto_triage_disabled event: ${logErr.message}`);
+          });
           const alertPath = path.join(PROJECT_ROOT, 'memory', 'autoTriage-alert.json');
           try {
             fs.writeFileSync(alertPath, JSON.stringify({
@@ -258,7 +287,13 @@ fastify.post('/api/memory/turn', { preHandler: [validateBody(SessionTurnRequest)
       fastify.log.debug(`autoTriage skipped (disabled since ${metrics.autoTriageDisabledAt})`);
     }
 
-    return { success: true, ...result };
+    return {
+      success: true,
+      ...result,
+      auto_triage: metrics.autoTriageDisabled
+        ? { mode: 'async', accepted: false, disabled: true, disabled_at: metrics.autoTriageDisabledAt }
+        : { mode: 'async', accepted: true, semantic_compare_enabled: Boolean(sideLlmGateway) },
+    };
   } catch (err) {
     reply.code(500);
     return KnowledgeBasePresenter.presentError(err, 500);
@@ -274,9 +309,10 @@ fastify.post('/api/memory/auto-triage', async (request, reply) => {
       return { success: false, error: 'session_id, role, content are required' };
     }
     const candidates = await knowledgeBase.memoryFacade.localMemory.autoTriageTurn({
-      session_id, role, content, previous_role, previous_content, persist: true,
+      session_id, role, content, previous_role, previous_content, persist: true, side_llm_gateway: sideLlmGateway,
     });
-    return { success: true, candidates, count: candidates.length };
+    recordAutoTriageResult({ status: 'success', candidates });
+    return { success: true, candidates, count: candidates.length, semantic_compare_enabled: Boolean(sideLlmGateway) };
   } catch (err) {
     reply.code(500);
     return KnowledgeBasePresenter.presentError(err, 500);
@@ -303,6 +339,7 @@ fastify.post('/api/memory/auto-triage/batch', async (request, reply) => {
         previous_role: prevTurn?.role,
         previous_content: prevTurn?.content,
         persist: true,
+        side_llm_gateway: sideLlmGateway,
       });
       for (const c of candidates) {
         if (c.status === 'rate_limited') {
@@ -319,6 +356,7 @@ fastify.post('/api/memory/auto-triage/batch', async (request, reply) => {
       processed: turns.length,
       extracted: results.length,
       daily_limit_reached: dailyLimitReached,
+      semantic_compare_enabled: Boolean(sideLlmGateway),
       results,
     };
   } catch (err) {
@@ -363,8 +401,14 @@ fastify.post('/api/memory/session/import-transcript', async (request, reply) => 
         reply.code(403);
         return { success: false, error: 'Access denied' };
       }
-      const allowedRoot = fs.realpathSync(path.resolve(PROJECT_ROOT));
-      if (!realPath.startsWith(allowedRoot)) {
+      let allowedRoot;
+      try {
+        allowedRoot = fs.realpathSync(path.resolve(PROJECT_ROOT));
+      } catch {
+        reply.code(500);
+        return { success: false, error: 'PROJECT_ROOT is not readable' };
+      }
+      if (!isPathInsideRoot(allowedRoot, realPath)) {
         reply.code(403);
         return { success: false, error: 'Access denied' };
       }
@@ -377,7 +421,13 @@ fastify.post('/api/memory/session/import-transcript', async (request, reply) => 
       transcriptPath: transcript_path, transcriptId: transcript_id, transcriptsRoot: transcripts_root,
       projectId: project_id, title, createdAt: created_at, sessionId: session_id,
     });
-    return { success: true, session_id: result.session_id, warning: result.warning };
+    return {
+      success: result.status === 'imported',
+      session_id: result.session_id,
+      imported_turn_count: result.imported_turn_count || 0,
+      status: result.status,
+      warning: result.warning,
+    };
   } catch (err) {
     reply.code(500);
     return KnowledgeBasePresenter.presentError(err, 500);
@@ -652,7 +702,11 @@ fastify.post('/api/wiki/detect-changes', async (request, reply) => {
 /** 生成 Wiki 编译提示词 */
 fastify.post('/api/wiki/compile-prompt', async (request, reply) => {
   try {
-    const { changesResult } = request.body;
+    const { changesResult } = request.body || {};
+    if (!changesResult || typeof changesResult !== 'object') {
+      reply.code(400);
+      return { success: false, error: 'changesResult is required' };
+    }
     const result = knowledgeBase.wikiGenerateCompilePrompt(changesResult);
     return successResponse({ prompt: result });
   } catch (err) {
@@ -696,7 +750,11 @@ fastify.post('/api/wiki/remove-page', async (request, reply) => {
 /** 更新 Wiki 总索引 */
 fastify.post('/api/wiki/update-index', async (request, reply) => {
   try {
-    const { pages } = request.body;
+    const { pages } = request.body || {};
+    if (pages !== undefined && !Array.isArray(pages)) {
+      reply.code(400);
+      return { success: false, error: 'pages must be an array when provided' };
+    }
     const result = knowledgeBase.wikiUpdateIndex(pages);
     return successResponse(result);
   } catch (err) {
@@ -711,7 +769,7 @@ fastify.post('/api/wiki/update-index', async (request, reply) => {
 fastify.post('/api/rebuild', async (request, reply) => {
   try {
     const result = await knowledgeBase.rebuildLocalMem();
-    return { success: true, ...result };
+    return { success: true, operation: 'maintenance_check', index_rebuilt: false, ...result };
   } catch (err) {
     reply.code(500);
     return KnowledgeBasePresenter.presentError(err, 500);
@@ -735,7 +793,7 @@ fastify.post('/api/memory/choice', async (request, reply) => {
 /** Review 通用入口（兼容 rule-engine-bridge） */
 fastify.post('/api/memory/review', async (request, reply) => {
   try {
-    const { memory_id, action, publish_target, updated_at } = request.body;
+    const { memory_id, action } = request.body;
     if (action === 'promote' || action === 'keep') {
       try {
         const result = knowledgeBase.promoteReview(memory_id);
@@ -772,7 +830,18 @@ const metrics = {
   autoTriageConsecutiveFails: 0,
   autoTriageDisabled: false,
   autoTriageDisabledAt: null,
+  lastQueryContext: null,
+  lastAutoTriage: null,
 };
+
+function recordAutoTriageResult({ status, candidates = [], error = null }) {
+  metrics.lastAutoTriage = {
+    status,
+    candidate_count: candidates.length,
+    error: error ? error.message : null,
+    at: new Date().toISOString(),
+  };
+}
 
 const AUTOTRIAGE_RECOVERY_MS = 30 * 60 * 1000;
 setInterval(() => {
@@ -801,7 +870,7 @@ fastify.addHook('onResponse', async (request, reply) => {
 });
 
 /** 基础 metrics 端点 */
-fastify.get('/metrics', async (request, reply) => {
+fastify.get('/metrics', async (_request, _reply) => {
   const mem = process.memoryUsage();
   const uptime = Date.now() - metrics.startTime;
   let memoryStats = null;
@@ -828,12 +897,14 @@ fastify.get('/metrics', async (request, reply) => {
       external_mb: Math.round(mem.external / 1024 / 1024),
     },
     memory: memoryStats,
+    last_query_context: metrics.lastQueryContext,
     auto_triage: {
       success_total: metrics.autoTriageSuccessCount,
       fail_total: metrics.autoTriageFailCount,
       consecutive_fails: metrics.autoTriageConsecutiveFails,
       disabled: metrics.autoTriageDisabled,
       disabled_at: metrics.autoTriageDisabledAt,
+      last: metrics.lastAutoTriage,
     },
   };
 });
@@ -854,16 +925,27 @@ const start = async () => {
     try {
       const store = knowledgeBase?.memoryFacade?.localMemory?._store;
       if (store?.db) {
-        const recentFail = store.db.prepare(
-          `SELECT created_at, payload_json FROM memory_events WHERE event_type = 'auto_triage_failure' ORDER BY created_at DESC LIMIT 1`
+        const disabledEvent = store.db.prepare(
+          `SELECT created_at, payload_json FROM memory_events WHERE event_type = 'auto_triage_disabled' ORDER BY created_at DESC LIMIT 1`
         ).get();
-        if (recentFail) {
-          const data = JSON.parse(recentFail.payload_json || '{}');
-          if (data.consecutiveFails >= 5) {
-            metrics.autoTriageDisabled = true;
-            metrics.autoTriageDisabledAt = recentFail.created_at;
-            metrics.autoTriageConsecutiveFails = data.consecutiveFails;
-            fastify.log.warn(`autoTriage restored to disabled state from persistent events (consecutiveFails=${data.consecutiveFails})`);
+        if (disabledEvent) {
+          const data = JSON.parse(disabledEvent.payload_json || '{}');
+          metrics.autoTriageDisabled = true;
+          metrics.autoTriageDisabledAt = data.disabled_at || disabledEvent.created_at;
+          metrics.autoTriageConsecutiveFails = data.consecutiveFails || 5;
+          fastify.log.warn(`autoTriage restored to disabled state from auto_triage_disabled event (disabled_at=${metrics.autoTriageDisabledAt})`);
+        } else {
+          const recentFail = store.db.prepare(
+            `SELECT created_at, payload_json FROM memory_events WHERE event_type = 'auto_triage_failure' ORDER BY created_at DESC LIMIT 1`
+          ).get();
+          if (recentFail) {
+            const data = JSON.parse(recentFail.payload_json || '{}');
+            if (data.consecutiveFails >= 5) {
+              metrics.autoTriageDisabled = true;
+              metrics.autoTriageDisabledAt = recentFail.created_at;
+              metrics.autoTriageConsecutiveFails = data.consecutiveFails;
+              fastify.log.warn(`autoTriage restored to disabled state from persistent events (consecutiveFails=${data.consecutiveFails})`);
+            }
           }
         }
       }
@@ -887,7 +969,6 @@ const start = async () => {
 
           if (API_SECRET) {
             let headerBuffer = Buffer.alloc(0);
-            let headerInjected = false;
             let headerParsed = false;
 
             clientSocket.on('data', (chunk) => {
@@ -926,7 +1007,6 @@ const start = async () => {
                 beforeHeaders + separator + authHeader + separator + separator + afterHeaders,
                 'utf-8'
               );
-              headerInjected = true;
               serverSocket.write(injected);
             });
 

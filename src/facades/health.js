@@ -29,8 +29,23 @@ export class HealthFacade {
     const allHealthy = localmem.healthy;
 
     const staleFlags = [];
-    if (benchmarks.available === false) staleFlags.push('benchmark_missing');
-    else if (benchmarks.stale) staleFlags.push('benchmark_stale');
+    const staleReasons = [];
+    if (benchmarks.available === false) {
+      staleFlags.push('benchmark_missing');
+      staleReasons.push({
+        flag: 'benchmark_missing',
+        severity: 'warning',
+        message: 'No benchmark history is available; run npm run benchmark:default or POST /api/benchmarks/run.',
+      });
+    } else if (benchmarks.stale) {
+      staleFlags.push('benchmark_stale');
+      staleReasons.push({
+        flag: 'benchmark_stale',
+        severity: 'warning',
+        age_hours: benchmarks.age_hours,
+        message: `Latest benchmark is ${benchmarks.age_hours} hours old; refresh it to clear this stale flag.`,
+      });
+    }
 
     const governance = {
       pending_review_count: localmem.stats?.tentative || 0,
@@ -38,6 +53,12 @@ export class HealthFacade {
     };
     if (governance.pending_review_count > 0) {
       staleFlags.push('review_queue_backlog');
+      staleReasons.push({
+        flag: 'review_queue_backlog',
+        severity: 'info',
+        count: governance.pending_review_count,
+        message: `${governance.pending_review_count} tentative memories are waiting for review; promote or discard them to clear this flag.`,
+      });
     }
 
     const status = staleFlags.length > 0 ? 'stale' : 'ready';
@@ -49,6 +70,7 @@ export class HealthFacade {
       governance,
       deployment: buildDeploymentSummary(),
       stale_flags: staleFlags,
+      stale_reasons: staleReasons,
       timestamp: new Date().toISOString(),
     };
   }
@@ -82,14 +104,16 @@ export class HealthFacade {
     try {
       const latest = this.benchmarkFacade.latestBenchmark();
       let stale = false;
+      let ageHours = null;
       if (latest?.executed_at) {
-        const ageHours = (Date.now() - new Date(latest.executed_at).getTime()) / (1000 * 60 * 60);
+        ageHours = Math.round(((Date.now() - new Date(latest.executed_at).getTime()) / (1000 * 60 * 60)) * 10) / 10;
         stale = ageHours > 24;
       }
       return {
         healthy: true,
         available: true,
         latest_benchmark: latest,
+        age_hours: ageHours,
         stale,
       };
     } catch (err) {

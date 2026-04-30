@@ -128,6 +128,19 @@ export class MemoryFacade {
    * @returns {Promise<string>} 会话 ID
    */
   importTranscriptSession({ transcriptPath, transcriptId, transcriptsRoot, projectId, title, createdAt, sessionId }) {
+    const result = this.localMemory.importTranscriptSession({
+      transcriptPath,
+      transcriptId,
+      transcriptsRoot,
+      projectId,
+      title,
+      createdAt,
+      sessionId,
+    });
+    return result;
+  }
+
+  createEmptyImportSession({ transcriptPath, transcriptId, projectId, title, createdAt, sessionId }) {
     const session = this.localMemory.startNewSession({
       project_id: projectId,
       title: title || `Import: ${transcriptPath || transcriptId}`,

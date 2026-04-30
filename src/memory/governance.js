@@ -5,11 +5,6 @@
 
 /** 分词正则：匹配英文/数字/下划线片段或中文字符片段 */
 const TOKEN_RE = /[A-Za-z0-9_]+|[\u4e00-\u9fff]+/g;
-/** 大驼峰类名正则：匹配常见后缀（Service、Manager、Config 等）的 Java 风格类名 */
-const CAMEL_CASE_RE = /(?<![A-Za-z0-9_])[A-Z][A-Za-z0-9]*(?:Service|Action|Mapper|ConfigManager|Impl|Exception|Result|Type|Helper|Controller|Manager|Handler|Factory|Builder|Constants|Config)(?![A-Za-z0-9_])/g;
-/** 蛇形命名正则：匹配 snake_case 标识符 */
-const SNAKE_CASE_RE = /\b[a-z0-9]+(?:_[a-z0-9]+)+\b/g;
-
 /** 主题分词停用词，这些词在主题匹配时被忽略 */
 const TOPIC_STOPWORDS = new Set([
   '当前', '这个', '那个', '这样', '进行', '处理', '相关', '问题', '方案', '新增',
@@ -249,7 +244,7 @@ function _topicRelation(candidateProfile, fact) {
   }
   if (!sameTopic && tokenOverlap.size >= 2) {
     const overlapRatio = tokenOverlap.size / Math.max(candidateProfile.tokens.size, 1);
-    if (overlapRatio >= 0.4) sameTopic = true;
+    if (overlapRatio >= 0.25) sameTopic = true;
   }
   if (!sameTopic && collectionOverlap.size > 0) {
     sameTopic = true;

@@ -1,156 +1,64 @@
 # OpenClaw Context Engine JS
 
-OpenClaw 上下文引擎的 JavaScript/Node.js 实现，为 OpenClaw AI 助手提供知识检索、记忆管理和上下文理解能力。
+> OpenClaw 的上下文引擎中间层——为 AI Agent 提供持久记忆和结构化知识检索。
+> 单进程、零外部依赖、~50MB 内存。
 
 ## 项目定位
 
-`openclaw-engine-js` 是 OpenClaw 生态系统的**上下文中间层**，采用 **localMem + LLM Wiki** 双引擎架构：
-
-- **localMem**：SQLite 记忆存储，两个状态分区（tentative / kept），丢弃 = 硬删除
-- **LLM Wiki**：基于 Karpathy LLM Wiki 模式的结构化知识库，取代传统 RAG 向量检索
-
-**设计原则**：不建索引、不切 chunk、不依赖向量数据库。知识搜索走 wiki 页面关键词匹配，记忆搜索走 SQLite LIKE 查询（含 aliases 搜索），文件搜索交给 Agent 的文件系统工具。
-
-## 架构
+一句话：**localMem（记忆）+ LLM Wiki（知识）双引擎**，替代旧架构的 ChromaDB + Embedding + BM25 三服务。
 
 ```
-OpenClaw 主程序 / Cursor IDE / 微信机器人
-              │
-              ▼
-    ┌─────────────────────┐
-    │  HTTP Server (:8901) │  ← openclaw-engine-js
-    │  Unix Socket 代理    │     (Fastify)
-    └──────────┬──────────┘
-               │
-    ┌──────────┴──────────┐
-    │   KnowledgeBase     │
-    │  (Memory + Wiki     │
-    │   + Health + Search)│
-    └──────────┬──────────┘
-               │
-    ┌──────────┼──────────┐
-    ▼          ▼          
-┌────────┐ ┌───────────┐ 
-│ Memory │ │  Wiki      │ 
-│ Facade │ │  Compiler  │ 
-└───┬────┘ └─────┬─────┘ 
-    │            │       
-    ▼            ▼       
-┌────────┐ ┌──────────┐ 
-│ SQLite │ │ raw →    │ 
-│localMem│ │ wiki 编译│ 
-│(2-state)│ └──────────┘ 
-└────────┘              
+┌─────────────────────────────────────────────────┐
+│              OpenClaw 主程序 (Agent)              │
+│         wiki_search / memory_save / ...          │
+└────────────────┬────────────────────────────────┘
+                 │ HTTP (8901) / Unix Socket
+┌────────────────▼────────────────────────────────┐
+│           Context Engine (本项目)                 │
+│  ┌──────────────┐  ┌──────────────────────────┐ │
+│  │   localMem   │  │       LLM Wiki           │ │
+│  │  记忆引擎    │  │     知识编译引擎          │ │
+│  │  ──────────  │  │  ──────────────────      │ │
+│  │  SQLite DB   │  │  Markdown 文件            │ │
+│  │  2-state     │  │  增量编译                 │ │
+│  │  治理/去重   │  │  人工编辑保护             │ │
+│  └──────────────┘  └──────────────────────────┘ │
+└─────────────────────────────────────────────────┘
 ```
-
-**关键设计决策**：向量搜索（ChromaDB + Embedding）和 BM25 分块索引（static_kb）均已移除，采用 LLM Wiki 模式替代传统 RAG。原因：
-1. 向量检索对中文分词不友好，语义检索准确率不稳定
-2. 向量数据库维护成本高，需要额外的 Python 服务和 GPU 资源
-3. BM25 分块索引（static_kb）在 wiki 场景下是多余的——wiki 页面本身就是编译好的结构化文档，切碎反而丢失结构
-4. LLM Wiki 的结构化 Markdown 比 embedding 分块更适合知识管理
-5. 人类可以直接阅读和编辑 wiki 页面，实现真正的人机协作
 
 ## 核心功能
 
-### 1. 知识搜索 (`wiki_search`)
+### 1. 知识搜索 (`/api/wiki/*`)
 
-wiki 页面关键词匹配（标题×5 + 内容计数），返回整页摘要：
+LLM Wiki 模式：把原始材料编译为结构化 Markdown 页面，Agent 搜索时返回整页而非分块。
 
-- **标题加权**：标题中的关键词权重 ×5，精确命中知识页面
-- **独立搜索**：wiki 自己的搜索，不依赖任何外部索引
-- **整页返回**：返回完整的结构化页面，不是切碎的 chunk 片段
-- **交叉引用**：wiki 页面间使用 `[[页面名]]` 语法互相链接
-- **搜索缓存**：5 分钟 TTL 缓存，wiki 页面变更时主动刷新
-
-> **未来方向**：当 wiki 页面超过 200 页时，应接入 BM25Okapi 提升 IDF 区分度（约 50 行改动）。
+- **增量编译**：只编译有变化的源文件（SHA256 对比）
+- **人工编辑保护**：`<!-- human-edit-start -->` 区域不会被编译覆盖
+- **搜索缓存**：5 分钟 TTL，写入时主动失效
+- **中文 bigram 扩展**：精确匹配不足时自动拆分双字组合放宽搜索
 
 ### 2. 记忆系统 (`/api/memory/*`)
 
-基于 SQLite 的本地记忆管理，**2 状态模型**：
+2-state 模型：`tentative`（临时）→ `kept`（永久），丢弃即硬删除。
 
-```
-tentative ──用户确认──→ kept（永久保留）
-    │
-    └──丢弃──→ 从数据库硬删除（不留痕迹）
-```
+- **三层过滤**：否定检测 → 敏感过滤 → 噪声过滤
+- **Canonical Key 去重**：SHA1 规范化文本，相同语义只存一份
+- **日写入限流**：自动来源每天最多 50 条
+- **治理系统**：四维重叠检测 + 四种策略（保留/替代/冲突/新建）
+- **检索洞察注入**：查询记忆时自动注入 `[检索洞察]` 到会话
+- **Auto-Triage 保护**：连续 5 次失败后暂停，30 分钟自动恢复，重启后从 DB 恢复状态（精确 `disabled_at` 时间戳）
+- **隐性偏好提取**：自动识别用户偏好、决策信号，支持中文关键词动态提取
+- **上下文感知**：`/api/memory/turn` 接受 `previous_content`，确保"记住这个"等指代型请求能正确提取上文
 
-- `tentative`：临时记忆，auto_triage / user_explicit 自动提取，7 天未确认自动清理
-- `kept`：永久记忆，用户确认后保留
-- **搜索方式**：SQL LIKE 多 token AND 查询，同时搜索 `content` 和 `aliases_json` 字段，结果按 `computeRelevanceScore` 加权排序（统一权重常量 `RELEVANCE_WEIGHTS`：搜索用命中率 50% + 位置 20% + 频次 15% + 新鲜度 15%，置信度用命中率 40% + 位置 20% + 频次 20% + 新鲜度 20%）
-- **三层过滤**：否定检测 → 敏感信息过滤 → 噪声过滤
-- **Canonical Key SHA1 去重**：相同语义的记忆只存一份（normalizeText 后计算）
-- **每日写入限流**：自动来源每天最多 50 条（`LOCALMEM_DAILY_WRITE_LIMIT`）
-- **session_id 可选**：保存记忆时 `session_id` 为可选参数，无会话上下文时可不传
-- **会话范围查询未实现**：`queryMemoryFull` 的 `sessionId` 参数当前未生效，所有查询为全局范围
+### 3. 健康监控 (`/api/health`)
 
-#### Auto-Triage 自动沉淀
+- `/api/health`：服务状态 + 记忆统计 + Wiki 统计
+- `/api/health/ready`：就绪检查（SQLite 可连接即 ready）
+- `/metrics`：请求计数、内存占用、autoTriage 状态
 
-对话轮次自动提取记忆候选：
+### 4. 基准测试 (`/api/benchmarks/*`)
 
-- **assistant 知识断言**：检测确认信号词 + 知识断言模式，自动提取为 tentative 记忆
-- **user 显式记忆请求**：检测"记住"、"记一下"等信号词，自动提取用户要求记忆的内容
-- **批量处理**：`/api/memory/auto-triage/batch` 支持批量处理积压轮次
-- **连续失败保护**：连续 5 次失败后标记 disabled，跳过后续 autoTriage 调用，30 分钟后自动恢复尝试；服务重启后从 `memory_events` 表恢复禁用状态
-
-#### Governance 治理系统
-
-保存记忆前的冲突检测和规划：
-
-- **冲突检测**：基于 aliases/path/collection/token 四维重叠判断是否同一主题（权重总和 1.0：alias 0.35 + path 0.25 + collection 0.15 + token 0.10 + 文本包含 0.15）
-- **token 重叠阈值**：3 个 token 重叠判定为同主题；2 个 token 重叠时额外检查重叠比例（≥ 40%）
-- **四种策略**：`keep_existing` / `supersede_existing` / `resolve_conflict` / `create_new`
-- **LLM 语义比较**（可选）：配置 `SIDE_LLM_GATEWAY_URL` 后，治理系统可调用侧边 LLM 网关进行语义判断，10 秒超时自动降级为词法匹配
-- **Dry-Run**：`/api/memory/governance/plan-update` 只返回计划不实际写入
-
-#### Review 审核 API
-
-管理 tentative 记忆的生命周期：
-
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| GET | `/api/memory/reviews` | 列出待审核记忆 |
-| POST | `/api/memory/reviews/:id/evaluate` | 评估记忆（存 LLM 评分，不修改状态） |
-| POST | `/api/memory/reviews/:id/promote` | 提升为 kept（永久保留） |
-| POST | `/api/memory/reviews/:id/discard` | 丢弃（硬删除） |
-
-#### 待审核记忆提醒
-
-tentative 记忆不会主动弹窗通知，但通过**心跳兜底脚本**实现被动提醒：
-
-```
-心跳触发 → check-review-reminder.sh → 查 SQLite tentative 记忆
-  ├─ 有 tentative → 输出提醒文本 → 心跳推送给你
-  └─ 无 tentative → 输出空 → 继续 HEARTBEAT_OK
-```
-
-| 触发时机 | 机制 | 说明 |
-|---------|------|------|
-| 心跳 | `check-review-reminder.sh` | 查 SQLite，有 tentative 就输出提醒 |
-| 查询记忆 | `queryMemoryFull()` 返回 `tentative_items` | Agent 可选择提醒用户 |
-| 7天过期 | `_maybePeriodicCleanup()` → 硬删除 | 不留痕迹 |
-
-脚本位置：`${PROJECT_ROOT}/scripts/check-review-reminder.sh`
-
-- 默认输出纯文本提醒；无提醒时输出空
-- `check-review-reminder.sh json`：输出结构化 JSON，含 `age_days` 和 `expires_in_days`
-
-### 3. LLM Wiki 编译 (`/api/wiki/*`)
-
-基于 Karpathy LLM Wiki 模式的结构化知识库：
-
-- **raw → wiki 编译**：LLM 将原始材料编译为结构化 Markdown（不是复制！）
-- **增量编译**：基于 SHA256 hash 的变更检测，只处理新增/修改的文件
-- **[[交叉引用]]**：wiki 页面间使用 `[[页面名]]` 语法互相链接
-- **人机协作**：wiki 页面是标准 Markdown，人类可直接编辑
-- **独立管理**：wiki 由 WikiCompiler 管理，不依赖 localMem 的状态机
-
-### 4. 健康监控 (`/api/health`)
-
-聚合多维度健康状态：LocalMem + Benchmarks，三级状态（ready / stale / degraded）。
-
-- `/api/health`：完整健康快照（含 WAL 大小、表完整性、governance 待审核数、benchmark 过期检测）
-- `/api/health/ready`：轻量就绪探针
-- `/metrics`：运行指标（请求数、错误数、内存、auto-triage 统计、记忆条目统计）
+自建搜索质量测试框架：命中率、召回率、Jaccard 多样性。
 
 ## API 端点清单
 
@@ -158,82 +66,97 @@ tentative 记忆不会主动弹窗通知，但通过**心跳兜底脚本**实现
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| POST | `/api/wiki/search` | Wiki 知识搜索 |
-| GET | `/api/wiki/check-stale` | 检查 wiki 是否过期 |
-| GET | `/api/wiki/detect-changes` | 检测源文件变更 |
-| POST | `/api/wiki/compile-prompt` | 生成编译提示词 |
+| POST | `/api/wiki/search` | 搜索 wiki 页面 |
+| GET | `/api/wiki/check-stale` | 检查是否有源文件变化 |
+| GET | `/api/wiki/status` | Wiki 编译状态 |
+| POST | `/api/wiki/detect-changes` | 检测源文件变化详情 |
+| POST | `/api/wiki/compile-prompt` | 生成编译提示 |
 | POST | `/api/wiki/save-page` | 保存 wiki 页面 |
 | POST | `/api/wiki/remove-page` | 删除 wiki 页面 |
 | POST | `/api/wiki/update-index` | 更新 wiki 索引 |
-| GET | `/api/wiki/status` | Wiki 编译状态 |
 
 ### 记忆
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| POST | `/api/memory/query` | 查询记忆（支持 `include_wiki` 参数） |
-| POST | `/api/memory/query-context` | 记忆上下文查询（含 hits、confidence） |
+| POST | `/api/memory/query` | 查询记忆（多 token AND） |
+| POST | `/api/memory/query-context` | 查询记忆上下文（含检索洞察注入） |
 | GET | `/api/memory/timeline` | 记忆时间线 |
-| POST | `/api/memory/turn` | 追加会话消息（触发 auto-triage） |
-| POST | `/api/memory/session/start` | 创建/切换会话 |
-| POST | `/api/memory/session/reset` | 重置会话指针 |
-| POST | `/api/memory/session/import-transcript` | 导入转录文件（创建空会话并返回 session_id + warning） |
-| POST | `/api/memory/save` | 保存记忆（status: duplicate / rate_limited / governed_kept） |
+| POST | `/api/memory/turn` | 提交对话轮次（触发 autoTriage，支持 previous_content） |
+| POST | `/api/memory/auto-triage` | 手动触发 autoTriage |
+| POST | `/api/memory/auto-triage/batch` | 批量 autoTriage |
+| POST | `/api/memory/session/start` | 开始记忆会话 |
+| POST | `/api/memory/session/reset` | 重置会话 |
+| POST | `/api/memory/session/import-transcript` | 导入对话记录 |
+| POST | `/api/memory/save` | 保存记忆 |
 | GET | `/api/memory/:id` | 获取单条记忆 |
-| PUT | `/api/memory/:id` | 更新记忆内容 |
+| PUT | `/api/memory/:id` | 更新记忆 |
 | DELETE | `/api/memory/:id` | 删除记忆 |
-| POST | `/api/memory/auto-triage` | 单条 auto-triage |
-| POST | `/api/memory/auto-triage/batch` | 批量 auto-triage |
-| POST | `/api/memory/governance/plan-update` | 记忆治理 Dry-Run |
-| GET | `/api/memory/reviews` | 列出待审核记忆 |
-| POST | `/api/memory/reviews/:id/evaluate` | 评估记忆 |
-| POST | `/api/memory/reviews/:id/promote` | 提升为 kept |
+| POST | `/api/memory/governance/plan-update` | 治理策略规划 |
+| GET | `/api/memory/reviews` | 获取待审核记忆 |
+| POST | `/api/memory/reviews/:id/evaluate` | 评估待审核记忆 |
+| POST | `/api/memory/reviews/:id/promote` | 确认记忆（tentative → kept） |
 | POST | `/api/memory/reviews/:id/discard` | 丢弃记忆 |
-| POST | `/api/rebuild` | 重建记忆索引 |
 
 ### 健康 / 基准测试
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET | `/api/health` | 完整健康快照 |
-| GET | `/api/health/ready` | 快速就绪检查 |
-| GET | `/metrics` | 服务指标（请求数、内存、运行时长、auto-triage 统计） |
-| POST | `/api/benchmarks/record` | 记录结果 |
-| GET | `/api/benchmarks/latest` | 最新结果 |
-| GET | `/api/benchmarks/history` | 历史记录 |
+| GET | `/api/health` | 健康状态 |
+| GET | `/api/health/ready` | 就绪检查 |
+| GET | `/metrics` | 运行指标 |
+| POST | `/api/benchmarks/record` | 记录基准测试结果 |
+| GET | `/api/benchmarks/latest` | 获取最新基准测试结果 |
+| GET | `/api/benchmarks/history` | 获取基准测试历史 |
 | POST | `/api/benchmarks/run` | 运行基准测试 |
+
+### Legacy Bridge（兼容 rule-engine-bridge）
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | `/api/memory/choice` | 保存记忆取舍决策 |
+| POST | `/api/memory/review` | Review 通用入口（promote/keep/discard） |
+
+### 其他
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | `/api/rebuild` | 重建知识库 |
 
 ## 项目结构
 
 ```
-openclaw-engine-js/
-├── src/
-│   ├── index.js              # HTTP 服务入口 (Fastify)
-│   ├── knowledge-base.js     # 核心 Facade (Memory + Wiki + Health + Search)
-│   ├── config.js             # 配置管理
-│   ├── api/                  # API 层
-│   │   ├── contract.js       # 路由契约与请求模型
-│   │   ├── presenter.js      # 响应格式化
-│   │   └── query-exporter.js # 调试查询导出
-│   ├── memory/               # 记忆系统
-│   │   ├── sqlite-store.js   # SQLite 存储层
-│   │   ├── local-memory.js   # 记忆业务逻辑
-│   │   ├── governance.js     # 记忆治理（冲突检测）
-│   │   └── models.js         # 数据模型与工具函数
-│   ├── wiki/                 # LLM Wiki 编译器
-│   │   ├── compiler.js       # 增量编译、搜索、页面保存/删除/索引更新
-│   │   └── manifest.js       # SHA256 变更检测
-│   ├── facades/              # 子 Facade
-│   │   ├── memory.js         # 记忆
-│   │   ├── health.js         # 健康
-│   │   └── benchmark.js      # 基准测试
-│   └── benchmark/            # 基准测试框架
-├── runtime/                  # 运行时数据 (SQLite)
-├── config/                   # 配置文件
-├── tests/                    # 测试文件
-├── scripts/                  # 工具脚本
-├── package.json
-└── README.md
+src/
+├── index.js              # Fastify 入口：路由定义 + 服务器启动 + Unix Socket 代理
+├── config.js             # 环境变量 + 日志配置 + prepareRuntimePath 迁移
+├── knowledge-base.js     # KnowledgeBase 门面：协调 localMem + LLM Wiki
+│
+├── memory/
+│   ├── models.js         # 数据模型：MemoryItem, Session, Turn 等
+│   ├── local-memory.js   # 记忆引擎：三层过滤 + 去重 + 查询 + 检索洞察注入
+│   ├── sqlite-store.js   # SQLite 持久层：WAL + Prepared Statement 缓存 + 迁移
+│   └── governance.js     # 治理系统：四维重叠检测 + 策略规划 + LLM 语义比较
+│
+├── wiki/
+│   ├── compiler.js       # Wiki 编译器：增量编译 + 人工编辑保护 + 搜索缓存
+│   └── manifest.js       # Manifest 管理：源文件 SHA256 跟踪
+│
+├── api/
+│   ├── contract.js       # 请求模型 + validate() 方法
+│   ├── presenter.js      # 响应格式化
+│   └── query-exporter.js # 调试导出：查询历史 + JSONL 文件轮转
+│
+├── facades/
+│   ├── memory.js         # MemoryFacade：记忆操作门面
+│   ├── health.js         # HealthFacade：健康检查门面
+│   └── benchmark.js      # BenchmarkFacade：基准测试门面
+│
+└── benchmark/
+    ├── scenario.js       # 测试场景定义
+    ├── harness.js        # 测试运行器
+    ├── metrics.js        # 搜索质量指标（命中率、召回率、Jaccard 多样性）
+    ├── reporting.js      # JSON + Markdown 双格式报告
+    └── cli.js            # CLI 入口
 ```
 
 ## 环境配置
@@ -242,90 +165,115 @@ openclaw-engine-js/
 |------|--------|------|
 | `HTTP_HOST` | `127.0.0.1` | HTTP 绑定地址 |
 | `HTTP_PORT` | `8901` | HTTP 端口 |
-| `HTTP_SOCKET_PATH` | `/tmp/openclaw-engine.sock` | Unix Socket 路径（可选） |
-| `API_SECRET` | - | API 认证密钥（Unix Socket 自动注入），环境变量名 `OPENCLAW_API_SECRET` |
-| `SIDE_LLM_GATEWAY_URL` | - | 侧边 LLM 网关地址（用于治理语义比较），如 `http://127.0.0.1:11434` |
+| `HTTP_SOCKET_PATH` | `/tmp/openclaw-engine.sock` | Unix Socket 路径（为空时禁用） |
+| `OPENCLAW_API_SECRET` | 空 | API 认证密钥（空时不校验，启动时打印警告） |
+| `SIDE_LLM_GATEWAY_URL` | 空 | 侧边 LLM 网关地址（用于治理语义比较） |
 | `SIDE_LLM_GATEWAY_MODEL` | `k2p6` | 侧边 LLM 网关默认模型名 |
 | `PROJECT_ROOT` | `../workspace` | 工作区根目录 |
-| `CONTEXT_ENGINE_RUNTIME_DIR` | `./runtime` | 运行时数据目录 |
-| `LOCALMEM_TRANSCRIPTS_ROOT` | `${PROJECT_ROOT}/memory` | 转录文件根目录 |
+| `CONTEXT_ENGINE_RUNTIME_DIR` | `./runtime` | 运行时数据目录（SQLite、日志等） |
+| `LOCALMEM_DAILY_WRITE_LIMIT` | `50` | 自动来源每日写入上限 |
 | `LOCALMEM_FACT_MAX_AGE_DAYS` | `180` | 事实记忆最大保留天数 |
 | `LOCALMEM_SESSION_MAX_AGE_DAYS` | `60` | 会话最大保留天数 |
-| `LOCALMEM_DAILY_WRITE_LIMIT` | `50` | 自动来源每日写入上限 |
+| `DEBUG_EXPORT_ENABLED` | `0` | 是否启用调试导出 |
+| `DEBUG_EXPORT_HISTORY_LIMIT` | `20` | 调试导出历史记录上限 |
+| `DEBUG_EXPORT_MAX_AGE_DAYS` | `3` | 调试导出文件最大保留天数 |
+| `MCP_LOG_RETENTION_DAYS` | `3` | MCP 日志保留天数 |
+| `LOCALMEM_AUTO_TRANSCRIPT_SYNC_ENABLED` | `1` | 是否启用对话记录自动同步 |
+| `LOCALMEM_AUTO_TRANSCRIPT_MAX_AGE_SECONDS` | `1800` | 自动同步的对话记录最大存活秒数 |
+| `CURSOR_PROJECTS_DIR` | `~/.cursor/projects` | Cursor 编辑器项目目录 |
 
 ## 快速开始
 
-### 环境要求
-
-- Node.js >= 18.0.0
-
-### 安装与启动
-
 ```bash
-cd openclaw-engine-js
+# 安装依赖
 npm install
 
-# HTTP 模式
-npm run start:http
-```
+# 启动服务
+node src/index.js
 
-### 健康检查
+# 验证服务
+curl http://127.0.0.1:8901/api/health/ready
+# → {"status":"ready"}
 
-```bash
-curl http://127.0.0.1:8901/api/health
+# 查看运行指标
+curl http://127.0.0.1:8901/metrics
 ```
 
 ## 运维
 
+### 常用命令
+
 ```bash
-# 查看服务状态
-systemctl --user status openclaw-context-engine.service
+# 检查服务状态
+curl http://127.0.0.1:8901/api/health
 
-# 查看日志
-journalctl --user -u openclaw-context-engine.service -f
-
-# 重启
-systemctl --user restart openclaw-context-engine.service
-
-# 查看实时指标
+# 查看运行指标
 curl http://127.0.0.1:8901/metrics
 
-# 健康检查
-curl http://127.0.0.1:8901/api/health/ready
+# 通过 Unix Socket 查询（自动注入 Bearer Token）
+curl --unix-socket /tmp/openclaw-engine.sock http://localhost/api/health
+
+# 搜索 wiki
+curl -X POST http://127.0.0.1:8901/api/wiki/search \
+  -H 'Content-Type: application/json' \
+  -d '{"query": "帧同步"}'
+
+# 查询记忆
+curl -X POST http://127.0.0.1:8901/api/memory/query \
+  -H 'Content-Type: application/json' \
+  -d '{"query": "项目架构", "limit": 5}'
 ```
 
 ### Graceful Shutdown
 
-服务接收 `SIGTERM` / `SIGINT` 时会按序关闭：
-1. Unix Socket 代理停止并清理 socket 文件
-2. Fastify HTTP 服务关闭（等待正在处理的请求）
-3. 清理定时器（cleanup timer）
-4. SQLite 数据库连接关闭（自动执行 WAL checkpoint）
-5. 进程退出
+服务收到 SIGTERM / SIGINT 时：
+1. 关闭 Unix Socket 监听
+2. 删除 Socket 文件
+3. 关闭 KnowledgeBase（SQLite TRUNCATE checkpoint + close）
+4. 关闭 Fastify HTTP 服务
 
-`uncaughtException` 时会紧急执行 SQLite checkpoint + close 后退出，避免 WAL 数据丢失。
+`uncaughtException` 时紧急执行 SQLite checkpoint + close，避免 WAL 数据丢失。
 
-避免直接 `kill -9`，防止 WAL 数据丢失。
+### Unix Socket 代理
+
+本地工具通过 Unix Socket 连接时，透明代理自动注入 `Authorization: Bearer <secret>` 头，无需手动传 Token。远程客户端通过 HTTP 连接时必须提供 Bearer Token。
+
+```
+Unix Socket 客户端 → 透明代理（注入 Bearer Token）→ Fastify HTTP 服务
+远程 HTTP 客户端 → 需要手动携带 Authorization 头 → Fastify HTTP 服务
+```
+
+### Bearer Token 认证
+
+配置 `OPENCLAW_API_SECRET` 环境变量后启用。所有 HTTP 请求必须携带 `Authorization: Bearer <secret>` 头。未配置时跳过认证（启动时打印警告）。
+
+### 数据目录
+
+运行时数据默认存储在 `./runtime/` 目录：
+
+```
+runtime/
+├── context-engine.db      # SQLite 数据库（记忆 + 会话 + 事件）
+├── context-engine.db-wal  # WAL 日志
+├── context-engine.db-shm  # 共享内存
+└── logs/                  # Winston 日志文件
+```
+
+`prepareRuntimePath` 会自动将旧路径（`./data/`）的数据迁移到 `./runtime/`。
 
 ## 与旧架构的对比
 
-| 维度 | 旧架构（已废弃） | 当前架构 |
-|------|----------------|---------|
-| 知识检索 | ChromaDB 向量 + BM25 分块索引 | Wiki 关键词匹配 + 整页返回 |
-| 向量数据库 | ChromaDB 独立服务 (:8000) | 无（已移除） |
-| Embedding | Python Flask 服务 (:8902) | 无（已移除） |
-| BM25 分块索引 | static_kb (chunk + BM25Okapi) | 无（已移除） |
-| 记忆状态 | 7 态（tentative → published） | 2 态（tentative / kept） |
-| 记忆搜索 | 仅搜 content | 搜 content + aliases |
-| Wiki 发布 | DB → wiki/ 目录文件投影 | LLM Wiki 独立编译系统 |
-| 全文搜索 | FTS5（中文不友好） | LIKE 多 token AND + aliases OR 查询 |
-| 丢弃记忆 | 软删除（status=discarded） | 硬删除 |
-| 服务架构 | 三服务协作 | 单服务 |
+| 维度 | 旧架构（Python 三服务） | 当前架构（Node.js 单服务） |
+|------|----------------------|-------------------------|
+| 语言 | Python | Node.js |
+| 进程数 | 3（ChromaDB + Embedding + 主服务） | 1 |
+| 内存 | ~700MB | ~50MB |
+| 知识检索 | ChromaDB 向量检索 + BM25 分块索引 | LLM Wiki 关键词匹配 + 整页阅读 |
+| 记忆模型 | 7 态 | 2 态（tentative / kept） |
+| 数据库 | ChromaDB + SQLite | SQLite (better-sqlite3 + WAL) |
 | 部署 | systemd 三服务链 | systemd 单服务 |
-| 可观测性 | 基础日志 | Metrics 端点 + WAL 健康检查 + auto-triage 统计 |
-| SQL 优化 | 每次重新 prepare | Prepared Statement 缓存 |
-| 数据库迁移 | 无版本控制 | _meta 表记录迁移版本号 |
+| 认证 | 无 | Bearer Token + Unix Socket 自动注入 |
 
 ## 许可证
 
-MIT
+内部项目，未开源。

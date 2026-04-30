@@ -8,7 +8,6 @@ import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import { createRequire } from 'module';
-import { fileURLToPath as _fileURLToPath } from 'url';
 import { LOCALMEM_DIR } from '../config.js';
 import { canonicalKeyForText, computeRelevanceScore, RELEVANCE_WEIGHTS } from './models.js';
 
@@ -601,20 +600,23 @@ export class SqliteStore {
    * @param {number} [topK=3] - 返回数量上限
    * @returns {Array<Object>} 匹配的记忆列表
    */
-  queryMemory(query, topK = 3) {
+  queryMemory(query, topK = 3, sessionId = null) {
     if (!query || !query.trim()) return [];
 
     const terms = query.trim().split(/\s+/).filter(t => t.length > 0);
     if (terms.length === 0) return [];
 
     const andConditions = terms.map(() => '(content LIKE ? OR aliases_json LIKE ?)').join(' AND ');
+    const sessionClause = sessionId ? ' AND session_id = ?' : '';
     const andParams = [];
     for (const t of terms) {
       andParams.push(`%${t}%`, `%"${t}"%`);
     }
+    if (sessionId) andParams.push(sessionId);
     const andStmt = this.db.prepare(`
       SELECT * FROM memory_items
       WHERE (${andConditions}) AND status = 'active' AND state IN ('tentative', 'kept')
+      ${sessionClause}
       ORDER BY updated_at DESC LIMIT ?
     `);
     let rows = andStmt.all(...andParams, topK * 3).map(r => this._rowToMemory(r));
@@ -651,13 +653,18 @@ export class SqliteStore {
         const excludeClause = excludeIds.length > 0
           ? ` AND id NOT IN (${excludeIds.map(() => '?').join(',')})`
           : '';
+        const fuzzySessionClause = sessionId ? ' AND session_id = ?' : '';
         const fuzzyStmt = this.db.prepare(`
           SELECT * FROM memory_items
           WHERE (${orConditions}) AND status = 'active' AND state IN ('tentative', 'kept')
+          ${fuzzySessionClause}
           ${excludeClause}
           ORDER BY updated_at DESC LIMIT ?
         `);
-        const fuzzyRows = fuzzyStmt.all(...orParams, ...excludeIds, topK * 5)
+        const fuzzyArgs = sessionId
+          ? [...orParams, sessionId, ...excludeIds, topK * 5]
+          : [...orParams, ...excludeIds, topK * 5];
+        const fuzzyRows = fuzzyStmt.all(...fuzzyArgs)
           .map(r => this._rowToMemory(r))
           .filter(r => {
             const content = (r.content || '').toLowerCase();
@@ -675,6 +682,27 @@ export class SqliteStore {
     });
 
     return rows.slice(0, topK);
+  }
+
+  queryTurns(query, topK = 5, sessionId = null) {
+    if (!query || !query.trim()) return [];
+    const terms = query.trim().split(/\s+/).filter(Boolean);
+    if (terms.length === 0) return [];
+
+    const conditions = terms.map(() => 'content LIKE ?').join(' AND ');
+    const sessionClause = sessionId ? ' AND session_id = ?' : '';
+    const params = terms.map(t => `%${t}%`);
+    if (sessionId) params.push(sessionId);
+
+    const rows = this.db.prepare(`
+      SELECT * FROM turns
+      WHERE ${conditions}
+      AND NOT (role = 'system' AND content LIKE '[检索洞察]%')
+      ${sessionClause}
+      ORDER BY created_at DESC
+      LIMIT ?
+    `).all(...params, topK);
+    return rows.map(r => this._rowToTurn(r));
   }
 
   _computeRelevanceScore(item, terms) {
@@ -787,9 +815,10 @@ export class SqliteStore {
    * @returns {number} 洞察数量
    */
   getRecentInsightCount(sessionId, maxAgeHours = 1) {
+    const cutoff = new Date(Date.now() - maxAgeHours * 60 * 60 * 1000).toISOString();
     const row = this.db.prepare(
-      `SELECT COUNT(*) as cnt FROM turns WHERE session_id = ? AND role = 'system' AND content LIKE '[检索洞察]%' AND created_at > datetime('now', '-${maxAgeHours} hour')`
-    ).get(sessionId);
+      `SELECT COUNT(*) as cnt FROM turns WHERE session_id = ? AND role = 'system' AND content LIKE '[检索洞察]%' AND created_at > ?`
+    ).get(sessionId, cutoff);
     return row?.cnt || 0;
   }
 
@@ -868,6 +897,13 @@ export class SqliteStore {
    * @returns {Array<Object>} 事件列表
    */
   getTimeline(memoryId, limit = 50) {
+    if (!memoryId) {
+      const stmt = this.db.prepare(`
+        SELECT * FROM memory_events
+        ORDER BY created_at DESC LIMIT ?
+      `);
+      return stmt.all(limit);
+    }
     const stmt = this.db.prepare(`
       SELECT * FROM memory_events WHERE memory_id = ?
       ORDER BY created_at DESC LIMIT ?
@@ -987,11 +1023,18 @@ export class SqliteStore {
    */
   cleanupExpiredTentative(ttlDays) {
     const cutoff = new Date(Date.now() - ttlDays * 24 * 60 * 60 * 1000).toISOString();
-    const result = this._getStmt(`
-      DELETE FROM memory_items
-      WHERE state = 'tentative' AND status = 'active' AND created_at < ?
-    `).run(cutoff);
-    return { deleted: result.changes };
+    const txn = this.db.transaction(() => {
+      const result = this._getStmt(`
+        DELETE FROM memory_items
+        WHERE state = 'tentative' AND status = 'active' AND created_at < ?
+      `).run(cutoff);
+      const aliasResult = this._getStmt(`
+        DELETE FROM memory_aliases
+        WHERE memory_id NOT IN (SELECT id FROM memory_items)
+      `).run();
+      return { deleted: result.changes, orphan_aliases_deleted: aliasResult.changes };
+    });
+    return txn();
   }
 
   // ========== State Migration ==========
