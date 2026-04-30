@@ -1,89 +1,56 @@
 /**
- * API contracts - request/response models, endpoint constants, and MCP tool schemas.
+ * API contracts - request/response models and endpoint constants.
+ * Architecture: localMem (memory) + LLMWiki (knowledge) — no static_kb/BM25.
  */
 
 // ========== API Version & Endpoints ==========
-/** API 主版本号 */
 export const API_VERSION = '1';
-/** API 路由前缀 */
 export const API_PREFIX = '/api';
 
-/** 搜索相关端点路径 */
-export const SEARCH_ENDPOINTS = {
-  SEARCH: `${API_PREFIX}/search`,
-  SEARCH_SYNC: `${API_PREFIX}/search/sync`,
-  SEARCH_DEBUG: `${API_PREFIX}/search/debug`,
-  COLLECTIONS: `${API_PREFIX}/collections`,
-};
-
-/** 记忆相关端点路径 */
 export const MEMORY_ENDPOINTS = {
-  SESSIONS: `${API_PREFIX}/memory/sessions`,
-  SESSION: `${API_PREFIX}/memory/sessions/:session_id`,
-  TURNS: `${API_PREFIX}/memory/sessions/:session_id/turns`,
-  MEMORIES: `${API_PREFIX}/memory/memories`,
-  MEMORY: `${API_PREFIX}/memory/memories/:memory_id`,
-  SEARCH: `${API_PREFIX}/memory/search`,
+  QUERY: `${API_PREFIX}/memory/query`,
+  QUERY_CONTEXT: `${API_PREFIX}/memory/query-context`,
+  TURN: `${API_PREFIX}/memory/turn`,
+  SAVE: `${API_PREFIX}/memory/save`,
+  MEMORY: `${API_PREFIX}/memory/:id`,
+  SESSION_START: `${API_PREFIX}/memory/session/start`,
+  AUTO_TRIAGE: `${API_PREFIX}/memory/auto-triage`,
+  AUTO_TRIAGE_BATCH: `${API_PREFIX}/memory/auto-triage/batch`,
+  REVIEWS: `${API_PREFIX}/memory/reviews`,
+  REVIEW_EVALUATE: `${API_PREFIX}/memory/reviews/:id/evaluate`,
+  REVIEW_PROMOTE: `${API_PREFIX}/memory/reviews/:id/promote`,
+  REVIEW_DISCARD: `${API_PREFIX}/memory/reviews/:id/discard`,
+  GOVERNANCE_PLAN: `${API_PREFIX}/memory/governance/plan-update`,
   TIMELINE: `${API_PREFIX}/memory/timeline`,
-  STATS: `${API_PREFIX}/memory/stats`,
+  REBUILD: `${API_PREFIX}/rebuild`,
+  WIKI_CHECK_STALE: `${API_PREFIX}/wiki/check-stale`,
+  WIKI_DETECT_CHANGES: `${API_PREFIX}/wiki/detect-changes`,
+  WIKI_COMPILE_PROMPT: `${API_PREFIX}/wiki/compile-prompt`,
+  WIKI_SAVE_PAGE: `${API_PREFIX}/wiki/save-page`,
+  WIKI_REMOVE_PAGE: `${API_PREFIX}/wiki/remove-page`,
+  WIKI_UPDATE_INDEX: `${API_PREFIX}/wiki/update-index`,
+  WIKI_SEARCH: `${API_PREFIX}/wiki/search`,
+  WIKI_STATUS: `${API_PREFIX}/wiki/status`,
 };
 
-/** 健康检查端点路径 */
 export const HEALTH_ENDPOINTS = {
   HEALTH: `${API_PREFIX}/health`,
   READY: `${API_PREFIX}/health/ready`,
 };
 
-/** 所有 API 端点的合集 */
 export const API_ENDPOINTS = {
-  ...SEARCH_ENDPOINTS,
   ...MEMORY_ENDPOINTS,
   ...HEALTH_ENDPOINTS,
 };
 
 // ========== Request Contracts (Class-based with validate) ==========
 
-/** 搜索请求模型 */
-export class SearchRequest {
-  constructor(options = {}) {
-    this.query = options.query || '';
-    this.top_k = options.top_k || 5;
-    this.doc_type = options.doc_type || null;
-    this.project_id = options.project_id || 'default';
-    this.session_id = options.session_id || null;
-    this.transcript_path = options.transcript_path || null;
-    this.transcript_id = options.transcript_id || null;
-    this.transcripts_root = options.transcripts_root || null;
-    this.include_debug = options.include_debug || false;
-  }
-
-  /**
-   * 验证请求参数
-   * @returns {{ valid: boolean, errors: string[] }}
-   */
-  validate() {
-    const errors = [];
-    if (!this.query || this.query.trim().length === 0) {
-      errors.push('query is required');
-    }
-    if (this.top_k < 1) {
-      errors.push('top_k must be at least 1');
-    }
-    return { valid: errors.length === 0, errors };
-  }
-}
-
-/** 记忆查询请求模型 */
 export class MemoryQueryRequest {
   constructor(options = {}) {
     this.query = options.query || '';
     this.top_k = options.top_k || 3;
   }
 
-  /**
-   * 验证请求参数
-   * @returns {{ valid: boolean, errors: string[] }}
-   */
   validate() {
     const errors = [];
     if (!this.query || this.query.trim().length === 0) {
@@ -93,7 +60,6 @@ export class MemoryQueryRequest {
   }
 }
 
-/** 记忆保存请求模型 */
 export class MemorySaveRequest {
   constructor(options = {}) {
     this.session_id = options.session_id || null;
@@ -105,23 +71,21 @@ export class MemorySaveRequest {
     this.source = options.source || 'manual';
   }
 
-  /**
-   * 验证请求参数
-   * @returns {{ valid: boolean, errors: string[] }}
-   */
   validate() {
     const errors = [];
-    if (!this.session_id) {
-      errors.push('session_id is required');
-    }
     if (!this.content || this.content.trim().length === 0) {
       errors.push('content is required');
+    }
+    if (this.content && this.content.length > 5000) {
+      errors.push('content must be less than 5000 characters');
+    }
+    if (this.state && !['tentative', 'kept'].includes(this.state)) {
+      errors.push('state must be tentative or kept');
     }
     return { valid: errors.length === 0, errors };
   }
 }
 
-/** 基准测试结果请求模型 */
 export class BenchmarkResultRequest {
   constructor(options = {}) {
     this.suite_name = options.suite_name || '';
@@ -134,9 +98,16 @@ export class BenchmarkResultRequest {
     this.regressions = options.regressions || [];
     this.artifact_paths = options.artifact_paths || [];
   }
+
+  validate() {
+    const errors = [];
+    if (!this.suite_name || this.suite_name.trim().length === 0) {
+      errors.push('suite_name is required');
+    }
+    return { valid: errors.length === 0, errors };
+  }
 }
 
-/** 会话轮次请求模型 */
 export class SessionTurnRequest {
   constructor(options = {}) {
     this.session_id = options.session_id || '';
@@ -147,9 +118,20 @@ export class SessionTurnRequest {
     this.created_at = options.created_at || null;
     this.references = options.references || {};
   }
+
+  validate() {
+    const errors = [];
+    if (!this.session_id) errors.push('session_id is required');
+    if (!this.role || !['user', 'assistant', 'system'].includes(this.role)) {
+      errors.push('role is required and must be user, assistant, or system');
+    }
+    if (!this.content || this.content.trim().length === 0) {
+      errors.push('content is required');
+    }
+    return { valid: errors.length === 0, errors };
+  }
 }
 
-/** 创建记忆会话请求模型 */
 export class StartMemorySessionRequest {
   constructor(options = {}) {
     this.project_id = options.project_id || 'default';
@@ -157,9 +139,14 @@ export class StartMemorySessionRequest {
     this.created_at = options.created_at || null;
     this.session_id = options.session_id || null;
   }
+
+  validate() {
+    const errors = [];
+    if (!this.project_id) errors.push('project_id is required');
+    return { valid: errors.length === 0, errors };
+  }
 }
 
-/** 导入对话记录会话请求模型 */
 export class ImportTranscriptSessionRequest {
   constructor(options = {}) {
     this.transcript_path = options.transcript_path || null;
@@ -174,34 +161,6 @@ export class ImportTranscriptSessionRequest {
 
 // ========== Response DTOs ==========
 
-/** 搜索结果条目 DTO */
-export class SearchResultItem {
-  constructor(options = {}) {
-    this.content = options.content || '';
-    this.source = options.source || '';
-    this.doc_type = options.doc_type || '';
-    this.title = options.title || '';
-    this.score = options.score || 0;
-    this.collection = options.collection || '';
-    this.chunk_id = options.chunk_id || '';
-    this.matched_chunks = options.matched_chunks || 1;
-    this.score_breakdown = options.score_breakdown || {};
-  }
-}
-
-/** 搜索响应 DTO */
-export class SearchResponse {
-  constructor(options = {}) {
-    this.query = options.query || '';
-    this.top_k = options.top_k || 5;
-    this.result_count = options.result_count || 0;
-    this.results = options.results || [];
-    this.debug = options.debug || null;
-    this.timing_ms = options.timing_ms || 0;
-  }
-}
-
-/** 记忆条目 DTO */
 export class MemoryItem {
   constructor(options = {}) {
     this.memory_id = options.memory_id || '';
@@ -218,17 +177,6 @@ export class MemoryItem {
   }
 }
 
-/** 记忆搜索响应 DTO */
-export class MemorySearchResponse {
-  constructor(options = {}) {
-    this.query = options.query || '';
-    this.top_k = options.top_k || 3;
-    this.total_matched = options.total_matched || 0;
-    this.items = options.items || [];
-  }
-}
-
-/** 健康检查响应 DTO */
 export class HealthResponse {
   constructor(options = {}) {
     this.status = options.status || 'healthy';
@@ -237,7 +185,40 @@ export class HealthResponse {
   }
 }
 
-/** 错误响应 DTO */
+export class SearchResponse {
+  constructor(options = {}) {
+    this.query = options.query || '';
+    this.top_k = options.top_k || 5;
+    this.result_count = options.result_count || 0;
+    this.results = options.results || [];
+    this.timing_ms = options.timing_ms || null;
+    this.debug = options.debug || null;
+  }
+}
+
+export class SearchResultItem {
+  constructor(options = {}) {
+    this.content = options.content || '';
+    this.source = options.source || '';
+    this.doc_type = options.doc_type || '';
+    this.title = options.title || '';
+    this.score = options.score || 0;
+    this.collection = options.collection || '';
+    this.chunk_id = options.chunk_id || '';
+    this.matched_chunks = options.matched_chunks || 1;
+    this.score_breakdown = options.score_breakdown || {};
+  }
+}
+
+export class MemorySearchResponse {
+  constructor(options = {}) {
+    this.query = options.query || '';
+    this.top_k = options.top_k || 5;
+    this.total_matched = options.total_matched || 0;
+    this.items = options.items || [];
+  }
+}
+
 export class ErrorResponse {
   constructor(options = {}) {
     this.error = options.error || 'Internal Server Error';
@@ -247,57 +228,6 @@ export class ErrorResponse {
   }
 }
 
-// ========== MCP Tool Input Schemas ==========
-
-/** 搜索工具 MCP 输入参数 Schema */
-export const SEARCH_TOOL_INPUT_SCHEMA = {
-  type: 'object',
-  properties: {
-    query: { type: 'string', description: 'Search query' },
-    top_k: { type: 'integer', default: 5, minimum: 1 },
-    doc_type: { type: 'string', description: 'Filter by document type' },
-    session_id: { type: 'string' },
-    transcript_path: { type: 'string' },
-    transcript_id: { type: 'string' },
-    transcripts_root: { type: 'string' },
-  },
-  required: ['query'],
-};
-
-/** 记忆查询 MCP 输入参数 Schema */
-export const MEMORY_QUERY_INPUT_SCHEMA = {
-  type: 'object',
-  properties: {
-    query: { type: 'string', description: 'Memory query' },
-    top_k: { type: 'integer', default: 3, minimum: 1 },
-  },
-  required: ['query'],
-};
-
-// ========== Call Builders ==========
-
-/**
- * 构建搜索调用参数，从 payload 中提取并填充默认值
- * @param {Object} payload - 原始请求参数
- * @returns {Object} 标准化的搜索调用参数
- */
-export function buildSearchCall(payload) {
-  return {
-    query: payload.query || '',
-    top_k: payload.top_k || 5,
-    doc_type: payload.doc_type || null,
-    session_id: payload.session_id || null,
-    transcript_path: payload.transcript_path || null,
-    transcript_id: payload.transcript_id || null,
-    transcripts_root: payload.transcripts_root || null,
-  };
-}
-
-/**
- * 构建记忆查询调用参数
- * @param {Object} payload - 原始请求参数
- * @returns {Object} 标准化的记忆查询参数
- */
 export function buildMemoryQueryCall(payload) {
   return {
     query: payload.query || '',
@@ -306,10 +236,7 @@ export function buildMemoryQueryCall(payload) {
 }
 
 export default {
-  SearchRequest,
   MemoryQueryRequest,
-  buildSearchCall,
+  MemorySaveRequest,
   buildMemoryQueryCall,
-  SEARCH_TOOL_INPUT_SCHEMA,
-  MEMORY_QUERY_INPUT_SCHEMA,
 };

@@ -115,9 +115,11 @@ export class MemoryFacade {
 
   /**
    * 导入外部对话记录为会话
+   * NOTE: 当前实现仅创建空会话并设置标题，不解析转录文件内容。
+   * 如需导入对话内容，请先解析转录文件，再通过 appendSessionTurn 逐条写入。
    * @param {object} params - 参数对象
-   * @param {string} [params.transcriptPath] - 对话记录文件路径
-   * @param {string} [params.transcriptId] - 对话记录 ID
+   * @param {string} [params.transcriptPath] - 对话记录文件路径（仅用于标题）
+   * @param {string} [params.transcriptId] - 对话记录 ID（仅用于标题）
    * @param {string} [params.transcriptsRoot] - 对话记录根目录
    * @param {string} [params.projectId] - 项目 ID
    * @param {string} [params.title] - 会话标题
@@ -126,12 +128,16 @@ export class MemoryFacade {
    * @returns {Promise<string>} 会话 ID
    */
   importTranscriptSession({ transcriptPath, transcriptId, transcriptsRoot, projectId, title, createdAt, sessionId }) {
-    return this.localMemory.startNewSession({
+    const session = this.localMemory.startNewSession({
       project_id: projectId,
       title: title || `Import: ${transcriptPath || transcriptId}`,
       created_at: createdAt,
       session_id: sessionId,
     });
+    return {
+      session_id: session.session_id,
+      warning: 'Transcript content was not parsed. Only an empty session was created. Use appendSessionTurn to add turns.',
+    };
   }
 
   /**

@@ -14,8 +14,11 @@ const __dirname = path.dirname(__filename);
 const require = createRequire(import.meta.url);
 const Database = require('better-sqlite3');
 
-const WORKSPACE_DIR = path.resolve('/root/.openclaw/workspace');
-const DB_PATH = path.resolve('/root/.openclaw/openclaw-engine-js/runtime/localmem/context-engine.db');
+const ENGINE_ROOT = path.resolve(__dirname, '..');
+const WORKSPACE_DIR = path.resolve(process.env.PROJECT_ROOT || path.join(ENGINE_ROOT, '..', 'workspace'));
+const DB_PATH = path.resolve(
+  process.env.CONTEXT_ENGINE_DB_PATH || path.join(ENGINE_ROOT, 'runtime', 'localmem', 'context-engine.db')
+);
 
 const FILES_TO_IMPORT = [
   'MEMORY.md',
@@ -27,8 +30,12 @@ const FILES_TO_IMPORT = [
   'IDENTITY.md',
 ];
 
+function normalizeText(text) {
+  return text.trim().replace(/\s+/g, ' ').toLowerCase();
+}
+
 function canonicalKeyForText(text) {
-  return crypto.createHash('sha1').update(text).digest('hex');
+  return crypto.createHash('sha1').update(normalizeText(text)).digest('hex');
 }
 
 function splitByHeadings(content) {

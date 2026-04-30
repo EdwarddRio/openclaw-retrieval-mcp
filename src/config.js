@@ -17,7 +17,7 @@ const __dirname = path.dirname(__filename); // 当前模块所在目录
 dotenv.config({ path: path.join(__dirname, '../config/context-engine.env') });
 
 // ========== 路径常量 ==========
-export const PROJECT_ROOT = path.resolve(process.env.PROJECT_ROOT || path.join(__dirname, '..')); // 项目根目录
+export const PROJECT_ROOT = path.resolve(process.env.PROJECT_ROOT || path.join(__dirname, '..', '..', 'workspace')); // 项目根目录
 export const CONTEXT_ENGINE_DIR = path.join(__dirname, '..'); // context-engine 包根目录
 export const RUNTIME_DIR = path.resolve(process.env.CONTEXT_ENGINE_RUNTIME_DIR || path.join(CONTEXT_ENGINE_DIR, 'runtime')); // 运行时数据目录，存放数据库、日志等
 
@@ -146,3 +146,5 @@ export function buildDeploymentSummary() {
 export const HTTP_HOST = process.env.HTTP_HOST || '127.0.0.1'; // HTTP 服务监听地址
 export const HTTP_PORT = parseInt(process.env.HTTP_PORT || '8901', 10); // HTTP 服务监听端口
 export const API_SECRET = process.env.OPENCLAW_API_SECRET || ''; // HTTP API 认证密钥，为空时不校验
+export const SIDE_LLM_GATEWAY_URL = process.env.SIDE_LLM_GATEWAY_URL || ''; // 侧边 LLM 网关地址（用于治理语义比较），为空时仅用词法匹配
+export const SIDE_LLM_GATEWAY_MODEL = process.env.SIDE_LLM_GATEWAY_MODEL || 'k2p6'; // 侧边 LLM 网关默认模型

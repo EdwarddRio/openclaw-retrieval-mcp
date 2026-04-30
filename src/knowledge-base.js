@@ -7,8 +7,9 @@ import { MemoryFacade } from './facades/memory.js';
 import { HealthFacade } from './facades/health.js';
 import { BenchmarkFacade } from './facades/benchmark.js';
 import { BenchmarkHarness } from './benchmark/harness.js';
-import { BENCHMARKS_DIR } from './config.js';
+import { BENCHMARKS_DIR, CONTEXT_ENGINE_DIR } from './config.js';
 import { WikiCompiler } from './wiki/compiler.js';
+import path from 'path';
 
 export class KnowledgeBase {
   /**
@@ -282,6 +283,26 @@ export class KnowledgeBase {
     return this.benchmarkFacade.benchmarkHistory(suiteName, limit);
   }
 
+  /**
+   * 执行基准测试套件
+   * @param {string|null} [suiteName=null] - 指定套件名，null 表示运行全部
+   * @returns {Promise<Array>} 各套件运行结果列表
+   */
+  async runBenchmark(suiteName = null) {
+    const searchFn = async (params) => {
+      const result = await this.queryMemory(params.query, params.top_k);
+      const wikiResults = params.include_wiki ? this.wikiSearch(params.query, params.top_k) : [];
+      return { hits: [...(result.hits || []), ...wikiResults] };
+    };
+    const scenariosDir = path.join(CONTEXT_ENGINE_DIR, 'config', 'benchmark-scenarios');
+    const harness = new BenchmarkHarness({
+      searchFn,
+      scenariosDir,
+      reportDir: BENCHMARKS_DIR,
+    });
+    return harness.runSuite(suiteName);
+  }
+
   // ========== Wiki Compiler ==========
 
   /**
@@ -350,6 +371,20 @@ export class KnowledgeBase {
     return this.wikiCompiler.searchWiki(query, topK);
   }
 
+  async search({ query, top_k = 5, include_wiki = true, include_debug = false }) {
+    const memResult = await this.queryMemory(query, top_k);
+    const memHits = memResult.hits || [];
+    let wikiResults = [];
+    if (include_wiki) {
+      wikiResults = this.wikiSearch(query, top_k);
+    }
+    const hits = [
+      ...memHits.map(m => ({ ...m, source_type: 'memory' })),
+      ...wikiResults.map(w => ({ ...w, source_type: 'wiki' })),
+    ];
+    return { query, hits, total: hits.length };
+  }
+
   /**
    * 重建 localMem 索引：验证完整性 + 清理过期 tentative 条目
    * @returns {Promise<object>} 重建结果摘要
@@ -378,10 +413,14 @@ export class KnowledgeBase {
    * Graceful shutdown：级联关闭所有子模块资源
    */
   async close() {
+    const errors = [];
     try {
       await this.memoryFacade.close();
     } catch (err) {
-      console.error(`[KnowledgeBase] memory facade close error: ${err.message}`);
+      errors.push(`memory: ${err.message}`);
+    }
+    if (errors.length > 0) {
+      console.error(`[KnowledgeBase] close errors: ${errors.join(', ')}`);
     }
   }
 }

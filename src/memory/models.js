@@ -57,7 +57,6 @@ export class ChatSession {
    */
   constructor(options = {}) {
     this.session_id = options.session_id || crypto.randomUUID();
-    if (!this.session_id) this.session_id = crypto.randomUUID();
     this.project_id = options.project_id || 'default';
     this.session_date = options.session_date || '';
     this.started_at = options.started_at || options.created_at || new Date().toISOString();
@@ -132,10 +131,8 @@ export const MEMORY_INTENT_PHRASES = [
   '你还记得', '前面定过', '之前说过',
 ];
 
-export const FACT_SIMILARITY_THRESHOLD = 0.82; /** 事实相似度判定阈值 */
-export const INFLUENCE_CONFIDENCE = 1.2;       /** 置信度影响因子 */
-export const INFLUENCE_CONFIDENCE_WITH_INTENT = 0.9; /** 带意图的置信度影响因子 */
-export const VECTOR_WEIGHT = 2.0;               /** 向量搜索权重（保留常量，embedding 已移除） */
+export const FACT_SIMILARITY_THRESHOLD = 0.82;
+export const INFLUENCE_CONFIDENCE_WITH_INTENT = 0.9;
 
 /** 分诊确认信号关键词，匹配时优先保留为记忆 */
 export const TRIAGE_CONFIRM_SIGNALS = [
@@ -149,8 +146,13 @@ export const TRIAGE_DISCARD_SIGNALS = [
   '不确定', '可能不对', '随便看看',
 ];
 
-export const TRIAGE_MIN_CONTENT_LENGTH = 10;  /** 分诊最小内容长度，低于此值不保留 */
-export const TRIAGE_MAX_CONTENT_LENGTH = 500;  /** 分诊最大内容长度，超过此值不保留 */
+export const TRIAGE_MIN_CONTENT_LENGTH = 10;
+export const TRIAGE_MAX_CONTENT_LENGTH = 500;
+
+export const RELEVANCE_WEIGHTS = {
+  search: { hitRate: 0.5, position: 0.2, count: 0.15, freshness: 0.15 },
+  confidence: { hitRate: 0.4, position: 0.2, count: 0.2, freshness: 0.2 },
+};
 
 // ========== Utility Functions (D version) ==========
 
@@ -181,28 +183,39 @@ export function isoToEpochMs(value) {
   return new Date(value).getTime();
 }
 
-/**
- * 计算两个向量的余弦相似度
- * @param {number[]} a - 向量 A
- * @param {number[]} b - 向量 B
- * @returns {number} 余弦相似度，范围 [-1, 1]
- */
-export function cosineSimilarity(a, b) {
-  const dotProduct = a.reduce((sum, x, i) => sum + x * b[i], 0);
-  const normA = Math.sqrt(a.reduce((sum, x) => sum + x * x, 0));
-  const normB = Math.sqrt(b.reduce((sum, x) => sum + x * x, 0));
-  if (normA === 0 || normB === 0) return 0;
-  return dotProduct / (normA * normB);
-}
-
-/**
- * 根据文本生成规范键（SHA1 哈希），用于记忆去重
- * @param {string} text - 原始文本
- * @returns {string} SHA1 哈希的十六进制字符串
- */
 export function canonicalKeyForText(text) {
   const normalized = normalizeText(text);
   return crypto.createHash('sha1').update(normalized).digest('hex');
+}
+
+export function computeRelevanceScore(query, item, weights = { hitRate: 0.5, position: 0.2, count: 0.15, freshness: 0.15 }) {
+  const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
+  if (!terms.length) return 0;
+
+  const content = (item.content || '').toLowerCase();
+  let matchCount = 0;
+  let totalPositions = 0;
+
+  for (const term of terms) {
+    const idx = content.indexOf(term);
+    if (idx >= 0) {
+      matchCount++;
+      totalPositions += idx;
+    }
+  }
+
+  const hitRate = matchCount / terms.length;
+  const positionScore = matchCount > 0 ? 1 / (1 + totalPositions / 100) : 0;
+  const countScore = Math.min(1, (item._hitCount || 1) / 3);
+  const ageDays = item.updated_at
+    ? (Date.now() - new Date(item.updated_at).getTime()) / (1000 * 60 * 60 * 24)
+    : 999;
+  const freshnessScore = 1 / (1 + ageDays / 30);
+
+  return hitRate * (weights.hitRate || 0.5)
+    + positionScore * (weights.position || 0.2)
+    + countScore * (weights.count || 0.15)
+    + freshnessScore * (weights.freshness || 0.15);
 }
 
 export default {
@@ -218,6 +231,6 @@ export default {
   normalizeText,
   isoNow,
   isoToEpochMs,
-  cosineSimilarity,
   canonicalKeyForText,
+  computeRelevanceScore,
 };

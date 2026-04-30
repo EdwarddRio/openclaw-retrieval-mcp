@@ -8,8 +8,9 @@ import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import { createRequire } from 'module';
-import { fileURLToPath } from 'url';
+import { fileURLToPath as _fileURLToPath } from 'url';
 import { LOCALMEM_DIR } from '../config.js';
+import { canonicalKeyForText, computeRelevanceScore, RELEVANCE_WEIGHTS } from './models.js';
 
 /** 生成 UUID */
 function _uuid() {
@@ -99,6 +100,8 @@ const MEMORY_ITEM_COLUMNS = {
   path_hints_json: "TEXT NOT NULL DEFAULT '[]'",
   collection_hints_json: "TEXT NOT NULL DEFAULT '[]'",
   last_choice: "TEXT",
+  evaluation_json: "TEXT",
+  unique_query_hashes: "TEXT NOT NULL DEFAULT '[]'",
 };
 
 /**
@@ -107,12 +110,22 @@ const MEMORY_ITEM_COLUMNS = {
  * @param {string} tableName - 表名
  * @param {Object} columns - 列名到 DDL 定义的映射
  */
+const ALLOWED_TABLES = new Set([
+  'sessions', 'turns', 'memory_items', 'memory_events', 'memory_aliases',
+]);
+
 function _ensureColumns(db, tableName, columns) {
+  if (!ALLOWED_TABLES.has(tableName)) {
+    throw new Error(`_ensureColumns: table "${tableName}" is not in the allowed list`);
+  }
   const existing = new Set(
     db.prepare(`PRAGMA table_info(${tableName})`).all().map(r => r.name)
   );
   for (const [column, ddl] of Object.entries(columns)) {
     if (existing.has(column)) continue;
+    if (!/^[a-zA-Z_]\w*$/.test(column)) {
+      throw new Error(`_ensureColumns: invalid column name "${column}"`);
+    }
     db.prepare(`ALTER TABLE ${tableName} ADD COLUMN ${column} ${ddl}`).run();
   }
 }
@@ -249,8 +262,8 @@ export class SqliteStore {
         this.checkpoint();
         this._lastCheckpointAt = now;
       }
-    } catch {
-      // 忽略
+    } catch (err) {
+      console.warn(`[SqliteStore] Checkpoint check failed: ${err.message}`);
     }
   }
 
@@ -275,19 +288,35 @@ export class SqliteStore {
     `);
 
     // Drop deprecated tables (wiki promotion path removed, mentions unused)
-    try { this.db.exec('DROP TABLE IF EXISTS memory_reviews'); } catch {}
-    try { this.db.exec('DROP TABLE IF EXISTS wiki_exports'); } catch {}
-    try { this.db.exec('DROP TABLE IF EXISTS memory_mentions'); } catch {}
-    try { this.db.exec('DROP TABLE IF EXISTS runtime_state'); } catch {}
+    const migrationVersion = this._getMigrationVersion();
+    if (migrationVersion < 1) {
+      try { this.db.exec('DROP TABLE IF EXISTS memory_reviews'); } catch {}
+      try { this.db.exec('DROP TABLE IF EXISTS wiki_exports'); } catch {}
+      try { this.db.exec('DROP TABLE IF EXISTS memory_mentions'); } catch {}
+      try { this.db.exec('DROP TABLE IF EXISTS runtime_state'); } catch {}
+      try { this.db.exec('DROP TABLE IF EXISTS memory_items_fts'); } catch {}
+      try { this.db.exec('DROP TRIGGER IF EXISTS memory_items_ai'); } catch {}
+      try { this.db.exec('DROP TRIGGER IF EXISTS memory_items_ad'); } catch {}
+      try { this.db.exec('DROP TRIGGER IF EXISTS memory_items_au'); } catch {}
+      this._setMigrationVersion(1);
+    }
 
     // Migrate old states to new simplified states
     this._migrateStates();
+  }
 
-    // Drop FTS5 — not used for memory queries (CJK unsupported by default tokenizer)
-    try { this.db.exec('DROP TABLE IF EXISTS memory_items_fts'); } catch {}
-    try { this.db.exec('DROP TRIGGER IF EXISTS memory_items_ai'); } catch {}
-    try { this.db.exec('DROP TRIGGER IF EXISTS memory_items_ad'); } catch {}
-    try { this.db.exec('DROP TRIGGER IF EXISTS memory_items_au'); } catch {}
+  _getMigrationVersion() {
+    try {
+      this.db.exec('CREATE TABLE IF NOT EXISTS _meta (key TEXT PRIMARY KEY, value TEXT)');
+      const row = this.db.prepare('SELECT value FROM _meta WHERE key = ?').get('migration_version');
+      return row ? parseInt(row.value, 10) : 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  _setMigrationVersion(version) {
+    this.db.prepare('INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)').run('migration_version', String(version));
   }
 
   // ========== Sessions ==========
@@ -448,6 +477,31 @@ export class SqliteStore {
   }
 
   /**
+   * 获取指定时间范围内的对话轮次
+   * @param {number} hours - 查询最近多少小时的轮次
+   * @returns {Array<Object>} 轮次列表
+   */
+  getTurnsSince(hours) {
+    const cutoff = new Date(Date.now() - hours * 60 * 60 * 1000).toISOString();
+    return this._getStmt(
+      `SELECT * FROM turns WHERE created_at >= ? ORDER BY created_at ASC`
+    ).all(cutoff).map(r => this._rowToTurn(r));
+  }
+
+  /**
+   * 获取指定会话中指定时间之前的最近一条轮次
+   * @param {string} sessionId - 会话 ID
+   * @param {string} beforeTime - ISO 时间字符串
+   * @returns {Object|null} 轮次对象
+   */
+  getPreviousTurn(sessionId, beforeTime) {
+    const row = this._getStmt(
+      `SELECT * FROM turns WHERE session_id = ? AND created_at < ? ORDER BY created_at DESC LIMIT 1`
+    ).get(sessionId, beforeTime);
+    return row ? this._rowToTurn(row) : null;
+  }
+
+  /**
    * 数据库行转轮次对象
    * @param {Object} row - 数据库行
    * @returns {Object} 轮次对象
@@ -481,38 +535,42 @@ export class SqliteStore {
    */
   saveMemory(memory) {
     const now = memory.updated_at || memory.created_at || new Date().toISOString();
-    const stmt = this.db.prepare(`
-      INSERT OR REPLACE INTO memory_items
-      (id, canonical_key, summary, state, status, source, content,
-       session_id, created_at, updated_at,
-       aliases_json, path_hints_json, collection_hints_json, last_choice)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-    stmt.run(
-      memory.memory_id,
-      memory.canonical_key || '',
-      memory.summary || memory.content || '',
-      memory.state || 'tentative',
-      memory.status || 'active',
-      memory.source || 'manual',
-      memory.content || '',
-      memory.session_id || memory.source_session_id || null,
-      memory.created_at || now,
-      now,
-      JSON.stringify(memory.aliases || []),
-      JSON.stringify(memory.path_hints || []),
-      JSON.stringify(memory.collection_hints || []),
-      memory.last_choice || null
-    );
 
-    // Sync aliases table
-    this._getStmt('DELETE FROM memory_aliases WHERE memory_id = ?').run(memory.memory_id);
-    const aliasStmt = this._getStmt('INSERT INTO memory_aliases (memory_id, alias) VALUES (?, ?)');
-    for (const alias of (memory.aliases || [])) {
-      aliasStmt.run(memory.memory_id, alias);
-    }
+    const txn = this.db.transaction(() => {
+      const stmt = this.db.prepare(`
+        INSERT OR REPLACE INTO memory_items
+        (id, canonical_key, summary, state, status, source, content,
+         session_id, created_at, updated_at,
+         aliases_json, path_hints_json, collection_hints_json, last_choice)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      stmt.run(
+        memory.memory_id,
+        memory.canonical_key || '',
+        memory.summary || memory.content || '',
+        memory.state || 'tentative',
+        memory.status || 'active',
+        memory.source || 'manual',
+        memory.content || '',
+        memory.session_id || memory.source_session_id || null,
+        memory.created_at || now,
+        now,
+        JSON.stringify(memory.aliases || []),
+        JSON.stringify(memory.path_hints || []),
+        JSON.stringify(memory.collection_hints || []),
+        memory.last_choice || null
+      );
 
-    return this._rowToMemory(this._getStmt('SELECT * FROM memory_items WHERE id = ?').get(memory.memory_id));
+      this._getStmt('DELETE FROM memory_aliases WHERE memory_id = ?').run(memory.memory_id);
+      const aliasStmt = this._getStmt('INSERT INTO memory_aliases (memory_id, alias) VALUES (?, ?)');
+      for (const alias of (memory.aliases || [])) {
+        aliasStmt.run(memory.memory_id, alias);
+      }
+
+      return this._rowToMemory(this._getStmt('SELECT * FROM memory_items WHERE id = ?').get(memory.memory_id));
+    });
+
+    return txn();
   }
 
   /**
@@ -526,43 +584,102 @@ export class SqliteStore {
   }
 
   /**
+   * 通过规范键获取活跃记忆（用于去重检查）
+   * @param {string} canonicalKey - 规范键
+   * @returns {Object|null} 记忆对象
+   */
+  getMemoryByCanonicalKey(canonicalKey) {
+    const row = this._getStmt(
+      `SELECT * FROM memory_items WHERE canonical_key = ? AND status = 'active' LIMIT 1`
+    ).get(canonicalKey);
+    return row ? this._rowToMemory(row) : null;
+  }
+
+  /**
    * 基于 LIKE 的记忆查询，每个分词须在 content 中出现，支持中文
    * @param {string} query - 查询文本
    * @param {number} [topK=3] - 返回数量上限
    * @returns {Array<Object>} 匹配的记忆列表
    */
   queryMemory(query, topK = 3) {
-    // Use LIKE-based search with tokenized terms for CJK support.
-    // FTS5 default tokenizer doesn't handle Chinese, so we avoid it for memory queries.
     if (!query || !query.trim()) return [];
 
-    // Build WHERE clause: each token must appear in content
-    let terms = query.trim().split(/\s+/).filter(t => t.length > 0);
+    const terms = query.trim().split(/\s+/).filter(t => t.length > 0);
     if (terms.length === 0) return [];
 
-    // 中文无空格 fallback：若整句无空格且含中文，按单字切分以提升召回
-    if (terms.length === 1 && terms[0].length > 1 && /[\u4e00-\u9fff]/.test(terms[0])) {
-      terms = [...terms[0]].filter(c => /[\u4e00-\u9fff]/.test(c));
+    const andConditions = terms.map(() => '(content LIKE ? OR aliases_json LIKE ?)').join(' AND ');
+    const andParams = [];
+    for (const t of terms) {
+      andParams.push(`%${t}%`, `%"${t}"%`);
+    }
+    const andStmt = this.db.prepare(`
+      SELECT * FROM memory_items
+      WHERE (${andConditions}) AND status = 'active' AND state IN ('tentative', 'kept')
+      ORDER BY updated_at DESC LIMIT ?
+    `);
+    let rows = andStmt.all(...andParams, topK * 3).map(r => this._rowToMemory(r));
+
+    if (rows.length < topK) {
+      const expandedTerms = [];
+      for (const term of terms) {
+        if (term.length > 1 && /[\u4e00-\u9fff]/.test(term)) {
+          const bigrams = [];
+          for (let i = 0; i < term.length - 1; i++) {
+            const bigram = term.slice(i, i + 2);
+            if (/[\u4e00-\u9fff]{2}/.test(bigram)) {
+              bigrams.push(bigram);
+            }
+          }
+          if (bigrams.length > 0) {
+            expandedTerms.push(...bigrams);
+          } else {
+            expandedTerms.push(term);
+          }
+        } else {
+          expandedTerms.push(term);
+        }
+      }
+
+      if (expandedTerms.length > terms.length) {
+        const minMatch = Math.ceil(expandedTerms.length / 2);
+        const orConditions = expandedTerms.map(() => '(content LIKE ? OR aliases_json LIKE ?)').join(' OR ');
+        const orParams = [];
+        for (const t of expandedTerms) {
+          orParams.push(`%${t}%`, `%"${t}"%`);
+        }
+        const excludeIds = rows.map(r => r.memory_id);
+        const excludeClause = excludeIds.length > 0
+          ? ` AND id NOT IN (${excludeIds.map(() => '?').join(',')})`
+          : '';
+        const fuzzyStmt = this.db.prepare(`
+          SELECT * FROM memory_items
+          WHERE (${orConditions}) AND status = 'active' AND state IN ('tentative', 'kept')
+          ${excludeClause}
+          ORDER BY updated_at DESC LIMIT ?
+        `);
+        const fuzzyRows = fuzzyStmt.all(...orParams, ...excludeIds, topK * 5)
+          .map(r => this._rowToMemory(r))
+          .filter(r => {
+            const content = (r.content || '').toLowerCase();
+            const matchCount = expandedTerms.filter(t => content.includes(t.toLowerCase())).length;
+            return matchCount >= minMatch;
+          });
+        rows = rows.concat(fuzzyRows);
+      }
     }
 
-    const conditions = terms.map(() => 'content LIKE ?').join(' OR ');
-    const params = terms.map(t => `%${t}%`);
-
-    const stmt = this.db.prepare(`
-      SELECT * FROM memory_items
-      WHERE ${conditions} AND status = 'active' AND state IN ('tentative', 'kept')
-      ORDER BY updated_at DESC
-      LIMIT ?
-    `);
-    const rows = stmt.all(...params, topK * 5).map(r => this._rowToMemory(r));
-    // 二次排序：命中 token 越多越靠前，其次按 updated_at 倒序
     rows.sort((a, b) => {
-      const scoreA = terms.filter(t => (a.content || '').includes(t)).length;
-      const scoreB = terms.filter(t => (b.content || '').includes(t)).length;
-      if (scoreB !== scoreA) return scoreB - scoreA;
-      return (b.updated_at || '').localeCompare(a.updated_at || '');
+      const scoreA = this._computeRelevanceScore(a, terms);
+      const scoreB = this._computeRelevanceScore(b, terms);
+      return scoreB - scoreA;
     });
+
     return rows.slice(0, topK);
+  }
+
+  _computeRelevanceScore(item, terms) {
+    const query = terms.join(' ');
+    return computeRelevanceScore(query, item, RELEVANCE_WEIGHTS.search);
   }
 
   /**
@@ -600,12 +717,13 @@ export class SqliteStore {
    * @returns {boolean} 始终返回 true
    */
   updateMemoryContent(memoryId, content) {
+    const canonicalKey = canonicalKeyForText(content.trim());
     const stmt = this.db.prepare(`
-      UPDATE memory_items SET content = ?, summary = ?, updated_at = ? WHERE id = ?
+      UPDATE memory_items SET content = ?, summary = ?, canonical_key = ?, updated_at = ? WHERE id = ?
     `);
     const now = new Date().toISOString();
-    stmt.run(content, content, now, memoryId);
-    return true;
+    const result = stmt.run(content, content, canonicalKey, now, memoryId);
+    return result.changes > 0;
   }
 
   /**
@@ -649,6 +767,32 @@ export class SqliteStore {
     return result.changes > 0;
   }
 
+  addQueryHash(memoryId, queryHash) {
+    const row = this.db.prepare('SELECT unique_query_hashes FROM memory_items WHERE id = ?').get(memoryId);
+    if (!row) return;
+    let hashes = [];
+    try { hashes = JSON.parse(row.unique_query_hashes || '[]'); } catch { hashes = []; }
+    if (!hashes.includes(queryHash)) {
+      hashes.push(queryHash);
+      if (hashes.length > 20) hashes = hashes.slice(-20);
+      this.db.prepare('UPDATE memory_items SET unique_query_hashes = ? WHERE id = ?')
+        .run(JSON.stringify(hashes), memoryId);
+    }
+  }
+
+  /**
+   * 获取指定会话最近一段时间内的检索洞察数量
+   * @param {string} sessionId - 会话 ID
+   * @param {number} [maxAgeHours=1] - 最大时间跨度（小时）
+   * @returns {number} 洞察数量
+   */
+  getRecentInsightCount(sessionId, maxAgeHours = 1) {
+    const row = this.db.prepare(
+      `SELECT COUNT(*) as cnt FROM turns WHERE session_id = ? AND role = 'system' AND content LIKE '[检索洞察]%' AND created_at > datetime('now', '-${maxAgeHours} hour')`
+    ).get(sessionId);
+    return row?.cnt || 0;
+  }
+
   /**
    * 硬删除记忆条目（同时清理别名记录）
    * @param {string} memoryId - 记忆 ID
@@ -668,6 +812,16 @@ export class SqliteStore {
    * @returns {Object} 记忆对象
    */
   _rowToMemory(row) {
+    let aliases = [];
+    try { aliases = row.aliases_json ? JSON.parse(row.aliases_json) : []; } catch { aliases = []; }
+    let pathHints = [];
+    try { pathHints = row.path_hints_json ? JSON.parse(row.path_hints_json) : []; } catch { pathHints = []; }
+    let collectionHints = [];
+    try { collectionHints = row.collection_hints_json ? JSON.parse(row.collection_hints_json) : []; } catch { collectionHints = []; }
+    let evaluation = null;
+    try { evaluation = row.evaluation_json ? JSON.parse(row.evaluation_json) : null; } catch { evaluation = null; }
+    let queryHashCount = 0;
+    try { queryHashCount = (JSON.parse(row.unique_query_hashes || '[]')).length; } catch {}
     return {
       memory_id: row.id,
       canonical_key: row.canonical_key || '',
@@ -680,10 +834,12 @@ export class SqliteStore {
       source_session_id: row.session_id || null,
       created_at: row.created_at,
       updated_at: row.updated_at,
-      aliases: row.aliases_json ? JSON.parse(row.aliases_json) : [],
-      path_hints: row.path_hints_json ? JSON.parse(row.path_hints_json) : [],
-      collection_hints: row.collection_hints_json ? JSON.parse(row.collection_hints_json) : [],
+      aliases,
+      path_hints: pathHints,
+      collection_hints: collectionHints,
+      evaluation,
       last_choice: row.last_choice || null,
+      _hitCount: queryHashCount,
     };
   }
 
@@ -769,21 +925,20 @@ export class SqliteStore {
    */
   supersedeMemory(oldMemoryId, newMemory) {
     const now = newMemory.created_at || new Date().toISOString();
-    // Delete old memory
-    this.deleteMemory(oldMemoryId);
 
-    // Insert new memory
-    const saved = this.saveMemory(newMemory);
-
-    // Record event
-    this.addEvent({
-      memory_id: oldMemoryId,
-      event_type: 'memory_superseded',
-      created_at: now,
-      event_data: { new_memory_id: saved.memory_id },
+    const txn = this.db.transaction(() => {
+      this.deleteMemory(oldMemoryId);
+      const saved = this.saveMemory(newMemory);
+      this.addEvent({
+        memory_id: oldMemoryId,
+        event_type: 'memory_superseded',
+        created_at: now,
+        event_data: { new_memory_id: saved.memory_id },
+      });
+      return { oldMemoryId, newMemory: saved };
     });
 
-    return { oldMemoryId, newMemory: saved };
+    return txn();
   }
 
   // ========== Periodic cleanup ==========
@@ -843,16 +998,13 @@ export class SqliteStore {
 
   /** 迁移旧状态到简化的 tentative/kept 模型，清理废弃和孤立数据 */
   _migrateStates() {
-    // Migrate old states to simplified tentative/kept model
     try {
       this.db.prepare("UPDATE memory_items SET state = 'kept' WHERE state IN ('local_only', 'manual_only') AND status = 'active'").run();
       this.db.prepare("UPDATE memory_items SET state = 'tentative' WHERE state IN ('wiki_candidate', 'candidate_on_reuse') AND status = 'active'").run();
-      // Delete discarded/archived items (they were soft-deleted before, now we hard-delete)
       this.db.prepare("DELETE FROM memory_items WHERE state = 'discarded' OR status IN ('archived', 'discarded')").run();
-      // Clean up orphaned aliases
       this.db.prepare("DELETE FROM memory_aliases WHERE memory_id NOT IN (SELECT id FROM memory_items)").run();
     } catch (err) {
-      // Non-fatal: migration best-effort
+      console.error(`[SqliteStore] State migration failed (non-fatal, continuing): ${err.message}`);
     }
   }
 }

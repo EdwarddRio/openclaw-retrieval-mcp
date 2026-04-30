@@ -72,11 +72,11 @@ export class BenchmarkHarness {
         const searchResult = await this.searchFn({
           query: benchmarkCase.query,
           top_k: 5,
-          doc_type: benchmarkCase.docType,
+          include_wiki: true,
           include_debug: false,
         });
 
-        const results = searchResult.results || [];
+        const results = searchResult.hits || searchResult.results || [];
         const hitRate = computeHitRate(results, benchmarkCase.expectedHits);
         const recall = computeRecall(results, benchmarkCase.expectedRecalls);
         const diversity = computeDiversity(results);

@@ -10,6 +10,7 @@ coverage/
 .idea/
 
 # Environment files
+config/context-engine.env
 *.env.local
 *.env.*.local
 

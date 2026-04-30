@@ -6,15 +6,34 @@
 
 import Fastify from 'fastify';
 import fs from 'fs';
+import path from 'path';
 import net from 'net';
-import { HTTP_HOST, HTTP_PORT, HTTP_SOCKET_PATH, API_SECRET } from './config.js';
+import { HTTP_HOST, HTTP_PORT, HTTP_SOCKET_PATH, API_SECRET, PROJECT_ROOT, SIDE_LLM_GATEWAY_URL, SIDE_LLM_GATEWAY_MODEL } from './config.js';
 import { KnowledgeBase } from './knowledge-base.js';
 import { KnowledgeBasePresenter } from './api/presenter.js';
 import { QueryExporter } from './api/query-exporter.js';
+import { MemoryQueryRequest, MemorySaveRequest, SessionTurnRequest, StartMemorySessionRequest, BenchmarkResultRequest } from './api/contract.js';
+
+function validateBody(ValidatorClass) {
+  return async (request, reply) => {
+    if (!request.body || typeof request.body !== 'object') {
+      return reply.code(400).send({ success: false, error: 'Request body is required' });
+    }
+    const instance = new ValidatorClass(request.body);
+    const { valid, errors } = instance.validate();
+    if (!valid) {
+      return reply.code(400).send({ success: false, error: `Validation failed: ${errors.join(', ')}` });
+    }
+  };
+}
 
 const fastify = Fastify({
-  logger: true, // 启用 Fastify 内置请求日志
+  logger: true,
 });
+
+function successResponse(data) {
+  return { success: true, data };
+}
 
 // 轻量级 Bearer Token 认证（未配置时跳过，兼容现有部署）
 if (API_SECRET) {
@@ -22,6 +41,7 @@ if (API_SECRET) {
     const auth = request.headers.authorization || '';
     if (!auth.startsWith('Bearer ') || auth.slice(7) !== API_SECRET) {
       reply.code(401).send({ error: 'Unauthorized' });
+      throw new Error('Unauthorized');
     }
   });
 }
@@ -31,14 +51,99 @@ const queryExporter = new QueryExporter(); // 查询上下文调试导出器
 // Initialize knowledge base
 const knowledgeBase = new KnowledgeBase(); // 知识库组合门面，聚合所有子模块
 
+// 侧边 LLM 网关客户端（用于治理语义比较）
+let sideLlmGateway = null;
+if (SIDE_LLM_GATEWAY_URL) {
+  sideLlmGateway = {
+    defaultModel: SIDE_LLM_GATEWAY_MODEL,
+    async chat({ model, messages, temperature, max_tokens }) {
+      const response = await fetch(`${SIDE_LLM_GATEWAY_URL}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: model || SIDE_LLM_GATEWAY_MODEL, messages, temperature, max_tokens }),
+      });
+      if (!response.ok) throw new Error(`LLM gateway returned ${response.status}`);
+      return response.json();
+    },
+  };
+}
+
 // ========== Memory Endpoints ==========
 
 /** 查询记忆 */
-fastify.post('/api/memory/query', async (request, reply) => {
+fastify.post('/api/memory/query', { preHandler: [validateBody(MemoryQueryRequest)] }, async (request, reply) => {
   try {
-    const { query, top_k } = request.body;
+    const { query, top_k, include_wiki } = request.body;
     const result = await knowledgeBase.queryMemory(query, top_k);
-    return result;
+    const freshness = result.freshness || { level: 'unknown', note: '', age_days: null };
+
+    if (include_wiki) {
+      const wikiResults = knowledgeBase.wikiSearch(query, top_k || 3);
+
+      const memItems = (result.hits || result.items || []).map(r => ({
+        id: r.memory_id,
+        content: r.content || '',
+        source_type: 'memory',
+        state: r.state,
+        score: r._relevanceScore || 0,
+        created_at: r.created_at,
+        updated_at: r.updated_at,
+      }));
+
+      const wikiItems = (wikiResults || []).map(r => ({
+        id: r.pageName,
+        content: r.snippet || '',
+        source_type: 'wiki',
+        state: 'kept',
+        score: r.score || 0,
+        created_at: null,
+        updated_at: null,
+      }));
+
+      const dedupedWikiItems = wikiItems.filter(w => {
+        const title = (w.id || '').replace('.md', '');
+        if (!title) return true;
+        return !memItems.some(m =>
+          (m.content || '').toLowerCase().includes(title.toLowerCase())
+        );
+      });
+
+      const merged = [...memItems, ...dedupedWikiItems]
+        .sort((a, b) => (b.score || 0) - (a.score || 0))
+        .slice(0, top_k || 5);
+
+      return {
+        query,
+        hits: merged,
+        total: merged.length,
+        include_wiki: true,
+        freshness_level: freshness.level,
+        tentative_count: (result.tentative_items || []).length,
+      };
+    }
+
+    return {
+      query,
+      hits: (result.hits || []).map(h => ({
+        id: h.memory_id,
+        content: h.content || '',
+        source_type: 'memory',
+        state: h.state,
+        score: h._relevanceScore || 0,
+        created_at: h.created_at,
+        updated_at: h.updated_at,
+      })),
+      total: (result.hits || []).length,
+      tentative_items: (result.tentative_items || []).map(t => ({
+        id: t.memory_id,
+        content: t.content || '',
+        state: t.state,
+        source: t.source,
+        created_at: t.created_at,
+      })),
+      freshness_level: freshness.level,
+      abstention_signals: result.abstention_signals || {},
+    };
   } catch (err) {
     reply.code(500);
     return KnowledgeBasePresenter.presentError(err, 500);
@@ -53,7 +158,33 @@ fastify.post('/api/memory/query-context', async (request, reply) => {
     if (include_debug && queryExporter) {
       await queryExporter.exportQueryContext({ query, result });
     }
-    return result;
+    const memHits = (result.hits || []).map(h => ({
+      id: h.memory_id,
+      content: h.content || '',
+      source_type: 'memory',
+      state: h.state,
+      score: h._relevanceScore || 0,
+      created_at: h.created_at,
+      updated_at: h.updated_at,
+    }));
+
+    return {
+      query,
+      hits: memHits,
+      total: memHits.length,
+      freshness_level: result.freshness_level || 'unknown',
+      context: {
+        aliases: result.aliases || [],
+        path_hints: result.path_hints || [],
+        collection_hints: result.collection_hints || [],
+        confidence: result.confidence || 0,
+        confidence_level: result.confidence_level || 'none',
+        should_abstain: result.should_abstain || false,
+        abstain_reason: result.abstain_reason || '',
+        recency_hint: result.recency_hint || null,
+        summary: result.summary || {},
+      },
+    };
   } catch (err) {
     reply.code(500);
     return KnowledgeBasePresenter.presentError(err, 500);
@@ -65,7 +196,7 @@ fastify.get('/api/memory/timeline', async (request, reply) => {
   try {
     const { memory_id, session_id, limit } = request.query;
     const result = await knowledgeBase.memoryTimeline({ memoryId: memory_id, sessionId: session_id, limit: parseInt(limit) || 50 });
-    return result;
+    return successResponse(result);
   } catch (err) {
     reply.code(500);
     return KnowledgeBasePresenter.presentError(err, 500);
@@ -73,12 +204,60 @@ fastify.get('/api/memory/timeline', async (request, reply) => {
 });
 
 /** 追加一轮对话到当前会话 */
-fastify.post('/api/memory/turn', async (request, reply) => {
+fastify.post('/api/memory/turn', { preHandler: [validateBody(SessionTurnRequest)] }, async (request, reply) => {
   try {
     const { session_id, role, content, project_id, title, created_at, references } = request.body;
     const result = await knowledgeBase.appendSessionTurn({
       sessionId: session_id, role, content, projectId: project_id, title, createdAt: created_at, references,
     });
+
+    if (!metrics.autoTriageDisabled) {
+      knowledgeBase.memoryFacade.localMemory.autoTriageTurn({
+        session_id, role, content, persist: true, side_llm_gateway: sideLlmGateway,
+      }).then(() => {
+        metrics.autoTriageSuccessCount += 1;
+        metrics.autoTriageConsecutiveFails = 0;
+        metrics.autoTriageDisabled = false;
+        metrics.autoTriageDisabledAt = null;
+      }).catch(err => {
+        metrics.autoTriageFailCount += 1;
+        metrics.autoTriageConsecutiveFails += 1;
+        fastify.log.warn(`autoTriage failed for turn (${metrics.autoTriageConsecutiveFails} consecutive): ${err.message}`);
+        try {
+          const store = knowledgeBase?.memoryFacade?.localMemory?._store;
+          if (store?.addEvent) {
+            store.addEvent({
+              memory_id: 'auto_triage',
+              event_type: 'auto_triage_failure',
+              created_at: new Date().toISOString(),
+              event_data: { consecutiveFails: metrics.autoTriageConsecutiveFails, totalFails: metrics.autoTriageFailCount, error: err.message },
+            });
+          }
+        } catch (logErr) {
+          fastify.log.warn(`Failed to persist autoTriage failure event: ${logErr.message}`);
+        }
+        if (metrics.autoTriageConsecutiveFails >= 5 && !metrics.autoTriageDisabled) {
+          metrics.autoTriageDisabled = true;
+          metrics.autoTriageDisabledAt = new Date().toISOString();
+          const alertPath = path.join(PROJECT_ROOT, 'memory', 'autoTriage-alert.json');
+          try {
+            fs.writeFileSync(alertPath, JSON.stringify({
+              alert: 'autoTriage_consecutive_failures',
+              consecutiveFails: metrics.autoTriageConsecutiveFails,
+              totalFails: metrics.autoTriageFailCount,
+              lastError: err.message,
+              disabled: true,
+              timestamp: new Date().toISOString(),
+            }, null, 2));
+          } catch (writeErr) {
+            fastify.log.warn(`Failed to write autoTriage alert file: ${writeErr.message}`);
+          }
+        }
+      });
+    } else {
+      fastify.log.debug(`autoTriage skipped (disabled since ${metrics.autoTriageDisabledAt})`);
+    }
+
     return { success: true, ...result };
   } catch (err) {
     reply.code(500);
@@ -86,8 +265,70 @@ fastify.post('/api/memory/turn', async (request, reply) => {
   }
 });
 
+/** 单条 autoTriage：对一条 turn 执行自动沉淀判断 */
+fastify.post('/api/memory/auto-triage', async (request, reply) => {
+  try {
+    const { session_id, role, content, previous_role, previous_content } = request.body || {};
+    if (!session_id || !role || !content) {
+      reply.code(400);
+      return { success: false, error: 'session_id, role, content are required' };
+    }
+    const candidates = await knowledgeBase.memoryFacade.localMemory.autoTriageTurn({
+      session_id, role, content, previous_role, previous_content, persist: true,
+    });
+    return { success: true, candidates, count: candidates.length };
+  } catch (err) {
+    reply.code(500);
+    return KnowledgeBasePresenter.presentError(err, 500);
+  }
+});
+
+/** 批量 autoTriage：处理指定时间范围内的 turns */
+fastify.post('/api/memory/auto-triage/batch', async (request, reply) => {
+  try {
+    const { hours = 24 } = request.body || {};
+    const localMemory = knowledgeBase.memoryFacade.localMemory;
+    const turns = localMemory.getTurnsSince(hours);
+
+    const results = [];
+    let dailyLimitReached = false;
+    for (const turn of turns) {
+      if (dailyLimitReached) break;
+      const prevTurn = localMemory.getPreviousTurn(turn.session_id, turn.created_at);
+
+      const candidates = await localMemory.autoTriageTurn({
+        session_id: turn.session_id,
+        role: turn.role,
+        content: turn.content,
+        previous_role: prevTurn?.role,
+        previous_content: prevTurn?.content,
+        persist: true,
+      });
+      for (const c of candidates) {
+        if (c.status === 'rate_limited') {
+          dailyLimitReached = true;
+          break;
+        }
+      }
+      if (candidates.length > 0) {
+        results.push({ turn_id: turn.id, candidates });
+      }
+    }
+    return {
+      success: true,
+      processed: turns.length,
+      extracted: results.length,
+      daily_limit_reached: dailyLimitReached,
+      results,
+    };
+  } catch (err) {
+    reply.code(500);
+    return KnowledgeBasePresenter.presentError(err, 500);
+  }
+});
+
 /** 启动新的记忆会话 */
-fastify.post('/api/memory/session/start', async (request, reply) => {
+fastify.post('/api/memory/session/start', { preHandler: [validateBody(StartMemorySessionRequest)] }, async (request, reply) => {
   try {
     const { project_id, title, created_at, session_id } = request.body;
     const result = await knowledgeBase.startMemorySession({ projectId: project_id, title, createdAt: created_at, sessionId: session_id });
@@ -113,19 +354,41 @@ fastify.post('/api/memory/session/reset', async (request, reply) => {
 fastify.post('/api/memory/session/import-transcript', async (request, reply) => {
   try {
     const { transcript_path, transcript_id, transcripts_root, project_id, title, created_at, session_id } = request.body;
+    if (transcript_path) {
+      const resolved = path.resolve(transcript_path);
+      let realPath;
+      try {
+        realPath = fs.realpathSync(resolved);
+      } catch {
+        reply.code(403);
+        return { success: false, error: 'Access denied' };
+      }
+      const allowedRoot = fs.realpathSync(path.resolve(PROJECT_ROOT));
+      if (!realPath.startsWith(allowedRoot)) {
+        reply.code(403);
+        return { success: false, error: 'Access denied' };
+      }
+      if (!resolved.endsWith('.md') && !resolved.endsWith('.json') && !resolved.endsWith('.jsonl')) {
+        reply.code(400);
+        return { success: false, error: 'Only .md, .json, .jsonl files are allowed' };
+      }
+    }
     const result = await knowledgeBase.importTranscriptSession({
       transcriptPath: transcript_path, transcriptId: transcript_id, transcriptsRoot: transcripts_root,
       projectId: project_id, title, createdAt: created_at, sessionId: session_id,
     });
-    return { success: true, session_id: result };
+    return { success: true, session_id: result.session_id, warning: result.warning };
   } catch (err) {
     reply.code(500);
     return KnowledgeBasePresenter.presentError(err, 500);
   }
 });
 
-/** 保存记忆（可选走治理流程） */
-fastify.post('/api/memory/save', async (request, reply) => {
+/** 保存记忆（可选走治理流程）
+ *  响应格式: { success: true, memory_id, content, state, status?, ... }
+ *  status 可能值: 'duplicate' | 'rate_limited' | 'governed_kept' | undefined(正常保存)
+ */
+fastify.post('/api/memory/save', { preHandler: [validateBody(MemorySaveRequest)] }, async (request, reply) => {
   try {
     const { session_id, content, state, aliases, path_hints, collection_hints, source, use_governance } = request.body;
     const options = {
@@ -135,6 +398,65 @@ fastify.post('/api/memory/save', async (request, reply) => {
       ? await knowledgeBase.saveMemoryWithGovernance(options)
       : knowledgeBase.saveMemory(options);
     return { success: true, ...result };
+  } catch (err) {
+    reply.code(500);
+    return KnowledgeBasePresenter.presentError(err, 500);
+  }
+});
+
+/** 获取单条记忆 */
+fastify.get('/api/memory/:id', async (request, reply) => {
+  try {
+    const { id } = request.params;
+    const memory = await knowledgeBase.getMemory(id);
+    if (!memory) {
+      reply.code(404);
+      return { success: false, error: 'Memory not found' };
+    }
+    return { success: true, data: memory };
+  } catch (err) {
+    reply.code(500);
+    return KnowledgeBasePresenter.presentError(err, 500);
+  }
+});
+
+/** 更新记忆内容 */
+fastify.put('/api/memory/:id', async (request, reply) => {
+  try {
+    const { id } = request.params;
+    const { content } = request.body || {};
+    if (!content || content.trim().length === 0) {
+      reply.code(400);
+      return { success: false, error: 'content is required' };
+    }
+    const existing = await knowledgeBase.getMemory(id);
+    if (!existing) {
+      reply.code(404);
+      return { success: false, error: 'Memory not found' };
+    }
+    const updated = await knowledgeBase.updateMemoryContent(id, content);
+    if (!updated) {
+      reply.code(404);
+      return { success: false, error: 'Memory not found or update failed' };
+    }
+    return { success: true, data: updated };
+  } catch (err) {
+    reply.code(500);
+    return KnowledgeBasePresenter.presentError(err, 500);
+  }
+});
+
+/** 删除记忆 */
+fastify.delete('/api/memory/:id', async (request, reply) => {
+  try {
+    const { id } = request.params;
+    const existing = await knowledgeBase.getMemory(id);
+    if (!existing) {
+      reply.code(404);
+      return { success: false, error: 'Memory not found' };
+    }
+    await knowledgeBase.deleteMemory(id);
+    return { success: true, memory_id: id, action: 'deleted' };
   } catch (err) {
     reply.code(500);
     return KnowledgeBasePresenter.presentError(err, 500);
@@ -162,7 +484,7 @@ fastify.get('/api/memory/reviews', async (request, reply) => {
   try {
     const { limit } = request.query;
     const items = knowledgeBase.listReviews(parseInt(limit) || 50);
-    return { reviews: items, count: items.length };
+    return successResponse({ reviews: items, count: items.length });
   } catch (err) {
     reply.code(500);
     return KnowledgeBasePresenter.presentError(err, 500);
@@ -213,7 +535,7 @@ fastify.post('/api/memory/reviews/:id/discard', async (request, reply) => {
 fastify.get('/api/health', async (request, reply) => {
   try {
     const result = await knowledgeBase.healthSnapshot();
-    return result;
+    return successResponse(result);
   } catch (err) {
     reply.code(500);
     return KnowledgeBasePresenter.presentError(err, 500);
@@ -234,10 +556,10 @@ fastify.get('/api/health/ready', async (request, reply) => {
 // ========== Benchmark Endpoints ==========
 
 /** 记录一次基准测试结果 */
-fastify.post('/api/benchmarks/record', async (request, reply) => {
+fastify.post('/api/benchmarks/record', { preHandler: [validateBody(BenchmarkResultRequest)] }, async (request, reply) => {
   try {
     const result = await knowledgeBase.recordBenchmarkResult(request.body);
-    return result;
+    return successResponse(result);
   } catch (err) {
     reply.code(500);
     return KnowledgeBasePresenter.presentError(err, 500);
@@ -249,7 +571,7 @@ fastify.get('/api/benchmarks/latest', async (request, reply) => {
   try {
     const { suite_name } = request.query;
     const result = await knowledgeBase.latestBenchmark(suite_name);
-    return result || {};
+    return successResponse(result || {});
   } catch (err) {
     reply.code(500);
     return KnowledgeBasePresenter.presentError(err, 500);
@@ -261,7 +583,7 @@ fastify.get('/api/benchmarks/history', async (request, reply) => {
   try {
     const { suite_name, limit } = request.query;
     const result = await knowledgeBase.benchmarkHistory(suite_name, parseInt(limit) || 20);
-    return result || [];
+    return successResponse(result || []);
   } catch (err) {
     reply.code(500);
     return KnowledgeBasePresenter.presentError(err, 500);
@@ -287,7 +609,7 @@ fastify.post('/api/wiki/search', async (request, reply) => {
   try {
     const { query, top_k } = request.body;
     const result = knowledgeBase.wikiSearch(query, top_k || 5);
-    return { results: result };
+    return successResponse({ results: result });
   } catch (err) {
     reply.code(500);
     return KnowledgeBasePresenter.presentError(err, 500);
@@ -298,7 +620,7 @@ fastify.post('/api/wiki/search', async (request, reply) => {
 fastify.get('/api/wiki/check-stale', async (request, reply) => {
   try {
     const result = knowledgeBase.wikiIsStale();
-    return result;
+    return successResponse(result);
   } catch (err) {
     reply.code(500);
     return KnowledgeBasePresenter.presentError(err, 500);
@@ -309,7 +631,74 @@ fastify.get('/api/wiki/check-stale', async (request, reply) => {
 fastify.get('/api/wiki/status', async (request, reply) => {
   try {
     const result = knowledgeBase.wikiGetStatus();
-    return result;
+    return successResponse(result);
+  } catch (err) {
+    reply.code(500);
+    return KnowledgeBasePresenter.presentError(err, 500);
+  }
+});
+
+/** 检测 Wiki 源文件变更 */
+fastify.post('/api/wiki/detect-changes', async (request, reply) => {
+  try {
+    const result = knowledgeBase.wikiDetectChanges();
+    return successResponse(result);
+  } catch (err) {
+    reply.code(500);
+    return KnowledgeBasePresenter.presentError(err, 500);
+  }
+});
+
+/** 生成 Wiki 编译提示词 */
+fastify.post('/api/wiki/compile-prompt', async (request, reply) => {
+  try {
+    const { changesResult } = request.body;
+    const result = knowledgeBase.wikiGenerateCompilePrompt(changesResult);
+    return successResponse({ prompt: result });
+  } catch (err) {
+    reply.code(500);
+    return KnowledgeBasePresenter.presentError(err, 500);
+  }
+});
+
+/** 保存 Wiki 编译页面 */
+fastify.post('/api/wiki/save-page', async (request, reply) => {
+  try {
+    const { sourcePath, wikiPageName, content, sourceId } = request.body;
+    if (!sourcePath || !wikiPageName || !content) {
+      reply.code(400);
+      return { error: 'BadRequest', message: 'Missing required fields: sourcePath, wikiPageName, content', code: 400 };
+    }
+    const result = knowledgeBase.wikiSavePage({ sourcePath, wikiPageName, content, sourceId });
+    return successResponse(result);
+  } catch (err) {
+    reply.code(500);
+    return KnowledgeBasePresenter.presentError(err, 500);
+  }
+});
+
+/** 删除 Wiki 页面 */
+fastify.post('/api/wiki/remove-page', async (request, reply) => {
+  try {
+    const { wikiPageName } = request.body;
+    if (!wikiPageName) {
+      reply.code(400);
+      return { error: 'BadRequest', message: 'Missing required field: wikiPageName', code: 400 };
+    }
+    const result = knowledgeBase.wikiRemovePage(wikiPageName);
+    return successResponse(result);
+  } catch (err) {
+    reply.code(500);
+    return KnowledgeBasePresenter.presentError(err, 500);
+  }
+});
+
+/** 更新 Wiki 总索引 */
+fastify.post('/api/wiki/update-index', async (request, reply) => {
+  try {
+    const { pages } = request.body;
+    const result = knowledgeBase.wikiUpdateIndex(pages);
+    return successResponse(result);
   } catch (err) {
     reply.code(500);
     return KnowledgeBasePresenter.presentError(err, 500);
@@ -320,17 +709,6 @@ fastify.get('/api/wiki/status', async (request, reply) => {
 
 /** 重建 localMem 索引（梦境循环 Deep Sleep 使用） */
 fastify.post('/api/rebuild', async (request, reply) => {
-  try {
-    const result = await knowledgeBase.rebuildLocalMem();
-    return { success: true, ...result };
-  } catch (err) {
-    reply.code(500);
-    return KnowledgeBasePresenter.presentError(err, 500);
-  }
-});
-
-/** 重建 localMem 索引（GET 版本，兼容无 body 调用） */
-fastify.get('/api/rebuild', async (request, reply) => {
   try {
     const result = await knowledgeBase.rebuildLocalMem();
     return { success: true, ...result };
@@ -359,8 +737,16 @@ fastify.post('/api/memory/review', async (request, reply) => {
   try {
     const { memory_id, action, publish_target, updated_at } = request.body;
     if (action === 'promote' || action === 'keep') {
-      const result = knowledgeBase.promoteReview(memory_id);
-      return { success: true, ...result };
+      try {
+        const result = knowledgeBase.promoteReview(memory_id);
+        return { success: true, ...result };
+      } catch (err) {
+        if (err.message && err.message.includes('not in tentative state')) {
+          reply.code(409);
+          return { success: false, error: err.message, code: 409 };
+        }
+        throw err;
+      }
     }
     if (action === 'discard') {
       const result = knowledgeBase.discardReview(memory_id);
@@ -381,7 +767,25 @@ const metrics = {
   errorCount: 0,
   memoryQueryCount: 0,
   memoryTurnCount: 0,
+  autoTriageSuccessCount: 0,
+  autoTriageFailCount: 0,
+  autoTriageConsecutiveFails: 0,
+  autoTriageDisabled: false,
+  autoTriageDisabledAt: null,
 };
+
+const AUTOTRIAGE_RECOVERY_MS = 30 * 60 * 1000;
+setInterval(() => {
+  if (metrics.autoTriageDisabled && metrics.autoTriageDisabledAt) {
+    const disabledAt = new Date(metrics.autoTriageDisabledAt).getTime();
+    if (Date.now() - disabledAt >= AUTOTRIAGE_RECOVERY_MS) {
+      metrics.autoTriageDisabled = false;
+      metrics.autoTriageDisabledAt = null;
+      metrics.autoTriageConsecutiveFails = 0;
+      fastify.log.info('autoTriage disabled flag auto-reset after recovery timeout');
+    }
+  }
+}, 60 * 1000);
 
 fastify.addHook('onResponse', async (request, reply) => {
   metrics.requestCount += 1;
@@ -400,6 +804,17 @@ fastify.addHook('onResponse', async (request, reply) => {
 fastify.get('/metrics', async (request, reply) => {
   const mem = process.memoryUsage();
   const uptime = Date.now() - metrics.startTime;
+  let memoryStats = null;
+  try {
+    const store = knowledgeBase?.memoryFacade?.localMemory?._store;
+    if (store?.db) {
+      const summary = store.statsSummary();
+      const turnCount = store.db.prepare('SELECT COUNT(*) as cnt FROM turns').get()?.cnt || 0;
+      memoryStats = { kept_items: summary.kept, tentative_items: summary.tentative, turns: turnCount, sessions: summary.sessions };
+    }
+  } catch (metricsErr) {
+    fastify.log.warn(`Failed to get memory stats for metrics: ${metricsErr.message}`);
+  }
   return {
     uptime_ms: uptime,
     requests_total: metrics.requestCount,
@@ -411,6 +826,14 @@ fastify.get('/metrics', async (request, reply) => {
       heap_used_mb: Math.round(mem.heapUsed / 1024 / 1024),
       heap_total_mb: Math.round(mem.heapTotal / 1024 / 1024),
       external_mb: Math.round(mem.external / 1024 / 1024),
+    },
+    memory: memoryStats,
+    auto_triage: {
+      success_total: metrics.autoTriageSuccessCount,
+      fail_total: metrics.autoTriageFailCount,
+      consecutive_fails: metrics.autoTriageConsecutiveFails,
+      disabled: metrics.autoTriageDisabled,
+      disabled_at: metrics.autoTriageDisabledAt,
     },
   };
 });
@@ -424,6 +847,30 @@ let socketServer = null;
  */
 const start = async () => {
   try {
+    if (!API_SECRET) {
+      console.warn('⚠️  WARNING: OPENCLAW_API_SECRET is not set. API authentication is DISABLED. All endpoints are publicly accessible.');
+    }
+
+    try {
+      const store = knowledgeBase?.memoryFacade?.localMemory?._store;
+      if (store?.db) {
+        const recentFail = store.db.prepare(
+          `SELECT created_at, payload_json FROM memory_events WHERE event_type = 'auto_triage_failure' ORDER BY created_at DESC LIMIT 1`
+        ).get();
+        if (recentFail) {
+          const data = JSON.parse(recentFail.payload_json || '{}');
+          if (data.consecutiveFails >= 5) {
+            metrics.autoTriageDisabled = true;
+            metrics.autoTriageDisabledAt = recentFail.created_at;
+            metrics.autoTriageConsecutiveFails = data.consecutiveFails;
+            fastify.log.warn(`autoTriage restored to disabled state from persistent events (consecutiveFails=${data.consecutiveFails})`);
+          }
+        }
+      }
+    } catch (restoreErr) {
+      fastify.log.warn(`Failed to restore autoTriage state: ${restoreErr.message}`);
+    }
+
     // TCP 入口（供网关使用）
     await fastify.listen({ host: HTTP_HOST, port: HTTP_PORT });
     console.log(`HTTP server listening on ${HTTP_HOST}:${HTTP_PORT}`);
@@ -437,7 +884,61 @@ const start = async () => {
         }
         socketServer = net.createServer((clientSocket) => {
           const serverSocket = net.connect(HTTP_PORT, HTTP_HOST);
-          clientSocket.pipe(serverSocket);
+
+          if (API_SECRET) {
+            let headerBuffer = Buffer.alloc(0);
+            let headerInjected = false;
+            let headerParsed = false;
+
+            clientSocket.on('data', (chunk) => {
+              if (headerParsed) {
+                serverSocket.write(chunk);
+                return;
+              }
+
+              headerBuffer = Buffer.concat([headerBuffer, chunk]);
+              const headerStr = headerBuffer.toString('utf-8');
+              let headerEndIdx = headerStr.indexOf('\r\n\r\n');
+              if (headerEndIdx === -1) {
+                headerEndIdx = headerStr.indexOf('\n\n');
+              }
+
+              if (headerEndIdx === -1) {
+                return;
+              }
+
+              headerParsed = true;
+              const beforeHeaders = headerStr.slice(0, headerEndIdx);
+              const afterHeaders = headerStr.slice(headerEndIdx + (headerStr.indexOf('\r\n\r\n') !== -1 ? 4 : 2));
+
+              const headerLines = beforeHeaders.split(/\r?\n/);
+              for (const line of headerLines) {
+                if (line.toLowerCase().startsWith('authorization:')) {
+                  const errResp = 'HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{"error":"Authorization header not allowed on Unix socket"}';
+                  clientSocket.write(errResp, () => clientSocket.destroy());
+                  return;
+                }
+              }
+
+              const authHeader = `Authorization: Bearer ${API_SECRET}`;
+              const separator = headerStr.indexOf('\r\n\r\n') !== -1 ? '\r\n' : '\n';
+              const injected = Buffer.from(
+                beforeHeaders + separator + authHeader + separator + separator + afterHeaders,
+                'utf-8'
+              );
+              headerInjected = true;
+              serverSocket.write(injected);
+            });
+
+            clientSocket.on('end', () => {
+              if (!headerParsed && headerBuffer.length > 0) {
+                serverSocket.write(headerBuffer);
+              }
+            });
+          } else {
+            clientSocket.pipe(serverSocket);
+          }
+
           serverSocket.pipe(clientSocket);
           clientSocket.on('error', (err) => {
             console.error(`[UnixSocket] client error: ${err.message}`);
@@ -492,5 +993,24 @@ async function shutdown(signal) {
 
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
+
+process.on('uncaughtException', (err) => {
+  console.error(`[uncaughtException] ${err.message}\n${err.stack}`);
+  try {
+    const store = knowledgeBase?.memoryFacade?.localMemory?._store;
+    if (store) {
+      store.checkpoint();
+      store.close();
+    }
+  } catch (closeErr) {
+    console.error(`[uncaughtException] emergency close failed: ${closeErr.message}`);
+  }
+  process.exit(1);
+});
+
+process.on('unhandledRejection', (reason) => {
+  console.error(`[unhandledRejection] ${reason}`);
+  shutdown('unhandledRejection');
+});
 
 start();

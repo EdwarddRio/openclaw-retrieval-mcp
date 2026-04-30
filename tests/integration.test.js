@@ -35,9 +35,10 @@ describe('Integration Tests', () => {
   it('should return health status', async () => {
     const res = await request('/api/health');
     assert.strictEqual(res.status, 200);
-    assert.ok(res.body.status);
-    assert.ok(res.body.localmem);
-    assert.ok(res.body.timestamp);
+    const body = res.body.data || res.body;
+    assert.ok(body.status);
+    assert.ok(body.localmem);
+    assert.ok(body.timestamp);
   });
 
   it('should return ready probe', async () => {
@@ -83,7 +84,11 @@ describe('Integration Tests', () => {
       top_k: 3,
     });
     assert.strictEqual(res.status, 200);
-    assert.ok(typeof res.body.confidence === 'number');
+    const body = res.body;
+    assert.ok(body.query);
+    assert.ok(typeof body.freshness_level === 'string');
+    assert.ok(body.context);
+    assert.ok(typeof body.context.confidence === 'number');
   });
 
   it('should save and retrieve a memory', async () => {
@@ -97,8 +102,10 @@ describe('Integration Tests', () => {
     assert.ok(saveRes.body.memory_id);
 
     const memId = saveRes.body.memory_id;
-    // Note: there is no direct GET /api/memory/:id endpoint in current API,
-    // so we validate via query-context instead.
+    const getRes = await request(`/api/memory/${memId}`, 'GET');
+    assert.strictEqual(getRes.status, 200);
+    assert.strictEqual(getRes.body.data.memory_id, memId);
+
     const queryRes = await request('/api/memory/query-context', 'POST', {
       query: 'Integration test memory fact',
       top_k: 5,

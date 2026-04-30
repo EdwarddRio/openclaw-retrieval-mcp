@@ -6,10 +6,9 @@
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
-import { v4 as uuidv4 } from 'uuid';
-import { logger, LOCALMEM_DIR, LOCALMEM_FACT_MAX_AGE_DAYS, PROJECT_ROOT, LOCALMEM_DAILY_WRITE_LIMIT } from '../config.js';
+import { logger, LOCALMEM_DIR, LOCALMEM_FACT_MAX_AGE_DAYS, LOCALMEM_SESSION_MAX_AGE_DAYS, PROJECT_ROOT, LOCALMEM_DAILY_WRITE_LIMIT } from '../config.js';
 import { SqliteStore } from './sqlite-store.js';
-import { ChatTurn, ChatSession, MemoryFact, isoNow, canonicalKeyForText, TRIAGE_CONFIRM_SIGNALS, TRIAGE_DISCARD_SIGNALS, TRIAGE_MIN_CONTENT_LENGTH, TRIAGE_MAX_CONTENT_LENGTH } from './models.js';
+import { ChatTurn, ChatSession, MemoryFact, isoNow, canonicalKeyForText, computeRelevanceScore, TRIAGE_CONFIRM_SIGNALS, TRIAGE_DISCARD_SIGNALS, TRIAGE_MIN_CONTENT_LENGTH, TRIAGE_MAX_CONTENT_LENGTH, RELEVANCE_WEIGHTS } from './models.js';
 import { planKnowledgeUpdate } from './governance.js';
 
 // ========== Saveable states ==========
@@ -54,13 +53,45 @@ export class LocalMemoryStore {
     this._statePath = path.join(this._root, 'meta', 'state.json');
     
     this._factMaxAgeDays = options.factMaxAgeDays || LOCALMEM_FACT_MAX_AGE_DAYS;
+    this._lastCleanupAt = Date.now();
+    this._cleanupInProgress = false;
     
     this._ensureLayout();
     this._store = new SqliteStore(this._dbPath);
+
+    this._cleanupTimer = setInterval(() => {
+      this._maybePeriodicCleanup();
+    }, 60 * 60 * 1000);
+    this._cleanupTimer.unref();
+    setTimeout(() => this._maybePeriodicCleanup(), 5000).unref();
+  }
+
+  /**
+   * 获取指定时间范围内的对话轮次（供批量 auto-triage 使用）
+   * @param {number} hours - 查询最近多少小时的轮次，范围 1-168
+   * @returns {Array<Object>} 轮次列表
+   */
+  getTurnsSince(hours) {
+    const safeHours = Math.max(1, Math.min(168, parseInt(hours) || 24));
+    return this._store.getTurnsSince(safeHours);
+  }
+
+  /**
+   * 获取指定会话中指定时间之前的最近一条轮次
+   * @param {string} sessionId - 会话 ID
+   * @param {string} beforeTime - ISO 时间字符串
+   * @returns {Object|null} 轮次对象
+   */
+  getPreviousTurn(sessionId, beforeTime) {
+    return this._store.getPreviousTurn(sessionId, beforeTime);
   }
 
   /** 关闭数据库连接 */
   close() {
+    if (this._cleanupTimer) {
+      clearInterval(this._cleanupTimer);
+      this._cleanupTimer = null;
+    }
     if (this._store) {
       this._store.close();
       this._store = null;
@@ -183,14 +214,23 @@ export class LocalMemoryStore {
    * 完整记忆查询，返回命中结果、暂定条目、新鲜度信息和弃权信号
    * @param {string} query - 查询文本
    * @param {number} [topK=3] - 返回结果数量上限
-   * @param {string} [sessionId] - 会话 ID（未使用）
+   * @param {string} [sessionId] - 会话 ID（⚠️ 当前未实现会话范围过滤，查询始终为全局范围，保留供未来扩展）
    * @returns {{ hits: Array, tentative_items: Array, freshness: Object, abstention_signals: Object, memory_context: Object }}
    */
   queryMemoryFull(query, topK = 3, sessionId = null) {
-    this._maybePeriodicCleanup();
     const hits = this._store.queryMemory(query, topK);
+    for (const hit of hits) {
+      hit._relevanceScore = computeRelevanceScore(query, hit, RELEVANCE_WEIGHTS.search);
+    }
+    if (hits.length > 0) {
+      const queryHash = crypto.createHash('sha256').update(query.trim().toLowerCase()).digest('hex').slice(0, 12);
+      for (const hit of hits) {
+        this._store.addQueryHash(hit.memory_id, queryHash);
+      }
+    }
     const tentativeItems = this._store.listMemoryByState('tentative', topK);
     const freshness = this._freshnessPayload(hits);
+    const computedConfidence = this._computeConfidence(query, hits);
     const memoryContext = {
       query,
       matched_sessions: [],
@@ -199,9 +239,9 @@ export class LocalMemoryStore {
       path_hints: [...new Set(hits.flatMap(item => item.path_hints || []))],
       collection_hints: [...new Set(hits.flatMap(item => item.collection_hints || []))],
       recency_hint: hits[0]?.updated_at || null,
-      confidence: hits[0] ? 1.0 : 0.0,
+      confidence: computedConfidence,
       memory_intent: false,
-      confidence_applied: false,
+      confidence_applied: true,
       lookup_performed: true,
       skipped_reason: null,
       timeline_summary: { memory_ids: hits.map(h => h.memory_id), event_count: 0, recent_events: [] },
@@ -213,7 +253,7 @@ export class LocalMemoryStore {
       freshness_level: freshness.level,
       staleness_note: freshness.note,
       age_days: freshness.age_days,
-      confidence_level: hits.length > 0 ? 'medium' : 'low',
+      confidence_level: this._confidenceLevel(computedConfidence),
       never_seen_entities: [],
       should_abstain: hits.length === 0,
       abstain_reason: hits.length === 0 ? 'no_v2_hits' : '',
@@ -243,8 +283,6 @@ export class LocalMemoryStore {
    * @returns {Object} 记忆上下文对象，包含 aliases、path_hints、freshness_level 等
    */
   queryMemoryContext(query, topK = 3, sessionId = null) {
-    this._maybePeriodicCleanup();
-    // 如果未传 sessionId，尝试获取当前活跃会话
     if (!sessionId) {
       const activeSession = this._store.getActiveSession ? this._store.getActiveSession() : null;
       sessionId = activeSession?.session_id || null;
@@ -260,27 +298,34 @@ export class LocalMemoryStore {
       const insight = this._buildRetrievalInsight({ query, hits, freshness });
       if (insight) {
         try {
-          this.appendTurn({
-            session_id: sessionId,
-            role: 'system',
-            content: `[检索洞察] ${insight}`,
-            references: { synthetic: 'retrieval_summary', insight_type: 'memory_query' },
-          });
+          const recentInsightCount = this._store.getRecentInsightCount(sessionId);
+          if (recentInsightCount < 3) {
+            this.appendTurn({
+              session_id: sessionId,
+              role: 'system',
+              content: `[检索洞察] ${insight}`,
+              references: { synthetic: 'retrieval_summary', insight_type: 'memory_query' },
+            });
+          }
         } catch (err) {
           logger.warn(`Insight injection failed: ${err.message}`);
         }
       }
     }
 
+    const computedConfidence = this._computeConfidence(query, hits);
+    const computedLevel = this._confidenceLevel(computedConfidence);
+
     return {
       query,
+      hits,
       matched_sessions: [],
       matched_turns: [],
       aliases,
       path_hints: pathHints,
       collection_hints: collectionHints,
       recency_hint: hits[0]?.updated_at || null,
-      confidence: hits[0] ? 1.0 : 0.0,
+      confidence: computedConfidence,
       memory_intent: false,
       confidence_applied: hits.length > 0,
       lookup_performed: true,
@@ -294,7 +339,7 @@ export class LocalMemoryStore {
       freshness_level: freshness.level,
       staleness_note: freshness.note,
       age_days: freshness.age_days,
-      confidence_level: hits.length > 0 ? 'medium' : 'low',
+      confidence_level: computedLevel,
       never_seen_entities: [],
       should_abstain: hits.length === 0,
       abstain_reason: hits.length === 0 ? 'no_v2_hits' : '',
@@ -305,7 +350,7 @@ export class LocalMemoryStore {
         total_hits: hits.length,
         session_hits: 0,
         memory_hits: hits.length,
-        has_high_confidence: hits.length > 0,
+        has_high_confidence: computedConfidence >= 0.7,
         has_relevant_sessions: false,
         has_relevant_memories: hits.length > 0,
       },
@@ -357,13 +402,24 @@ export class LocalMemoryStore {
       }
     }
 
-    const memoryId = `${session_id}-${crypto.randomBytes(4).toString('hex')}`;
+    const memoryId = crypto.randomUUID();
     const now = created_at || isoNow();
 
     const filteredPathHints = this._filterPathHints(path_hints || []);
     const normalizedAliases = [...new Set(aliases || [])];
     const normalizedCollectionHints = [...new Set(collection_hints || [])];
     const canonicalKey = canonicalKeyForText(content.trim());
+
+    const existingByCk = this._store.getMemoryByCanonicalKey(canonicalKey);
+    if (existingByCk && existingByCk.memory_id !== memoryId) {
+      return {
+        memory_id: existingByCk.memory_id,
+        content: content.trim(),
+        state: normalizedState,
+        status: 'duplicate',
+        duplicate_of: existingByCk.memory_id,
+      };
+    }
 
     const saved = this._store.saveMemory(new MemoryFact({
       memory_id: memoryId,
@@ -378,10 +434,13 @@ export class LocalMemoryStore {
       created_at: now,
     }));
 
-    this._store.updateSession && this._store.updateSession(session_id, { updated_at: now });
+    if (session_id && this._store.updateSession) {
+      this._store.updateSession(session_id, { updated_at: now });
+    }
     this._writeState({ last_memory_id: memoryId, last_updated_at: now });
 
     // Timeline event
+    let timelineEventSaved = true;
     try {
       this._store.addEvent({
         memory_id: memoryId,
@@ -391,9 +450,10 @@ export class LocalMemoryStore {
       });
     } catch (error) {
       logger.warn(`Failed to append timeline event: ${error}`);
+      timelineEventSaved = false;
     }
 
-    return saved;
+    return { ...saved, timeline_event_saved: timelineEventSaved };
   }
 
   /**
@@ -416,8 +476,9 @@ export class LocalMemoryStore {
     if (updated) {
       const now = isoNow();
       this._writeState({ last_memory_id: memoryId, last_updated_at: now });
+      return this._store.getMemory(memoryId);
     }
-    return updated;
+    return null;
   }
 
   /**
@@ -531,10 +592,10 @@ export class LocalMemoryStore {
     if (minAge === Infinity) {
       return { level: 'unknown', note: 'Unable to determine freshness', age_days: null };
     }
-    if (minAge < 1) return { level: 'fresh', note: 'Recently updated', age_days: Math.floor(minAge) };
-    if (minAge < 7) return { level: 'recent', note: 'Updated within a week', age_days: Math.floor(minAge) };
-    if (minAge < 30) return { level: 'stale', note: 'Updated within a month', age_days: Math.floor(minAge) };
-    return { level: 'old', note: 'Not updated recently', age_days: Math.floor(minAge) };
+    if (minAge < 1) return { level: 'fresh', note: 'Recently updated', age_days: Math.round(minAge * 10) / 10 };
+    if (minAge < 7) return { level: 'recent', note: 'Updated within a week', age_days: Math.round(minAge) };
+    if (minAge < 30) return { level: 'stale', note: 'Updated within a month', age_days: Math.round(minAge) };
+    return { level: 'old', note: 'Not updated recently', age_days: Math.round(minAge) };
   }
 
   /**
@@ -571,9 +632,11 @@ export class LocalMemoryStore {
     if (this._lastCleanupAt && (now - this._lastCleanupAt) < twentyFourHours) {
       return;
     }
+    if (this._cleanupInProgress) return;
+    this._cleanupInProgress = true;
     this._lastCleanupAt = now;
     try {
-      const sessionAge = Math.min(this._factMaxAgeDays || 180, 60);
+      const sessionAge = LOCALMEM_SESSION_MAX_AGE_DAYS || 60;
       const turnResult = this._store.cleanupOldTurns(sessionAge);
       const sessionResult = this._store.cleanupOldSessions(sessionAge);
       const eventResult = this._store.cleanupOldEvents(30);
@@ -582,8 +645,15 @@ export class LocalMemoryStore {
         `Periodic cleanup: turns=${turnResult.deleted}, sessions=${sessionResult.deleted}, ` +
         `events=${eventResult.deleted}, tentative=${tentativeResult.deleted}`
       );
+      this._cleanupConsecutiveFails = 0;
     } catch (err) {
-      logger.warn(`Periodic cleanup failed: ${err.message}`);
+      this._cleanupConsecutiveFails = (this._cleanupConsecutiveFails || 0) + 1;
+      logger.warn(`Periodic cleanup failed (${this._cleanupConsecutiveFails} consecutive): ${err.message}`);
+      if (this._cleanupConsecutiveFails >= 3) {
+        logger.error(`Periodic cleanup has failed ${this._cleanupConsecutiveFails} times in a row - data may accumulate`);
+      }
+    } finally {
+      this._cleanupInProgress = false;
     }
   }
 
@@ -594,7 +664,7 @@ export class LocalMemoryStore {
     const { session_id, role, content, previous_role, previous_content, persist = true, side_llm_gateway } = options;
     const candidates = [];
 
-    if (role === 'assistant' && this._shouldKeepCandidate(content, side_llm_gateway)) {
+    if (role === 'assistant' && this._shouldKeepCandidate(content) && this._isKnowledgeAssertion(content)) {
       const aliases = this._extractAliasesFromContent(content);
       if (persist) {
         const saved = await this.saveMemoryWithGovernance({
@@ -620,7 +690,7 @@ export class LocalMemoryStore {
 
     if (role === 'user' && this._containsExplicitMemoryRequest(content)) {
       const extracted = this._extractMemoryFromUserMessage(content, previous_content);
-      if (extracted && this._shouldKeepCandidate(extracted, side_llm_gateway)) {
+      if (extracted && this._shouldKeepCandidate(extracted)) {
         const aliases = this._extractAliasesFromContent(extracted);
         if (persist) {
           const saved = await this.saveMemoryWithGovernance({
@@ -667,7 +737,23 @@ export class LocalMemoryStore {
       return this.saveMemory(options);
     }
 
-    const facts = this._store.listActiveFacts(500);
+    const candidateContent = (options.content || '').trim();
+    const tokenRe = /[A-Za-z0-9_]+|[\u4e00-\u9fff]+/g;
+    const allTokens = candidateContent.toLowerCase().match(tokenRe) || [];
+    const keywords = allTokens.filter(t => t.length > 1).slice(0, 5);
+
+    let facts;
+    if (keywords.length > 0) {
+      const allFacts = this._store.listActiveFacts(500);
+      facts = allFacts.filter(f => {
+        const content = (f.content || '').toLowerCase();
+        return keywords.some(kw => content.includes(kw));
+      });
+      if (facts.length < 3) facts = allFacts.slice(0, 50);
+    } else {
+      facts = this._store.listActiveFacts(50);
+    }
+
     const plan = await planKnowledgeUpdate({
       content: options.content || '',
       aliases: options.aliases || [],
@@ -713,7 +799,7 @@ export class LocalMemoryStore {
    * @returns {Object} 替代结果，包含 oldMemoryId 和 newMemory
    */
   supersedeMemory(oldMemoryId, options) {
-    const memoryId = `${options.session_id || 'manual'}-${crypto.randomBytes(4).toString('hex')}`;
+    const memoryId = crypto.randomUUID();
     const now = options.created_at || isoNow();
     const newMemory = new MemoryFact({
       memory_id: memoryId,
@@ -750,7 +836,7 @@ export class LocalMemoryStore {
    * @param {Object} [sideLlmGateway] - 侧边 LLM 网关（预留参数）
    * @returns {boolean} 是否值得保留
    */
-  _shouldKeepCandidate(content, sideLlmGateway) {
+  _shouldKeepCandidate(content) {
     if (!content || content.length < TRIAGE_MIN_CONTENT_LENGTH) return false;
     const cleaned = content.trim();
     if (cleaned.length > TRIAGE_MAX_CONTENT_LENGTH) return false;
@@ -763,15 +849,40 @@ export class LocalMemoryStore {
       return true;
     }
 
-    // 🔥 收紧 assistant 过滤：必须包含结构化信号
+    const TIME_SENSITIVE_PATTERNS = [
+      /\d{4}[-/]\d{1,2}[-/]\d{1,2}/,
+      /\d{1,2}:\d{2}(:\d{2})?/,
+      /[\u4e00-\u9fff]{0,4}(开盘|收盘|午间|盘中|盘后|简报|速评|复盘|行情|涨跌|涨幅|跌幅|上涨|下跌|涨停|跌停)/,
+      /[\u4e00-\u9fff]{0,4}(梦境|Dream|dream|浅睡|深睡|REM)/,
+      /[\u4e00-\u9fff]{0,4}(systemd|service|daemon|超时|timeout)/,
+    ];
+    if (TIME_SENSITIVE_PATTERNS.some(p => p.test(cleaned))) return false;
+
     const ASSISTANT_VALUE_PATTERNS = [
-      /【.*】/,           // 有标题块
-      /^(步骤|流程|规则|方案|配置|模板|错误|注意|教训|建议|修复|完成|更新|删除|创建|推送)/,
-      /已(修复|完成|更新|删除|创建|推送)/,
-      /(禁止|必须|优先|默认|统一|固定).{2,30}/,
-      /^(##|###|\d+\.)\s+/, // Markdown 标题/列表
+      /【.*】/,
+      /(禁止|必须|优先|默认|统一|固定).{5,30}/,
+      /^(##|###)\s+.+\n[\s\S]{50,}/,
     ];
     return ASSISTANT_VALUE_PATTERNS.some(p => p.test(cleaned));
+  }
+
+  _isKnowledgeAssertion(content) {
+    const cleaned = content.trim();
+
+    if (/^已(修复|完成|更新|删除|创建|推送)/.test(cleaned)) return false;
+
+    if (cleaned.startsWith('```') && cleaned.endsWith('```')) return false;
+
+    if (cleaned.length < 30) return false;
+
+    if (/(禁止|必须|优先|默认|统一|固定|约定|规则).{5,}/.test(cleaned)) return true;
+
+    if (/【[^】]+】/.test(cleaned)) return true;
+
+    const mdMatch = /^(##|###)\s+(.+)\n([\s\S]{50,})/.exec(cleaned);
+    if (mdMatch) return true;
+
+    return false;
   }
 
   /**
@@ -871,9 +982,15 @@ export class LocalMemoryStore {
     const brackets = content.match(/【([^】]+)】/g) || [];
     aliases.push(...brackets.map(m => m.slice(1, -1).trim()));
     
-    // 2. 大驼峰/蛇形命名（复用现有 _extractAliases）
-    const codeIds = _extractAliases(content);
-    aliases.push(...codeIds);
+    // 2. 大驼峰/蛇形命名（内联正则）
+    const CAMEL_CASE_RE = /(?<![A-Za-z0-9_])[A-Z][A-Za-z0-9]*(?:Service|Action|Mapper|ConfigManager|Impl|Exception|Result|Type|Helper|Controller|Manager|Handler|Factory|Builder|Constants|Config)(?![A-Za-z0-9_])/g;
+    const SNAKE_CASE_RE = /\b[a-z0-9]+(?:_[a-z0-9]+)+\b/g;
+    for (const pattern of [CAMEL_CASE_RE, SNAKE_CASE_RE]) {
+      const matches = String(content).match(pattern) || [];
+      for (const match of matches) {
+        if (!aliases.includes(match)) aliases.push(match);
+      }
+    }
     
     // 3. 动态中文词提取（无需维护词表）
     const dynamicKeywords = this._extractChineseKeywords(content);
@@ -941,7 +1058,6 @@ export class LocalMemoryStore {
    * @returns {Array<Object>} 待审核记忆列表
    */
   listReviews(limit = 50) {
-    this._maybePeriodicCleanup();
     return this._store.listMemoryByState('tentative', limit);
   }
 
@@ -952,7 +1068,6 @@ export class LocalMemoryStore {
    * @returns {Object} 操作结果
    */
   promoteReview(memoryId, evaluation = null) {
-    this._maybePeriodicCleanup();
     const memory = this._store.getMemory(memoryId);
     if (!memory) throw new Error(`Memory not found: ${memoryId}`);
     if (memory.state !== 'tentative') throw new Error(`Memory is not in tentative state: ${memory.state}`);
@@ -964,7 +1079,7 @@ export class LocalMemoryStore {
     if (evaluation) {
       this._store.evaluateMemory(memoryId, evaluation);
     }
-    this._store.updateMemoryState(memoryId, 'kept', { state: 'kept' });
+    this._store.updateMemoryState(memoryId, 'kept');
     this._store.addEvent({
       memory_id: memoryId,
       event_type: autoPromoted ? 'review_auto_promoted' : 'review_promoted',
@@ -992,7 +1107,6 @@ export class LocalMemoryStore {
    * @returns {Object} 操作结果
    */
   discardReview(memoryId) {
-    this._maybePeriodicCleanup();
     const memory = this._store.getMemory(memoryId);
     if (!memory) throw new Error(`Memory not found: ${memoryId}`);
 
@@ -1013,7 +1127,6 @@ export class LocalMemoryStore {
    * @returns {Object} 操作结果
    */
   evaluateReview(memoryId, evaluation) {
-    this._maybePeriodicCleanup();
     const memory = this._store.getMemory(memoryId);
     if (!memory) throw new Error(`Memory not found: ${memoryId}`);
 
@@ -1042,7 +1155,23 @@ export class LocalMemoryStore {
     }
 
     const updated = { ...current, ...extra };
-    fs.writeFileSync(this._statePath, JSON.stringify(updated, null, 2), 'utf8');
+    const tmpPath = this._statePath + '.tmp';
+    fs.writeFileSync(tmpPath, JSON.stringify(updated, null, 2), 'utf8');
+    fs.renameSync(tmpPath, this._statePath);
+  }
+
+  _computeConfidence(query, hits) {
+    if (!hits || hits.length === 0) return 0.0;
+    const topN = hits.slice(0, Math.min(3, hits.length));
+    const scores = topN.map(h => computeRelevanceScore(query, h, RELEVANCE_WEIGHTS.confidence));
+    return scores.reduce((a, b) => a + b, 0) / scores.length;
+  }
+
+  _confidenceLevel(confidence) {
+    if (confidence >= 0.8) return 'high';
+    if (confidence >= 0.5) return 'medium';
+    if (confidence > 0) return 'low';
+    return 'none';
   }
 }
 

@@ -81,13 +81,19 @@ export class HealthFacade {
   healthBenchmarks() {
     try {
       const latest = this.benchmarkFacade.latestBenchmark();
+      let stale = false;
+      if (latest?.executed_at) {
+        const ageHours = (Date.now() - new Date(latest.executed_at).getTime()) / (1000 * 60 * 60);
+        stale = ageHours > 24;
+      }
       return {
         healthy: true,
         available: true,
         latest_benchmark: latest,
+        stale,
       };
     } catch (err) {
-      return { healthy: false, available: false, error: err.message };
+      return { healthy: false, available: false, stale: false, error: err.message };
     }
   }
 }

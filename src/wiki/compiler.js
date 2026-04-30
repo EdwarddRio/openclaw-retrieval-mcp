@@ -28,8 +28,11 @@ export class WikiCompiler {
     this._wikiDir = path.join(this._llmwikiDir, 'wiki'); // 编译输出目录
     this._schemaPath = path.join(this._llmwikiDir, 'schema.md'); // Wiki 页面 Schema
     this._sourcesPath = path.join(this._llmwikiDir, 'raw-sources.json'); // 数据源配置文件
-    this._manifestPath = path.join(this._llmwikiDir, 'wiki-manifest.json'); // 编译清单
+    this._manifestPath = path.join(this._llmwikiDir, 'wiki-manifest.json');
     this._manifest = new WikiManifest(this._manifestPath);
+    this._searchCache = null;
+    this._searchCacheTime = 0;
+    this._searchCacheTTL = 300000;
   }
 
   /**
@@ -237,6 +240,9 @@ export class WikiCompiler {
 
     logger.info(`Wiki page saved: ${wikiPageName} (from ${sourcePath})`);
 
+    this._searchCache = null;
+    this._searchCacheTime = 0;
+
     return {
       wikiPage: wikiPageName,
       wikiPath: wikiFilePath,
@@ -265,6 +271,9 @@ export class WikiCompiler {
       }
     }
     this._manifest.save();
+
+    this._searchCache = null;
+    this._searchCacheTime = 0;
   }
 
   /**
@@ -353,35 +362,25 @@ export class WikiCompiler {
     if (!query || !query.trim()) return [];
 
     const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
-    const wikiPages = this._listWikiPages();
+    const pageIndex = this._getSearchIndex();
     const scored = [];
 
-    for (const pageName of wikiPages) {
-      const filePath = path.join(this._wikiDir, pageName);
-      if (!fs.existsSync(filePath)) continue;
-      const content = fs.readFileSync(filePath, 'utf-8').toLowerCase();
-      const title = pageName.replace(/\.md$/, '').toLowerCase();
-
+    for (const [pageName, entry] of Object.entries(pageIndex)) {
       let score = 0;
       for (const term of terms) {
-        // Title match counts more
         const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-        const titleCount = (title.match(new RegExp(escaped, 'g')) || []).length;
-        const contentCount = (content.match(new RegExp(escaped, 'g')) || []).length;
+        const titleCount = (entry.title.match(new RegExp(escaped, 'g')) || []).length;
+        const contentCount = (entry.content.match(new RegExp(escaped, 'g')) || []).length;
         score += titleCount * 5 + contentCount;
       }
 
       if (score > 0) {
-        // Read sourceId from manifest
-        this._manifest.load();
-        const entry = Object.values(this._manifest.allEntries)
-          .find(e => e.wikiPage === pageName);
         scored.push({
           pageName,
-          title: pageName.replace(/\.md$/, ''),
+          title: entry.title,
           score,
-          sourceId: entry?.sourceId || '',
-          snippet: fs.readFileSync(filePath, 'utf-8').slice(0, 300),
+          sourceId: entry.sourceId || '',
+          snippet: entry.content.slice(0, 300),
         });
       }
     }
@@ -390,15 +389,49 @@ export class WikiCompiler {
     return scored.slice(0, topK);
   }
 
+  _getSearchIndex() {
+    const now = Date.now();
+    if (this._searchCache && (now - this._searchCacheTime) < this._searchCacheTTL) {
+      return this._searchCache;
+    }
+
+    const wikiPages = this._listWikiPages();
+    this._manifest.load();
+    const index = {};
+
+    for (const pageName of wikiPages) {
+      const filePath = path.join(this._wikiDir, pageName);
+      if (!fs.existsSync(filePath)) continue;
+      const content = fs.readFileSync(filePath, 'utf-8');
+      const title = pageName.replace(/\.md$/, '').toLowerCase();
+      const manifestEntry = Object.values(this._manifest.allEntries).find(e => e.wikiPage === pageName);
+      index[pageName] = {
+        content: content.toLowerCase(),
+        title,
+        sourceId: manifestEntry?.sourceId || '',
+      };
+    }
+
+    this._searchCache = index;
+    this._searchCacheTime = now;
+    return index;
+  }
+
   /**
    * Check if wiki is stale (raw sources changed since last compilation).
    * Lightweight — does not read file contents.
    */
   isStale() {
-    const changes = this.detectChanges();
-    return changes.hasChanges
-      ? { stale: true, summary: changes.summary }
-      : { stale: false, summary: changes.summary };
+    this.ensureDirs();
+    this._manifest.load();
+
+    const currentFiles = this.scanAllSources();
+    const changes = this._manifest.detectChanges(currentFiles);
+
+    const hasChanges = changes.added.length > 0 || changes.modified.length > 0 || changes.deleted.length > 0;
+    return hasChanges
+      ? { stale: true, summary: { added: changes.added.length, modified: changes.modified.length, deleted: changes.deleted.length, unchanged: changes.unchanged.length, total: currentFiles.length } }
+      : { stale: false, summary: { added: 0, modified: 0, deleted: 0, unchanged: changes.unchanged.length, total: currentFiles.length } };
   }
 
   // ========== Private helpers ==========
@@ -478,8 +511,8 @@ export class WikiCompiler {
             results.push(full);
           }
         }
-      } catch {
-        // skip inaccessible dirs
+      } catch (err) {
+        logger.warn(`Failed to walk directory ${d}: ${err.message}`);
       }
     };
 

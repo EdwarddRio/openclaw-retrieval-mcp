@@ -7,33 +7,66 @@ import path from 'path';
 import { BENCHMARKS_DIR } from '../config.js';
 
 export class BenchmarkFacade {
-  /**
-   * 基准测试门面，管理基准测试结果的读写
-   * @param {string} [benchmarkRoot=BENCHMARKS_DIR] - 基准测试数据存放目录
-   */
   constructor(benchmarkRoot = BENCHMARKS_DIR) {
     this.benchmarkRoot = benchmarkRoot;
+    this.maxFileSizeMb = 50;
+    this.maxArchives = 3;
     if (!fs.existsSync(this.benchmarkRoot)) {
       fs.mkdirSync(this.benchmarkRoot, { recursive: true });
     }
   }
 
-  /**
-   * 记录一条基准测试结果，追加写入对应套件的 JSONL 文件
-   * @param {object} payload - 测试结果数据，需包含 suite_name 字段
-   * @returns {object} 带有 recorded_at 时间戳的完整条目
-   */
   recordBenchmarkResult(payload) {
     const suiteName = payload.suite_name;
     const filePath = path.join(this.benchmarkRoot, `${suiteName}.jsonl`);
+
+    if (fs.existsSync(filePath)) {
+      const stats = fs.statSync(filePath);
+      if (stats.size > this.maxFileSizeMb * 1024 * 1024) {
+        this._rotateFile(filePath);
+      }
+    }
 
     const entry = {
       ...payload,
       recorded_at: new Date().toISOString(),
     };
 
-    fs.appendFileSync(filePath, JSON.stringify(entry) + '\n', 'utf-8');
+    let retries = 3;
+    while (retries > 0) {
+      try {
+        fs.appendFileSync(filePath, JSON.stringify(entry) + '\n', 'utf-8');
+        return entry;
+      } catch (err) {
+        retries--;
+        if (retries === 0) throw err;
+      }
+    }
     return entry;
+  }
+
+  _rotateFile(filePath) {
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const archivePath = filePath.replace('.jsonl', `-${timestamp}.jsonl`);
+    try {
+      fs.renameSync(filePath, archivePath);
+    } catch (err) {
+      console.warn(`[BenchmarkFacade] Failed to rotate ${filePath}: ${err.message}`);
+      return;
+    }
+
+    const dir = path.dirname(filePath);
+    const baseName = path.basename(filePath, '.jsonl');
+    const archives = fs.readdirSync(dir)
+      .filter(f => f.startsWith(baseName) && f.endsWith('.jsonl') && f !== path.basename(filePath))
+      .sort()
+      .reverse();
+
+    for (let i = this.maxArchives; i < archives.length; i++) {
+      try {
+        fs.unlinkSync(path.join(dir, archives[i]));
+      } catch {}
+    }
   }
 
   /**

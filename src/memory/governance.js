@@ -48,6 +48,7 @@ export async function planKnowledgeUpdate({
     if (fact.status && fact.status !== 'active') continue;
     const relation = _topicRelation(candidateProfile, fact);
     if (!relation.sameTopic) continue;
+    fact._relationScore = _computeRelationScore(candidateProfile, fact);
     relatedFacts.push(fact);
     if (relation.sameText) {
       exactMatches.push(fact);
@@ -56,6 +57,7 @@ export async function planKnowledgeUpdate({
 
   const sortedRelated = _sortedFacts(relatedFacts);
   const sortedExact = _sortedFacts(exactMatches);
+  sortedRelated.sort((a, b) => (b._relationScore || 0) - (a._relationScore || 0));
   const relatedMemoryIds = sortedRelated
     .map(f => f.memory_id)
     .filter(Boolean);
@@ -71,43 +73,59 @@ export async function planKnowledgeUpdate({
 
   if (relatedMemoryIds.length === 1) {
     const onlyFact = sortedRelated[0];
-    // 🔥 LLM 语义兜底：当 token 匹配不确定时，调用 LLM 二次判断
-    if (sideLlmGateway) {
-      const llmDecision = await _llmSemanticCompare({
-        candidate: content,
-        existing: onlyFact.content || '',
-        sideLlmGateway,
-      });
-      if (llmDecision.sameIntent) {
+    const score = onlyFact._relationScore || 0;
+
+    if (score >= 0.7) {
+      if (sideLlmGateway) {
+        const llmDecision = await _llmSemanticCompare({
+          candidate: content,
+          existing: onlyFact.content || '',
+          sideLlmGateway,
+        });
+        if (llmDecision.sameIntent) {
+          return {
+            strategy: 'keep_existing',
+            suggestedMemoryId: relatedMemoryIds[0],
+            relatedMemoryIds,
+            conflictMemoryIds: [],
+          };
+        }
+        if (llmDecision.confidence >= 0.6) {
+          return {
+            strategy: 'supersede_existing',
+            suggestedMemoryId: relatedMemoryIds[0],
+            relatedMemoryIds,
+            conflictMemoryIds: [relatedMemoryIds[0]],
+          };
+        }
+      }
+      const exactOverlap = candidateProfile.normalizedText &&
+        (onlyFact.content || '').toLowerCase().includes(candidateProfile.normalizedText);
+      if (exactOverlap) {
         return {
-          strategy: 'keep_existing',
+          strategy: 'supersede_existing',
           suggestedMemoryId: relatedMemoryIds[0],
           relatedMemoryIds,
-          conflictMemoryIds: [],
+          conflictMemoryIds: [relatedMemoryIds[0]],
         };
       }
-    }
-    const exactOverlap = candidateProfile.normalizedText &&
-      (onlyFact.content || '').toLowerCase().includes(candidateProfile.normalizedText);
-    if (exactOverlap) {
       return {
-        strategy: 'supersede_existing',
-        suggestedMemoryId: relatedMemoryIds[0],
+        strategy: 'resolve_conflict',
+        suggestedMemoryId: '',
         relatedMemoryIds,
-        conflictMemoryIds: [relatedMemoryIds[0]],
+        conflictMemoryIds: relatedMemoryIds,
       };
     }
-    // 相关性不足，降级为人工审阅
+
     return {
-      strategy: 'resolve_conflict',
+      strategy: 'create_new',
       suggestedMemoryId: '',
       relatedMemoryIds,
-      conflictMemoryIds: relatedMemoryIds,
+      conflictMemoryIds: [],
     };
   }
 
   if (relatedMemoryIds.length > 1) {
-    // 🔥 LLM 语义兜底：多条相关时，检查是否与第一条同意图
     if (sideLlmGateway) {
       const llmDecision = await _llmSemanticCompare({
         candidate: content,
@@ -137,6 +155,41 @@ export async function planKnowledgeUpdate({
     relatedMemoryIds: [],
     conflictMemoryIds: [],
   };
+}
+
+// ------------------------------------------------------------------
+// Relation score computation
+// ------------------------------------------------------------------
+
+function _computeRelationScore(candidateProfile, fact) {
+  const factProfile = _topicProfile(
+    fact.content || '',
+    fact.aliases || [],
+    fact.path_hints || [],
+    fact.collection_hints || [],
+  );
+
+  const aliasOverlap = _setIntersect(candidateProfile.aliases, factProfile.aliases);
+  const pathOverlap = _setIntersect(candidateProfile.paths, factProfile.paths);
+  const collectionOverlap = _setIntersect(candidateProfile.collections, factProfile.collections);
+  const tokenOverlap = _setIntersect(candidateProfile.tokens, factProfile.tokens);
+
+  let score = 0;
+
+  if (aliasOverlap.size > 0) score += 0.35 * Math.min(aliasOverlap.size / Math.max(candidateProfile.aliases.size, 1), 1);
+  if (pathOverlap.size > 0) score += 0.25 * Math.min(pathOverlap.size / Math.max(candidateProfile.paths.size, 1), 1);
+  if (collectionOverlap.size > 0) score += 0.15;
+
+  const tokenRatio = tokenOverlap.size / Math.max(candidateProfile.tokens.size, 1);
+  score += 0.10 * tokenRatio;
+
+  const left = candidateProfile.normalizedText;
+  const right = factProfile.normalizedText;
+  if (left && right && (left.includes(right) || right.includes(left))) {
+    score += 0.15;
+  }
+
+  return Math.min(score, 1.0);
 }
 
 // ------------------------------------------------------------------
@@ -191,10 +244,14 @@ function _topicRelation(candidateProfile, fact) {
   const tokenOverlap = _setIntersect(candidateProfile.tokens, factProfile.tokens);
 
   let sameTopic = aliasOverlap.size > 0 || pathOverlap.size > 0;
-  if (!sameTopic && tokenOverlap.size >= 2) {
+  if (!sameTopic && tokenOverlap.size >= 3) {
     sameTopic = true;
   }
-  if (!sameTopic && tokenOverlap.size >= 2 && collectionOverlap.size > 0) {
+  if (!sameTopic && tokenOverlap.size >= 2) {
+    const overlapRatio = tokenOverlap.size / Math.max(candidateProfile.tokens.size, 1);
+    if (overlapRatio >= 0.4) sameTopic = true;
+  }
+  if (!sameTopic && collectionOverlap.size > 0) {
     sameTopic = true;
   }
   if (!sameTopic) {
@@ -304,22 +361,6 @@ function _normalizePath(pathHint) {
 }
 
 /**
- * 从文本中提取别名（大驼峰类名和蛇形命名标识符）
- * @param {string} text - 原始文本
- * @returns {string[]} 去重后的别名列表
- */
-function _extractAliases(text) {
-  const aliases = [];
-  for (const pattern of [CAMEL_CASE_RE, SNAKE_CASE_RE]) {
-    const matches = String(text).match(pattern) || [];
-    for (const match of matches) {
-      if (!aliases.includes(match)) aliases.push(match);
-    }
-  }
-  return aliases;
-}
-
-/**
  * 对记忆事实排序：优先级(kept>tentative) > 命中次数 > 更新时间 > ID
  * @param {Array<Object>} facts - 待排序的记忆事实列表
  * @returns {Array<Object>} 排序后的列表
@@ -369,28 +410,33 @@ function _setIntersect(a, b) {
  * @returns {Promise<{sameIntent: boolean, confidence: number}>}
  */
 async function _llmSemanticCompare({ candidate, existing, sideLlmGateway }) {
+  const LLM_TIMEOUT_MS = 10000;
   try {
     const prompt = `判断以下两条记忆是否表达同一意图或规则。只输出 JSON：\n\n候选："${candidate.slice(0, 200)}"\n已有："${existing.slice(0, 200)}"\n\n输出格式：{"sameIntent": true/false, "confidence": 0.0-1.0}`;
     
-    const response = await sideLlmGateway.chat({
-      model: 'k2p6',
+    const model = sideLlmGateway.defaultModel || 'k2p6';
+    const chatPromise = sideLlmGateway.chat({
+      model,
       messages: [{ role: 'user', content: prompt }],
       temperature: 0.1,
       max_tokens: 100,
     });
+    const timeoutPromise = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`LLM gateway timeout after ${LLM_TIMEOUT_MS}ms`)), LLM_TIMEOUT_MS)
+    );
+    const response = await Promise.race([chatPromise, timeoutPromise]);
     
     const text = response?.choices?.[0]?.message?.content || '';
     const match = text.match(/\{[^}]*\}/);
     if (match) {
       const parsed = JSON.parse(match[0]);
       return {
-        sameIntent: Boolean(parsed.sameIntent),
-        confidence: Number(parsed.confidence) || 0.5,
+        sameIntent: parsed.sameIntent === true || parsed.sameIntent === 'true',
+        confidence: typeof parsed.confidence === 'number' ? parsed.confidence : parseFloat(parsed.confidence) || 0.5,
       };
     }
   } catch (err) {
-    // LLM 判断失败时不阻断，降级为词法匹配结果
-    console.warn(`[governance] LLM semantic compare failed: ${err.message}`);
+    console.warn(`[governance] LLM semantic compare failed (model: ${sideLlmGateway.defaultModel || 'k2p6'}): ${err.message}`);
   }
   return { sameIntent: false, confidence: 0 };
 }
