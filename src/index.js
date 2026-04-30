@@ -14,6 +14,26 @@ import { KnowledgeBasePresenter } from './api/presenter.js';
 import { QueryExporter } from './api/query-exporter.js';
 import { MemoryQueryRequest, MemorySaveRequest, SessionTurnRequest, StartMemorySessionRequest, BenchmarkResultRequest } from './api/contract.js';
 
+/**
+ * Sanitize query input: strip OpenClaw inbound metadata wrapper.
+ * OpenClaw occasionally passes the full "Conversation info (untrusted metadata):\n```json\n{...}" block
+ * as the query instead of the user's actual message. This detects and rejects such queries.
+ */
+const METADATA_PREFIX_RE = /^Conversation info \(untrusted metadata\):/i;
+function sanitizeQuery(raw) {
+  if (!raw || typeof raw !== 'string') return { valid: false, cleaned: '', reason: 'empty_or_invalid' };
+  const trimmed = raw.trim();
+  if (METADATA_PREFIX_RE.test(trimmed)) {
+    // Try to extract user message after the metadata JSON block
+    const afterJson = trimmed.split(/```\s*\n?/).slice(2).join('```').trim();
+    if (afterJson.length > 0) {
+      return { valid: true, cleaned: afterJson, reason: 'extracted_from_metadata' };
+    }
+    return { valid: false, cleaned: '', reason: 'metadata_wrapper_only' };
+  }
+  return { valid: true, cleaned: trimmed, reason: 'ok' };
+}
+
 function validateBody(ValidatorClass) {
   return async (request, reply) => {
     if (!request.body || typeof request.body !== 'object') {
@@ -163,9 +183,24 @@ fastify.post('/api/memory/query-context', async (request, reply) => {
       reply.code(400);
       return { success: false, error: 'query is required' };
     }
-    const result = await knowledgeBase.queryMemoryContext(query, top_k, session_id);
+    const sq = sanitizeQuery(String(query));
+    if (!sq.valid) {
+      fastify.log.warn(`query-context: rejected metadata wrapper query (reason=${sq.reason})`);
+      return {
+        query: String(query).slice(0, 80),
+        hits: [], total: 0,
+        matched_sessions: [], matched_turns: [],
+        freshness_level: 'none',
+        context: { aliases: [], path_hints: [], collection_hints: [], confidence: 0, confidence_level: 'none', should_abstain: true, abstain_reason: 'metadata_wrapper_query', recency_hint: null, summary: {} },
+      };
+    }
+    const effectiveQuery = sq.cleaned;
+    if (sq.reason === 'extracted_from_metadata') {
+      fastify.log.info(`query-context: extracted user message from metadata wrapper (len=${effectiveQuery.length})`);
+    }
+    const result = await knowledgeBase.queryMemoryContext(effectiveQuery, top_k, session_id);
     if (include_debug && queryExporter) {
-      await queryExporter.exportQueryContext({ query, result });
+      await queryExporter.exportQueryContext({ query: effectiveQuery, result });
     }
     const memHits = (result.hits || []).map(h => ({
       id: h.memory_id,
@@ -178,7 +213,7 @@ fastify.post('/api/memory/query-context', async (request, reply) => {
     }));
 
     const response = {
-      query,
+      query: effectiveQuery,
       hits: memHits,
       total: memHits.length,
       matched_sessions: result.matched_sessions || [],
@@ -197,14 +232,14 @@ fastify.post('/api/memory/query-context', async (request, reply) => {
       },
     };
     metrics.lastQueryContext = {
-      query,
+      query: effectiveQuery,
       total: memHits.length,
       matched_turn_count: (result.matched_turns || []).length,
       confidence: result.confidence || 0,
       should_abstain: result.should_abstain || false,
       at: new Date().toISOString(),
     };
-    fastify.log.info(`Query-context summary: query="${String(query).slice(0, 80)}" hits=${memHits.length} matched_turns=${(result.matched_turns || []).length} confidence=${result.confidence || 0}`);
+    fastify.log.info(`Query-context summary: query="${effectiveQuery.slice(0, 80)}" hits=${memHits.length} matched_turns=${(result.matched_turns || []).length} confidence=${result.confidence || 0}`);
     return response;
   } catch (err) {
     reply.code(500);

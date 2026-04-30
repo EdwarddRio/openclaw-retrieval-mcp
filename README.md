@@ -276,4 +276,4 @@ runtime/
 
 ## 许可证
 
-内部项目，未开源。
+[MIT License](LICENSE)
