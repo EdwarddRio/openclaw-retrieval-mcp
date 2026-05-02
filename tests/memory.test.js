@@ -1,4 +1,4 @@
-import { describe, it, beforeEach } from 'node:test';
+import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert';
 import fs from 'fs';
 import path from 'path';
@@ -47,7 +47,7 @@ describe('LocalMemory', () => {
   it('should query memory', () => {
     const result = memory.queryMemoryFull('test', 3);
     assert.ok(Array.isArray(result.hits));
-    assert.ok(Array.isArray(result.tentative_items));
+    assert.ok(Array.isArray(result.weak_items));
   });
 
   it('should save and get memory', () => {

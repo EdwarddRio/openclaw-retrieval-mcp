@@ -259,13 +259,13 @@ export class LocalMemoryStore {
    * 查询记忆（简单版）
    * @param {string} query - 查询文本
    * @param {number} [topK=3] - 返回结果数量上限
-   * @param {string} [sessionId] - 会话 ID（未使用）
+   * @param {string} [sessionId] - 会话 ID（用于过滤特定会话的记忆）
    * @param {Object} [options] - 查询选项
    * @param {string} [options.scope] - 范围过滤
    * @param {string} [options.scopeId] - 范围 ID 过滤
    * @returns {Array<Object>} 匹配的记忆条目列表
    */
-  queryMemory(query, topK = 3, _sessionId = null, options = {}) {
+  queryMemory(query, topK = 3, sessionId = null, options = {}) {
     // v3.3: 使用 BM25 + 融合排序
     this._ensureBM25();
     
@@ -280,6 +280,9 @@ export class LocalMemoryStore {
     for (const result of bm25Results) {
       const memory = this._store.getMemory(result.docId);
       if (!memory) continue;
+      
+      // Session 过滤
+      if (sessionId && memory.session_id !== sessionId) continue;
       
       // Scope 过滤
       if (options.scope && memory.scope !== 'global' && memory.scope !== options.scope) continue;
