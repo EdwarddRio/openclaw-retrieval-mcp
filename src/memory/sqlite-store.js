@@ -129,6 +129,11 @@ const MEMORY_ITEM_COLUMNS = {
   weight: "TEXT NOT NULL DEFAULT 'MEDIUM'",
   weight_set_at: "TEXT",
   expires_at: "TEXT",
+  // v3.3: multi-scope and actor
+  scope: "TEXT NOT NULL DEFAULT 'global'",
+  scope_id: "TEXT NOT NULL DEFAULT ''",
+  actor_id: "TEXT",
+  actor_type: "TEXT",
 };
 
 /**
@@ -574,8 +579,9 @@ export class SqliteStore {
         (id, canonical_key, summary, state, status, source, content,
          session_id, created_at, updated_at,
          aliases_json, path_hints_json, collection_hints_json, last_choice,
-         category, weight, weight_set_at, expires_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         category, weight, weight_set_at, expires_at,
+         scope, scope_id, actor_id, actor_type)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
       stmt.run(
         memory.memory_id,
@@ -595,7 +601,12 @@ export class SqliteStore {
         memory.category || 'general',
         memory.weight || 'MEDIUM',
         memory.weight_set_at || now,
-        memory.expires_at || null
+        memory.expires_at || null,
+        // v3.3: multi-scope and actor
+        memory.scope || 'global',
+        memory.scope_id || '',
+        memory.actor_id || null,
+        memory.actor_type || null
       );
 
       this._getStmt('DELETE FROM memory_aliases WHERE memory_id = ?').run(memory.memory_id);
@@ -995,6 +1006,11 @@ export class SqliteStore {
       weight: row.weight || 'MEDIUM',
       weight_set_at: row.weight_set_at || null,
       expires_at: row.expires_at || null,
+      // v3.3: multi-scope and actor
+      scope: row.scope || 'global',
+      scope_id: row.scope_id || '',
+      actor_id: row.actor_id || null,
+      actor_type: row.actor_type || null,
     };
   }
 

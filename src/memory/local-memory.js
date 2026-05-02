@@ -260,9 +260,12 @@ export class LocalMemoryStore {
    * @param {string} query - 查询文本
    * @param {number} [topK=3] - 返回结果数量上限
    * @param {string} [sessionId] - 会话 ID（未使用）
+   * @param {Object} [options] - 查询选项
+   * @param {string} [options.scope] - 范围过滤
+   * @param {string} [options.scopeId] - 范围 ID 过滤
    * @returns {Array<Object>} 匹配的记忆条目列表
    */
-  queryMemory(query, topK = 3, _sessionId = null) {
+  queryMemory(query, topK = 3, _sessionId = null, options = {}) {
     // v3.3: 使用 BM25 + 融合排序
     this._ensureBM25();
     
@@ -277,6 +280,10 @@ export class LocalMemoryStore {
     for (const result of bm25Results) {
       const memory = this._store.getMemory(result.docId);
       if (!memory) continue;
+      
+      // Scope 过滤
+      if (options.scope && memory.scope !== 'global' && memory.scope !== options.scope) continue;
+      if (options.scopeId && memory.scope_id && memory.scope_id !== options.scopeId) continue;
       
       // 字段过滤
       if (!matchesFieldFilters(memory, parsed.fieldFilters)) continue;
@@ -534,6 +541,10 @@ export class LocalMemoryStore {
    * @param {string} [options.weight] - 权重（STRONG|MEDIUM|WEAK）
    * @param {string} [options.weight_set_at] - weight最后变更时间
    * @param {string} [options.expires_at] - 过期时间
+   * @param {string} [options.scope] - 范围（user|agent|session|org|global）
+   * @param {string} [options.scope_id] - 范围标识符
+   * @param {string} [options.actor_id] - 来源 Agent/用户 ID
+   * @param {string} [options.actor_type] - 来源类型（user|agent|system）
    * @returns {Object} 保存后的记忆对象，日限额到达时返回 rate_limited 状态
    */
   saveMemory(options) {
@@ -551,6 +562,10 @@ export class LocalMemoryStore {
       weight,
       weight_set_at,
       expires_at,
+      scope,
+      scope_id,
+      actor_id,
+      actor_type,
     } = options;
 
     const normalizedState = (state || 'tentative').trim() || 'tentative';
@@ -607,6 +622,11 @@ export class LocalMemoryStore {
       weight: weight || 'MEDIUM',
       weight_set_at: weight_set_at || now,
       expires_at: expires_at || null,
+      // v3.3: multi-scope and actor
+      scope: scope || 'global',
+      scope_id: scope_id || '',
+      actor_id: actor_id || null,
+      actor_type: actor_type || null,
     }));
 
     if (session_id && this._store.updateSession) {

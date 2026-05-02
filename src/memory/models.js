@@ -130,6 +130,12 @@ export class MemoryFact {
     this.weight = options.weight || 'MEDIUM'; // STRONG|MEDIUM|WEAK
     this.weight_set_at = options.weight_set_at || null; // ISO时间，weight变更时更新
     this.expires_at = options.expires_at || null; // ISO时间，null=永不过期
+    
+    // New fields for multi-scope and actor (v3.3)
+    this.scope = options.scope || 'global'; // user|agent|session|org|global
+    this.scope_id = options.scope_id || ''; // 范围标识符
+    this.actor_id = options.actor_id || null; // 来源 Agent/用户 ID
+    this.actor_type = options.actor_type || null; // user|agent|system
   }
 }
 
