@@ -14,8 +14,9 @@ fi
 
 # Ensure API_SECRET is set for test
 export OPENCLAW_API_SECRET="${OPENCLAW_API_SECRET:-test-secret}"
-# Use a temporary port to avoid conflict with production service
+# Use a temporary port and socket to avoid conflict with production service
 export HTTP_PORT="${TEST_HTTP_PORT:-18901}"
+export HTTP_SOCKET_PATH="/tmp/openclaw-engine-test.sock"
 
 echo "[contract-test] Starting context-engine on port $HTTP_PORT..."
 node src/index.js &
