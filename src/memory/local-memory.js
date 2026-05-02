@@ -8,8 +8,10 @@ import path from 'path';
 import crypto from 'crypto';
 import { logger, LOCALMEM_DIR, LOCALMEM_FACT_MAX_AGE_DAYS, LOCALMEM_SESSION_MAX_AGE_DAYS, PROJECT_ROOT, LOCALMEM_DAILY_WRITE_LIMIT, LOCALMEM_TENTATIVE_TTL_DAYS } from '../config.js';
 import { SqliteStore } from './sqlite-store.js';
-import { ChatTurn, ChatSession, MemoryFact, isoNow, canonicalKeyForText, computeRelevanceScore, TRIAGE_CONFIRM_SIGNALS, TRIAGE_DISCARD_SIGNALS, TRIAGE_MIN_CONTENT_LENGTH, TRIAGE_MAX_CONTENT_LENGTH, RELEVANCE_WEIGHTS, WEIGHT, CATEGORY } from './models.js';
+import { ChatTurn, ChatSession, MemoryFact, isoNow, canonicalKeyForText, computeRelevanceScore, TRIAGE_CONFIRM_SIGNALS, TRIAGE_DISCARD_SIGNALS, TRIAGE_MIN_CONTENT_LENGTH, TRIAGE_MAX_CONTENT_LENGTH, RELEVANCE_WEIGHTS, WEIGHT, CATEGORY, WEIGHT_PRIORITY } from './models.js';
 import { planKnowledgeUpdate } from './governance.js';
+import { BM25Search } from '../search/bm25.js';
+import { parseQuery, matchesFieldFilters, matchesPhrases } from '../search/query-parser.js';
 
 // ========== Saveable states ==========
 // localMem has two states:
@@ -58,6 +60,11 @@ export class LocalMemoryStore {
     
     this._ensureLayout();
     this._store = new SqliteStore(this._dbPath);
+    
+    // v3.3: BM25 索引
+    this._bm25 = new BM25Search();
+    this._bm25Dirty = true; // 启动时需要重建索引
+    this._bm25Initialized = false;
 
     this._cleanupTimer = setInterval(() => {
       this._maybePeriodicCleanup();
@@ -100,6 +107,58 @@ export class LocalMemoryStore {
     if (this._store) {
       this._store.close();
       this._store = null;
+    }
+  }
+
+  /**
+   * 初始化或重建 BM25 索引（懒加载）
+   */
+  _ensureBM25() {
+    if (!this._bm25Dirty && this._bm25Initialized) return;
+    
+    try {
+      this._bm25.clear();
+      const facts = this._store.listActiveFacts(1000);
+      for (const fact of facts) {
+        this._bm25.addDocument(fact.memory_id, fact.content || '', {
+          title: fact.summary || '',
+          category: fact.category,
+          weight: fact.weight,
+        });
+      }
+      this._bm25Dirty = false;
+      this._bm25Initialized = true;
+      logger.info(`[BM25] Index rebuilt: ${facts.length} documents`);
+    } catch (err) {
+      logger.warn(`[BM25] Index rebuild failed: ${err.message}`);
+    }
+  }
+
+  /**
+   * 同步 BM25 索引：添加文档
+   * @param {Object} memory - 记忆对象
+   */
+  _bm25Add(memory) {
+    try {
+      this._bm25.addDocument(memory.memory_id, memory.content || '', {
+        title: memory.summary || '',
+        category: memory.category,
+        weight: memory.weight,
+      });
+    } catch (err) {
+      logger.warn(`[BM25] Add document failed: ${err.message}`);
+    }
+  }
+
+  /**
+   * 同步 BM25 索引：删除文档
+   * @param {string} memoryId - 记忆 ID
+   */
+  _bm25Remove(memoryId) {
+    try {
+      this._bm25.removeDocument(memoryId);
+    } catch (err) {
+      logger.warn(`[BM25] Remove document failed: ${err.message}`);
     }
   }
 
@@ -203,7 +262,73 @@ export class LocalMemoryStore {
    * @returns {Array<Object>} 匹配的记忆条目列表
    */
   queryMemory(query, topK = 3, sessionId = null) {
-    return this._store.queryMemory(query, topK, sessionId);
+    // v3.3: 使用 BM25 + 融合排序
+    this._ensureBM25();
+    
+    // 解析布尔查询
+    const parsed = parseQuery(query);
+    
+    // BM25 搜索
+    const bm25Results = this._bm25.search(query, topK * 3);
+    
+    // 应用字段过滤和短语匹配
+    const filteredResults = [];
+    for (const result of bm25Results) {
+      const memory = this._store.getMemory(result.docId);
+      if (!memory) continue;
+      
+      // 字段过滤
+      if (!matchesFieldFilters(memory, parsed.fieldFilters)) continue;
+      
+      // 短语匹配
+      if (!matchesPhrases(memory.content || '', parsed.phraseTerms)) continue;
+      
+      // 排除词
+      const contentLower = (memory.content || '').toLowerCase();
+      if (parsed.excluded.some(term => contentLower.includes(term.toLowerCase()))) continue;
+      
+      filteredResults.push({
+        ...memory,
+        _bm25Score: result.score,
+      });
+    }
+    
+    // 4因子融合排序
+    const maxBM25Score = filteredResults.length > 0 ? filteredResults[0]._bm25Score : 1;
+    
+    filteredResults.sort((a, b) => {
+      const scoreA = this._computeFusionScore(a, maxBM25Score);
+      const scoreB = this._computeFusionScore(b, maxBM25Score);
+      return scoreB - scoreA;
+    });
+    
+    return filteredResults.slice(0, topK);
+  }
+
+  /**
+   * 计算4因子融合分数
+   * finalScore = bm25Norm × 0.5 + positionScore × 0.1 + recency × 0.3 + weightBoost × 0.1
+   */
+  _computeFusionScore(memory, maxBM25Score) {
+    // BM25 归一化分数
+    const bm25Norm = maxBM25Score > 0 ? (memory._bm25Score || 0) / maxBM25Score : 0;
+    
+    // 位置分数（首次匹配位置越前越相关）
+    const content = (memory.content || '').toLowerCase();
+    const firstMatchPos = content.length > 0 ? content.indexOf(content[0]) : 0;
+    const positionScore = 1 / (1 + firstMatchPos / 100);
+    
+    // 时间衰减（30天半衰期）
+    const ageDays = memory.updated_at
+      ? (Date.now() - new Date(memory.updated_at).getTime()) / (1000 * 60 * 60 * 24)
+      : 999;
+    const recency = 1 / (1 + ageDays / 30);
+    
+    // 权重加成
+    const weightBoostMap = { STRONG: 1.5, MEDIUM: 1.0, WEAK: 0.5 };
+    const weightBoost = weightBoostMap[memory.weight] || 1.0;
+    
+    return bm25Norm * 0.5 + positionScore * 0.1 + recency * 0.3 + weightBoost * 0.1;
   }
 
   /**
@@ -223,9 +348,10 @@ export class LocalMemoryStore {
    * @returns {{ hits: Array, weak_items: Array, freshness: Object, abstention_signals: Object, memory_context: Object }}
    */
   queryMemoryFull(query, topK = 3, sessionId = null) {
-    const hits = this._store.queryMemory(query, topK, sessionId);
+    // v3.3: 使用 BM25 查询
+    const hits = this.queryMemory(query, topK, sessionId);
     for (const hit of hits) {
-      hit._relevanceScore = computeRelevanceScore(query, hit, RELEVANCE_WEIGHTS.search);
+      hit._relevanceScore = this._computeFusionScore(hit, hits[0]?._bm25Score || 1);
     }
     if (hits.length > 0) {
       const queryHash = crypto.createHash('sha256').update(query.trim().toLowerCase()).digest('hex').slice(0, 12);
@@ -501,6 +627,9 @@ export class LocalMemoryStore {
       timelineEventSaved = false;
     }
 
+    // v3.3: 同步 BM25 索引
+    this._bm25Add(saved);
+
     return { ...saved, timeline_event_saved: timelineEventSaved };
   }
 
@@ -542,7 +671,14 @@ export class LocalMemoryStore {
       created_at: isoNow(),
       event_data: {},
     });
-    return this._store.deleteMemory(memoryId);
+    const result = this._store.deleteMemory(memoryId);
+    
+    // v3.3: 同步 BM25 索引
+    if (result) {
+      this._bm25Remove(memoryId);
+    }
+    
+    return result;
   }
 
   /**
@@ -1377,7 +1513,9 @@ export class LocalMemoryStore {
   _computeConfidence(query, hits) {
     if (!hits || hits.length === 0) return 0.0;
     const topN = hits.slice(0, Math.min(3, hits.length));
-    const scores = topN.map(h => computeRelevanceScore(query, h, RELEVANCE_WEIGHTS.confidence));
+    // v3.3: 使用融合分数替代旧的 computeRelevanceScore
+    const maxScore = topN[0]?._bm25Score || 1;
+    const scores = topN.map(h => this._computeFusionScore(h, maxScore));
     return scores.reduce((a, b) => a + b, 0) / scores.length;
   }
 
