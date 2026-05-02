@@ -17,6 +17,7 @@
     "dotenv": "^16.4.0",
     "fastify": "^4.26.0",
     "pino": "^8.19.0",
+    "rate-limiter-flexible": "^11.0.1",
     "uuid": "^9.0.1",
     "winston": "^3.17.0",
     "zod": "^3.22.4"

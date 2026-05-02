@@ -63,7 +63,8 @@ export class LocalMemoryStore {
       this._maybePeriodicCleanup();
     }, 60 * 60 * 1000);
     this._cleanupTimer.unref();
-    setTimeout(() => this._maybePeriodicCleanup(), 5000).unref();
+    this._cleanupTimeout = setTimeout(() => this._maybePeriodicCleanup(), 5000);
+    this._cleanupTimeout.unref();
   }
 
   /**
@@ -91,6 +92,10 @@ export class LocalMemoryStore {
     if (this._cleanupTimer) {
       clearInterval(this._cleanupTimer);
       this._cleanupTimer = null;
+    }
+    if (this._cleanupTimeout) {
+      clearTimeout(this._cleanupTimeout);
+      this._cleanupTimeout = null;
     }
     if (this._store) {
       this._store.close();
@@ -739,6 +744,7 @@ export class LocalMemoryStore {
    * 定期清理过期数据（每 24 小时执行一次）：清理旧轮次、旧会话、旧事件、过期暂定记忆
    */
   _maybePeriodicCleanup() {
+    if (!this._store) return;
     const now = Date.now();
     const twentyFourHours = 24 * 60 * 60 * 1000;
     if (this._lastCleanupAt && (now - this._lastCleanupAt) < twentyFourHours) {

@@ -5,16 +5,28 @@ import path from 'path';
 import { LocalMemoryStore } from '../src/memory/local-memory.js';
 import { MemoryFact } from '../src/memory/models.js';
 
-const TEST_DB_PATH = path.join(process.cwd(), 'tests', 'test-localmem.db');
+const TEST_ROOT_DIR = path.join(process.cwd(), 'tests', 'localmem-root');
+const TEST_DB_PATH = path.join(TEST_ROOT_DIR, 'context-engine.db');
 
 describe('LocalMemory', () => {
   let memory;
 
   beforeEach(() => {
-    if (fs.existsSync(TEST_DB_PATH)) {
-      fs.unlinkSync(TEST_DB_PATH);
+    if (fs.existsSync(TEST_ROOT_DIR)) {
+      fs.rmSync(TEST_ROOT_DIR, { recursive: true, force: true });
     }
-    memory = new LocalMemoryStore({ rootDir: path.dirname(TEST_DB_PATH) });
+    fs.mkdirSync(TEST_ROOT_DIR, { recursive: true });
+    memory = new LocalMemoryStore({ rootDir: TEST_ROOT_DIR });
+  });
+
+  afterEach(() => {
+    if (memory) {
+      memory.close();
+      memory = null;
+    }
+    if (fs.existsSync(TEST_ROOT_DIR)) {
+      fs.rmSync(TEST_ROOT_DIR, { recursive: true, force: true });
+    }
   });
 
   it('should create a session', () => {

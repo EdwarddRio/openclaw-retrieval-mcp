@@ -221,6 +221,106 @@ export class MemorySearchResponse {
   }
 }
 
+export class MemoryQueryContextRequest {
+  constructor(options = {}) {
+    this.query = options.query || '';
+    this.top_k = options.top_k || 3;
+    this.session_id = options.session_id || null;
+    this.include_debug = options.include_debug || false;
+  }
+
+  validate() {
+    const errors = [];
+    if (!this.query || this.query.trim().length === 0) {
+      errors.push('query is required');
+    }
+    return { valid: errors.length === 0, errors };
+  }
+}
+
+export class AutoTriageRequest {
+  constructor(options = {}) {
+    this.session_id = options.session_id || '';
+    this.role = options.role || '';
+    this.content = options.content || '';
+    this.previous_role = options.previous_role || '';
+    this.previous_content = options.previous_content || '';
+  }
+
+  validate() {
+    const errors = [];
+    if (!this.session_id) errors.push('session_id is required');
+    if (!this.role) errors.push('role is required');
+    if (!this.content || this.content.trim().length === 0) {
+      errors.push('content is required');
+    }
+    return { valid: errors.length === 0, errors };
+  }
+}
+
+export class GovernancePlanUpdateRequest {
+  constructor(options = {}) {
+    this.content = options.content || '';
+    this.aliases = options.aliases || [];
+    this.path_hints = options.path_hints || [];
+    this.collection_hints = options.collection_hints || [];
+  }
+
+  validate() {
+    const errors = [];
+    if (!this.content || this.content.trim().length === 0) {
+      errors.push('content is required');
+    }
+    return { valid: errors.length === 0, errors };
+  }
+}
+
+export class WikiSearchRequest {
+  constructor(options = {}) {
+    this.query = options.query || '';
+    this.top_k = options.top_k || 5;
+  }
+
+  validate() {
+    const errors = [];
+    if (!this.query || this.query.trim().length === 0) {
+      errors.push('query is required');
+    }
+    return { valid: errors.length === 0, errors };
+  }
+}
+
+export class WikiSavePageRequest {
+  constructor(options = {}) {
+    this.sourcePath = options.sourcePath || '';
+    this.wikiPageName = options.wikiPageName || '';
+    this.content = options.content || '';
+    this.sourceId = options.sourceId || '';
+  }
+
+  validate() {
+    const errors = [];
+    if (!this.wikiPageName || this.wikiPageName.trim().length === 0) {
+      errors.push('wikiPageName is required');
+    }
+    return { valid: errors.length === 0, errors };
+  }
+}
+
+export class WikiRemovePageRequest {
+  constructor(options = {}) {
+    this.wikiPageName = options.wikiPageName || '';
+  }
+
+  validate() {
+    const errors = [];
+    if (!this.wikiPageName || this.wikiPageName.trim().length === 0) {
+      errors.push('wikiPageName is required');
+    }
+    return { valid: errors.length === 0, errors };
+  }
+}
+
 export class ErrorResponse {
   constructor(options = {}) {
     this.error = options.error || 'Internal Server Error';

@@ -1,0 +1,1245 @@
+openapi: 3.0.3
+info:
+  title: OpenClaw Context Engine API
+  description: |
+    OpenClaw 上下文引擎中间层 API —— 为 AI Agent 提供持久记忆和结构化知识检索。
+    
+    ## 架构
+    - **localMem**: SQLite 记忆存储（2-state 模型：tentative / kept）
+    - **LLMWiki**: 结构化知识页面编译和搜索
+    
+    ## 认证
+    配置 `OPENCLAW_API_SECRET` 后，所有请求需要 Bearer Token。
+    Unix Socket 连接自动注入 Token。
+    
+    ## 速率限制
+    默认 100 请求/分钟，可通过环境变量配置。
+  version: 1.0.0
+  contact:
+    name: OpenClaw Team
+  license:
+    name: MIT
+
+servers:
+  - url: http://127.0.0.1:8901
+    description: 本地 HTTP 服务
+  - url: http://localhost
+    description: Unix Socket 代理（通过 /tmp/openclaw-engine.sock）
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: Memory
+    description: 记忆系统操作
+  - name: Wiki
+    description: Wiki 知识库操作
+  - name: Health
+    description: 健康检查和监控
+  - name: Benchmark
+    description: 基准测试
+  - name: Legacy
+    description: 兼容旧版 API
+
+paths:
+  /api/memory/query:
+    post:
+      tags: [Memory]
+      summary: 查询记忆
+      description: 搜索记忆条目，支持可选的 Wiki 结果合并
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MemoryQueryRequest'
+      responses:
+        '200':
+          description: 查询成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryQueryResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '422':
+          description: 查询仅包含元数据
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MetadataOnlyError'
+        '429':
+          $ref: '#/components/responses/RateLimit'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/memory/query-context:
+    post:
+      tags: [Memory]
+      summary: 查询记忆上下文
+      description: 查询记忆并返回关联的会话和轮次信息
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MemoryQueryContextRequest'
+      responses:
+        '200':
+          description: 查询成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryQueryContextResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/memory/save:
+    post:
+      tags: [Memory]
+      summary: 保存记忆
+      description: 保存一条记忆，可选走治理流程
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MemorySaveRequest'
+      responses:
+        '200':
+          description: 保存成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemorySaveResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/memory/{id}:
+    get:
+      tags: [Memory]
+      summary: 获取单条记忆
+      parameters:
+        - $ref: '#/components/parameters/MemoryId'
+      responses:
+        '200':
+          description: 获取成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    put:
+      tags: [Memory]
+      summary: 更新记忆内容
+      parameters:
+        - $ref: '#/components/parameters/MemoryId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [content]
+              properties:
+                content:
+                  type: string
+                  minLength: 1
+                  maxLength: 5000
+      responses:
+        '200':
+          description: 更新成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    delete:
+      tags: [Memory]
+      summary: 删除记忆
+      parameters:
+        - $ref: '#/components/parameters/MemoryId'
+      responses:
+        '200':
+          description: 删除成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  memory_id:
+                    type: string
+                  action:
+                    type: string
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/memory/turn:
+    post:
+      tags: [Memory]
+      summary: 追加对话轮次
+      description: 追加一轮对话到当前会话，触发异步 autoTriage
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SessionTurnRequest'
+      responses:
+        '200':
+          description: 追加成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TurnResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/memory/session/start:
+    post:
+      tags: [Memory]
+      summary: 启动记忆会话
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StartSessionRequest'
+      responses:
+        '200':
+          description: 会话启动成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  session_id:
+                    type: string
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/memory/reviews:
+    get:
+      tags: [Memory]
+      summary: 列出待审核记忆
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 50
+      responses:
+        '200':
+          description: 获取成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReviewsResponse'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/memory/reviews/{id}/promote:
+    post:
+      tags: [Memory]
+      summary: 提升待审核记忆为永久
+      parameters:
+        - $ref: '#/components/parameters/MemoryId'
+      responses:
+        '200':
+          description: 提升成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReviewActionResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/memory/reviews/{id}/discard:
+    post:
+      tags: [Memory]
+      summary: 丢弃待审核记忆
+      parameters:
+        - $ref: '#/components/parameters/MemoryId'
+      responses:
+        '200':
+          description: 丢弃成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReviewActionResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/memory/reviews/{id}/evaluate:
+    post:
+      tags: [Memory]
+      summary: 评估待审核记忆
+      description: 存储 LLM 评估结果，不修改记忆状态
+      parameters:
+        - $ref: '#/components/parameters/MemoryId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                evaluation:
+                  type: object
+                  properties:
+                    score:
+                      type: number
+                    reasoning:
+                      type: string
+                    recommendation:
+                      type: string
+      responses:
+        '200':
+          description: 评估成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReviewActionResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/memory/auto-triage:
+    post:
+      tags: [Memory]
+      summary: 单条 autoTriage
+      description: 对一条 turn 执行自动沉淀判断
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [session_id, role, content]
+              properties:
+                session_id:
+                  type: string
+                role:
+                  type: string
+                  enum: [user, assistant, system]
+                content:
+                  type: string
+                previous_role:
+                  type: string
+                previous_content:
+                  type: string
+      responses:
+        '200':
+          description: triage 成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  candidates:
+                    type: array
+                  count:
+                    type: integer
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/memory/auto-triage/batch:
+    post:
+      tags: [Memory]
+      summary: 批量 autoTriage
+      description: 处理指定时间范围内的 turns
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                hours:
+                  type: integer
+                  default: 24
+                  minimum: 1
+                  maximum: 168
+      responses:
+        '200':
+          description: 批量 triage 成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  processed:
+                    type: integer
+                  extracted:
+                    type: integer
+                  daily_limit_reached:
+                    type: boolean
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/memory/session/reset:
+    post:
+      tags: [Memory]
+      summary: 重置当前活跃会话
+      responses:
+        '200':
+          description: 重置成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/memory/session/import-transcript:
+    post:
+      tags: [Memory]
+      summary: 导入外部对话记录为会话
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                transcript_path:
+                  type: string
+                transcript_id:
+                  type: string
+                transcripts_root:
+                  type: string
+                project_id:
+                  type: string
+                title:
+                  type: string
+                created_at:
+                  type: string
+                  format: date-time
+                session_id:
+                  type: string
+      responses:
+        '200':
+          description: 导入成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  session_id:
+                    type: string
+                  imported_turn_count:
+                    type: integer
+                  status:
+                    type: string
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/memory/governance/plan-update:
+    post:
+      tags: [Memory]
+      summary: 治理流程预演
+      description: 返回更新计划但不实际写入
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                content:
+                  type: string
+                aliases:
+                  type: array
+                  items:
+                    type: string
+                path_hints:
+                  type: array
+                  items:
+                    type: string
+                collection_hints:
+                  type: array
+                  items:
+                    type: string
+      responses:
+        '200':
+          description: 规划成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  strategy:
+                    type: string
+                  suggestedMemoryId:
+                    type: string
+                  relatedMemoryIds:
+                    type: array
+                    items:
+                      type: string
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/wiki/check-stale:
+    get:
+      tags: [Wiki]
+      summary: 检查 Wiki 是否需要重新编译
+      description: 轻量级检查，不读取文件内容
+      responses:
+        '200':
+          description: 检查成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  data:
+                    type: object
+                    properties:
+                      stale:
+                        type: boolean
+                      summary:
+                        type: object
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/wiki/remove-page:
+    post:
+      tags: [Wiki]
+      summary: 删除 Wiki 页面
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [wikiPageName]
+              properties:
+                wikiPageName:
+                  type: string
+      responses:
+        '200':
+          description: 删除成功
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/wiki/update-index:
+    post:
+      tags: [Wiki]
+      summary: 更新 Wiki 总索引
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                pages:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      name:
+                        type: string
+                      title:
+                        type: string
+                      sourceId:
+                        type: string
+      responses:
+        '200':
+          description: 更新成功
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/wiki/compile-prompt:
+    post:
+      tags: [Wiki]
+      summary: 生成 Wiki 编译提示词
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                changesResult:
+                  type: object
+      responses:
+        '200':
+          description: 生成成功
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/rebuild:
+    post:
+      tags: [Memory]
+      summary: 重建知识库
+      responses:
+        '200':
+          description: 重建成功
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/wiki/search:
+    post:
+      tags: [Wiki]
+      summary: 搜索 Wiki 页面
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WikiSearchRequest'
+      responses:
+        '200':
+          description: 搜索成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WikiSearchResponse'
+        '422':
+          description: 查询仅包含元数据
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/wiki/detect-changes:
+    post:
+      tags: [Wiki]
+      summary: 检测 Wiki 源文件变更
+      responses:
+        '200':
+          description: 检测成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WikiChangesResponse'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/wiki/save-page:
+    post:
+      tags: [Wiki]
+      summary: 保存 Wiki 页面
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WikiSavePageRequest'
+      responses:
+        '200':
+          description: 保存成功
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/wiki/status:
+    get:
+      tags: [Wiki]
+      summary: 获取 Wiki 编译状态
+      responses:
+        '200':
+          description: 获取成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  data:
+                    type: object
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/health:
+    get:
+      tags: [Health]
+      summary: 完整健康快照
+      responses:
+        '200':
+          description: 健康状态
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/health/ready:
+    get:
+      tags: [Health]
+      summary: 就绪探针
+      responses:
+        '200':
+          description: 服务就绪
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum: [ready, stale, degraded]
+                  timestamp:
+                    type: string
+                    format: date-time
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /metrics:
+    get:
+      tags: [Health]
+      summary: 运行指标
+      responses:
+        '200':
+          description: 指标数据
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MetricsResponse'
+
+  /api/benchmarks/run:
+    post:
+      tags: [Benchmark]
+      summary: 执行基准测试
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                suite_name:
+                  type: string
+      responses:
+        '200':
+          description: 测试执行成功
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: API 认证密钥（OPENCLAW_API_SECRET）
+
+  parameters:
+    MemoryId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+      description: 记忆 ID
+
+  schemas:
+    MemoryQueryRequest:
+      type: object
+      required: [query]
+      properties:
+        query:
+          type: string
+          minLength: 1
+          description: 查询文本
+        top_k:
+          type: integer
+          default: 3
+          minimum: 1
+          maximum: 100
+        include_wiki:
+          type: boolean
+          default: false
+          description: 是否合并 Wiki 搜索结果
+
+    MemoryQueryContextRequest:
+      type: object
+      required: [query]
+      properties:
+        query:
+          type: string
+          minLength: 1
+        top_k:
+          type: integer
+          default: 3
+        session_id:
+          type: string
+        include_debug:
+          type: boolean
+          default: false
+
+    MemorySaveRequest:
+      type: object
+      required: [content]
+      properties:
+        session_id:
+          type: string
+        content:
+          type: string
+          minLength: 1
+          maxLength: 5000
+        state:
+          type: string
+          enum: [tentative, kept]
+          default: tentative
+        aliases:
+          type: array
+          items:
+            type: string
+        path_hints:
+          type: array
+          items:
+            type: string
+        collection_hints:
+          type: array
+          items:
+            type: string
+        source:
+          type: string
+          enum: [manual, auto_triage, user_explicit, auto_draft]
+          default: manual
+        use_governance:
+          type: boolean
+          default: false
+
+    SessionTurnRequest:
+      type: object
+      required: [session_id, role, content]
+      properties:
+        session_id:
+          type: string
+        role:
+          type: string
+          enum: [user, assistant, system]
+        content:
+          type: string
+          minLength: 1
+        previous_role:
+          type: string
+        previous_content:
+          type: string
+        project_id:
+          type: string
+          default: default
+        title:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        references:
+          type: object
+
+    StartSessionRequest:
+      type: object
+      required: [project_id]
+      properties:
+        project_id:
+          type: string
+        title:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        session_id:
+          type: string
+
+    WikiSearchRequest:
+      type: object
+      required: [query]
+      properties:
+        query:
+          type: string
+          minLength: 1
+        top_k:
+          type: integer
+          default: 5
+
+    WikiSavePageRequest:
+      type: object
+      required: [sourcePath, wikiPageName, content]
+      properties:
+        sourcePath:
+          type: string
+        wikiPageName:
+          type: string
+        content:
+          type: string
+        sourceId:
+          type: string
+
+    MemoryQueryResponse:
+      type: object
+      properties:
+        query:
+          type: string
+        hits:
+          type: array
+          items:
+            $ref: '#/components/schemas/MemoryHit'
+        total:
+          type: integer
+        freshness_level:
+          type: string
+
+    MemoryQueryContextResponse:
+      allOf:
+        - $ref: '#/components/schemas/MemoryQueryResponse'
+        - type: object
+          properties:
+            matched_sessions:
+              type: array
+            matched_turns:
+              type: array
+            context:
+              type: object
+
+    MemoryHit:
+      type: object
+      properties:
+        id:
+          type: string
+        content:
+          type: string
+        source_type:
+          type: string
+          enum: [memory, wiki]
+        state:
+          type: string
+        score:
+          type: number
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    MemoryResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        data:
+          $ref: '#/components/schemas/MemoryItem'
+
+    MemorySaveResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        memory_id:
+          type: string
+        content:
+          type: string
+        state:
+          type: string
+        status:
+          type: string
+
+    MemoryItem:
+      type: object
+      properties:
+        memory_id:
+          type: string
+        session_id:
+          type: string
+        content:
+          type: string
+        state:
+          type: string
+        status:
+          type: string
+        source:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        aliases:
+          type: array
+          items:
+            type: string
+        path_hints:
+          type: array
+          items:
+            type: string
+
+    TurnResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        auto_triage:
+          type: object
+          properties:
+            mode:
+              type: string
+            accepted:
+              type: boolean
+            disabled:
+              type: boolean
+
+    ReviewsResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        data:
+          type: object
+          properties:
+            reviews:
+              type: array
+              items:
+                $ref: '#/components/schemas/MemoryItem'
+            count:
+              type: integer
+
+    ReviewActionResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        memory_id:
+          type: string
+        action:
+          type: string
+        state:
+          type: string
+
+    WikiSearchResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        data:
+          type: object
+          properties:
+            results:
+              type: array
+              items:
+                type: object
+                properties:
+                  pageName:
+                    type: string
+                  score:
+                    type: number
+                  snippet:
+                    type: string
+
+    WikiChangesResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        data:
+          type: object
+          properties:
+            hasChanges:
+              type: boolean
+            added:
+              type: array
+            modified:
+              type: array
+            deleted:
+              type: array
+
+    HealthResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        data:
+          type: object
+          properties:
+            status:
+              type: string
+              enum: [ready, stale, degraded]
+            localmem:
+              type: object
+            benchmarks:
+              type: object
+            governance:
+              type: object
+            deployment:
+              type: object
+            stale_flags:
+              type: array
+              items:
+                type: string
+            timestamp:
+              type: string
+              format: date-time
+
+    MetricsResponse:
+      type: object
+      properties:
+        uptime_ms:
+          type: integer
+        requests_total:
+          type: integer
+        errors_total:
+          type: integer
+        memory_queries_total:
+          type: integer
+        memory_turns_total:
+          type: integer
+        process:
+          type: object
+          properties:
+            rss_mb:
+              type: number
+            heap_used_mb:
+              type: number
+            heap_total_mb:
+              type: number
+            external_mb:
+              type: number
+        memory:
+          type: object
+        auto_triage:
+          type: object
+        sanitize:
+          type: object
+        rate_limit:
+          type: object
+
+    MetadataOnlyError:
+      type: object
+      properties:
+        success:
+          type: boolean
+          example: false
+        error:
+          type: string
+          example: query_contains_only_metadata
+        message:
+          type: string
+        reason:
+          type: string
+
+    ErrorResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+          example: false
+        error:
+          type: string
+        message:
+          type: string
+        requestId:
+          type: string
+        timestamp:
+          type: string
+          format: date-time
+        details:
+          type: object
+
+  responses:
+    BadRequest:
+      description: 请求验证失败
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            success: false
+            error: VALIDATION_ERROR
+            message: "Validation failed: query is required"
+
+    NotFound:
+      description: 资源不存在
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            success: false
+            error: NOT_FOUND
+            message: "Memory not found: abc123"
+
+    RateLimit:
+      description: 速率限制
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+          description: 重试等待秒数
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            success: false
+            error: RATE_LIMIT_EXCEEDED
+            message: "Rate limit exceeded. Try again in 60 seconds."
+
+    InternalError:
+      description: 服务器内部错误
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            success: false
+            error: INTERNAL_ERROR
+            message: "An unexpected error occurred"
+
+    Forbidden:
+      description: 访问被拒绝
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            success: false
+            error: FORBIDDEN
+            message: "Access denied"
