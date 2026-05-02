@@ -35,7 +35,7 @@ function _loadDatabase() {
   }
 }
 
-/** 基础建表 SQL：sessions、turns、memory_items、memory_events、memory_aliases */
+/** 基础建表 SQL：sessions、turns、memory_items、memory_events、memory_aliases、entities、entity_facts */
 const BASE_SCHEMA = `
 CREATE TABLE IF NOT EXISTS sessions (
   id TEXT PRIMARY KEY,
@@ -72,6 +72,25 @@ CREATE TABLE IF NOT EXISTS memory_aliases (
   memory_id TEXT NOT NULL,
   alias TEXT NOT NULL,
   PRIMARY KEY (memory_id, alias)
+);
+
+-- v3.3: 实体表
+CREATE TABLE IF NOT EXISTS entities (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  type TEXT NOT NULL DEFAULT 'generic',
+  aliases_json TEXT NOT NULL DEFAULT '[]',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+-- v3.3: 实体-记忆关联表
+CREATE TABLE IF NOT EXISTS entity_facts (
+  entity_id TEXT NOT NULL,
+  memory_id TEXT NOT NULL,
+  observation TEXT,
+  confidence REAL NOT NULL DEFAULT 1.0,
+  PRIMARY KEY (entity_id, memory_id)
 );
 `;
 
@@ -120,6 +139,7 @@ const MEMORY_ITEM_COLUMNS = {
  */
 const ALLOWED_TABLES = new Set([
   'sessions', 'turns', 'memory_items', 'memory_events', 'memory_aliases',
+  'entities', 'entity_facts',
 ]);
 
 function _ensureColumns(db, tableName, columns) {
@@ -1212,6 +1232,209 @@ export class SqliteStore {
       deleted: weakDelete.changes,
       expired: expiredResult.changes,
     };
+  }
+
+  // ========== Entities (v3.3) ==========
+
+  /**
+   * 创建或更新实体
+   * @param {Object} entity - 实体对象
+   * @param {string} entity.id - 实体 ID
+   * @param {string} entity.name - 实体名称
+   * @param {string} [entity.type] - 实体类型 (person|tech|project|concept|generic)
+   * @param {string[]} [entity.aliases] - 别名列表
+   * @returns {Object} 实体对象
+   */
+  saveEntity(entity) {
+    const now = new Date().toISOString();
+    const stmt = this.db.prepare(`
+      INSERT OR REPLACE INTO entities (id, name, type, aliases_json, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `);
+    stmt.run(
+      entity.id,
+      entity.name,
+      entity.type || 'generic',
+      JSON.stringify(entity.aliases || []),
+      entity.created_at || now,
+      now
+    );
+    return entity;
+  }
+
+  /**
+   * 获取实体
+   * @param {string} entityId - 实体 ID
+   * @returns {Object|null} 实体对象
+   */
+  getEntity(entityId) {
+    const row = this._getStmt('SELECT * FROM entities WHERE id = ?').get(entityId);
+    if (!row) return null;
+    return {
+      id: row.id,
+      name: row.name,
+      type: row.type,
+      aliases: JSON.parse(row.aliases_json || '[]'),
+      created_at: row.created_at,
+      updated_at: row.updated_at,
+    };
+  }
+
+  /**
+   * 按名称查找实体
+   * @param {string} name - 实体名称
+   * @returns {Object|null} 实体对象
+   */
+  getEntityByName(name) {
+    const row = this._getStmt('SELECT * FROM entities WHERE name = ?').get(name);
+    if (!row) return null;
+    return {
+      id: row.id,
+      name: row.name,
+      type: row.type,
+      aliases: JSON.parse(row.aliases_json || '[]'),
+      created_at: row.created_at,
+      updated_at: row.updated_at,
+    };
+  }
+
+  /**
+   * 列出所有实体
+   * @param {number} [limit=100] - 返回数量上限
+   * @returns {Array<Object>} 实体列表
+   */
+  listEntities(limit = 100) {
+    return this._getStmt('SELECT * FROM entities ORDER BY updated_at DESC LIMIT ?').all(limit).map(row => ({
+      id: row.id,
+      name: row.name,
+      type: row.type,
+      aliases: JSON.parse(row.aliases_json || '[]'),
+      created_at: row.created_at,
+      updated_at: row.updated_at,
+    }));
+  }
+
+  /**
+   * 删除实体
+   * @param {string} entityId - 实体 ID
+   * @returns {boolean} 是否删除成功
+   */
+  deleteEntity(entityId) {
+    this._getStmt('DELETE FROM entity_facts WHERE entity_id = ?').run(entityId);
+    const result = this._getStmt('DELETE FROM entities WHERE id = ?').run(entityId);
+    return result.changes > 0;
+  }
+
+  /**
+   * 关联实体与记忆
+   * @param {string} entityId - 实体 ID
+   * @param {string} memoryId - 记忆 ID
+   * @param {string} [observation] - 观察内容
+   * @param {number} [confidence] - 置信度
+   */
+  linkEntityMemory(entityId, memoryId, observation = null, confidence = 1.0) {
+    const stmt = this.db.prepare(`
+      INSERT OR REPLACE INTO entity_facts (entity_id, memory_id, observation, confidence)
+      VALUES (?, ?, ?, ?)
+    `);
+    stmt.run(entityId, memoryId, observation, confidence);
+  }
+
+  /**
+   * 获取实体关联的记忆
+   * @param {string} entityId - 实体 ID
+   * @returns {Array<Object>} 关联的记忆列表
+   */
+  getEntityMemories(entityId) {
+    return this._getStmt(`
+      SELECT m.*, ef.observation, ef.confidence
+      FROM memory_items m
+      JOIN entity_facts ef ON m.id = ef.memory_id
+      WHERE ef.entity_id = ? AND m.status = 'active'
+      ORDER BY m.updated_at DESC
+    `).all(entityId).map(r => this._rowToMemory(r));
+  }
+
+  /**
+   * 获取记忆关联的实体
+   * @param {string} memoryId - 记忆 ID
+   * @returns {Array<Object>} 关联的实体列表
+   */
+  getMemoryEntities(memoryId) {
+    return this._getStmt(`
+      SELECT e.*, ef.observation, ef.confidence
+      FROM entities e
+      JOIN entity_facts ef ON e.id = ef.entity_id
+      WHERE ef.memory_id = ?
+      ORDER BY e.name
+    `).all(memoryId).map(row => ({
+      id: row.id,
+      name: row.name,
+      type: row.type,
+      aliases: JSON.parse(row.aliases_json || '[]'),
+      observation: row.observation,
+      confidence: row.confidence,
+    }));
+  }
+
+  /**
+   * 搜索观察级内容
+   * @param {string} query - 查询文本
+   * @param {number} [topK=5] - 返回数量上限
+   * @returns {Array<Object>} 匹配的观察列表
+   */
+  searchObservations(query, topK = 5) {
+    const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
+    if (terms.length === 0) return [];
+
+    const conditions = terms.map(() => "ef.observation LIKE ? ESCAPE '!'").join(' OR ');
+    const params = terms.map(t => `%${t}%`);
+
+    return this._getStmt(`
+      SELECT e.name as entity_name, e.type as entity_type, 
+             ef.observation, ef.confidence, ef.memory_id,
+             m.content as memory_content
+      FROM entity_facts ef
+      JOIN entities e ON e.id = ef.entity_id
+      JOIN memory_items m ON m.id = ef.memory_id
+      WHERE (${conditions}) AND m.status = 'active'
+      ORDER BY ef.confidence DESC
+      LIMIT ?
+    `).all(...params, topK).map(row => ({
+      entity: row.entity_name,
+      entity_type: row.entity_type,
+      observation: row.observation,
+      confidence: row.confidence,
+      memory_id: row.memory_id,
+      memory_content: row.memory_content,
+    }));
+  }
+
+  /**
+   * 获取关联记忆（1跳）
+   * @param {string} memoryId - 记忆 ID
+   * @returns {Array<Object>} 关联的记忆列表
+   */
+  getRelatedMemories(memoryId) {
+    // 找出该记忆关联的所有实体
+    const entities = this.getMemoryEntities(memoryId);
+    if (entities.length === 0) return [];
+
+    // 找出这些实体关联的其他记忆
+    const entityIds = entities.map(e => e.id);
+    const placeholders = entityIds.map(() => '?').join(',');
+
+    return this._getStmt(`
+      SELECT DISTINCT m.*, e.name as related_entity
+      FROM memory_items m
+      JOIN entity_facts ef ON m.id = ef.memory_id
+      JOIN entities e ON e.id = ef.entity_id
+      WHERE ef.entity_id IN (${placeholders}) 
+        AND m.id != ? 
+        AND m.status = 'active'
+      ORDER BY m.updated_at DESC
+      LIMIT 10
+    `).all(...entityIds, memoryId).map(r => this._rowToMemory(r));
   }
 
   // ========== State Migration ==========

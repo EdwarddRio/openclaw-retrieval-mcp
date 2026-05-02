@@ -15,20 +15,20 @@ export async function benchmarkRoutes(fastify, context) {
   const { knowledgeBase } = context;
 
   /** 记录一次基准测试结果 */
-  fastify.post('/api/benchmarks/record', { preHandler: [validateBody(BenchmarkResultRequest)] }, async (request, reply) => {
+  fastify.post('/api/benchmarks/record', { preHandler: [validateBody(BenchmarkResultRequest)] }, async (request, _reply) => {
     const result = await knowledgeBase.recordBenchmarkResult(request.body);
     return { success: true, data: result };
   });
 
   /** 获取最新基准测试结果 */
-  fastify.get('/api/benchmarks/latest', async (request, reply) => {
+  fastify.get('/api/benchmarks/latest', async (request, _reply) => {
     const { suite_name } = request.query;
     const result = await knowledgeBase.latestBenchmark(suite_name);
     return { success: true, data: result || {} };
   });
 
   /** 获取基准测试历史记录 */
-  fastify.get('/api/benchmarks/history', async (request, reply) => {
+  fastify.get('/api/benchmarks/history', async (request, _reply) => {
     const { suite_name, limit } = request.query;
     const result = await knowledgeBase.benchmarkHistory(suite_name, parseInt(limit) || 20);
     return { success: true, data: result || [] };

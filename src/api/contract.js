@@ -23,6 +23,8 @@ export const MEMORY_ENDPOINTS = {
   REVIEW_DISCARD: `${API_PREFIX}/memory/reviews/:id/discard`,
   GOVERNANCE_PLAN: `${API_PREFIX}/memory/governance/plan-update`,
   TIMELINE: `${API_PREFIX}/memory/timeline`,
+  SEARCH_OBSERVATIONS: `${API_PREFIX}/memory/search-observations`,
+  RELATED: `${API_PREFIX}/memory/:id/related`,
   REBUILD: `${API_PREFIX}/rebuild`,
   WIKI_CHECK_STALE: `${API_PREFIX}/wiki/check-stale`,
   WIKI_DETECT_CHANGES: `${API_PREFIX}/wiki/detect-changes`,

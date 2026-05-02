@@ -6,12 +6,13 @@
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
-import { logger, LOCALMEM_DIR, LOCALMEM_FACT_MAX_AGE_DAYS, LOCALMEM_SESSION_MAX_AGE_DAYS, PROJECT_ROOT, LOCALMEM_DAILY_WRITE_LIMIT, LOCALMEM_TENTATIVE_TTL_DAYS } from '../config.js';
+import { logger, LOCALMEM_DIR, LOCALMEM_FACT_MAX_AGE_DAYS, LOCALMEM_SESSION_MAX_AGE_DAYS, PROJECT_ROOT, LOCALMEM_DAILY_WRITE_LIMIT } from '../config.js';
 import { SqliteStore } from './sqlite-store.js';
-import { ChatTurn, ChatSession, MemoryFact, isoNow, canonicalKeyForText, computeRelevanceScore, TRIAGE_CONFIRM_SIGNALS, TRIAGE_DISCARD_SIGNALS, TRIAGE_MIN_CONTENT_LENGTH, TRIAGE_MAX_CONTENT_LENGTH, RELEVANCE_WEIGHTS, WEIGHT, CATEGORY, WEIGHT_PRIORITY } from './models.js';
+import { ChatTurn, ChatSession, MemoryFact, isoNow, canonicalKeyForText, TRIAGE_CONFIRM_SIGNALS, TRIAGE_DISCARD_SIGNALS, TRIAGE_MIN_CONTENT_LENGTH, TRIAGE_MAX_CONTENT_LENGTH } from './models.js';
 import { planKnowledgeUpdate } from './governance.js';
 import { BM25Search } from '../search/bm25.js';
 import { parseQuery, matchesFieldFilters, matchesPhrases } from '../search/query-parser.js';
+import { extractEntities, generateEntityId } from './entity-extractor.js';
 
 // ========== Saveable states ==========
 // localMem has two states:
@@ -261,7 +262,7 @@ export class LocalMemoryStore {
    * @param {string} [sessionId] - 会话 ID（未使用）
    * @returns {Array<Object>} 匹配的记忆条目列表
    */
-  queryMemory(query, topK = 3, sessionId = null) {
+  queryMemory(query, topK = 3, _sessionId = null) {
     // v3.3: 使用 BM25 + 融合排序
     this._ensureBM25();
     
@@ -629,6 +630,9 @@ export class LocalMemoryStore {
 
     // v3.3: 同步 BM25 索引
     this._bm25Add(saved);
+    
+    // v3.3: 实体提取和链接
+    this._extractAndLinkEntities(memoryId, content.trim());
 
     return { ...saved, timeline_event_saved: timelineEventSaved };
   }
@@ -682,6 +686,40 @@ export class LocalMemoryStore {
   }
 
   /**
+   * 提取实体并关联到记忆
+   * @param {string} memoryId - 记忆 ID
+   * @param {string} content - 记忆内容
+   */
+  _extractAndLinkEntities(memoryId, content) {
+    try {
+      const extractedEntities = extractEntities(content);
+      
+      for (const entityData of extractedEntities) {
+        // 查找或创建实体
+        let entity = this._store.getEntityByName(entityData.name);
+        if (!entity) {
+          entity = {
+            id: generateEntityId(entityData.name, entityData.type),
+            name: entityData.name,
+            type: entityData.type,
+            aliases: [],
+          };
+          this._store.saveEntity(entity);
+        }
+        
+        // 关联实体与记忆
+        this._store.linkEntityMemory(entity.id, memoryId, entityData.observation);
+      }
+      
+      if (extractedEntities.length > 0) {
+        logger.debug(`[Entity] Extracted ${extractedEntities.length} entities from memory ${memoryId}`);
+      }
+    } catch (err) {
+      logger.warn(`[Entity] Extraction failed: ${err.message}`);
+    }
+  }
+
+  /**
    * 获取存储统计信息
    * @returns {Object} 统计摘要，包含 total、active、tentative、kept、sessions、active_session_id
    */
@@ -691,6 +729,25 @@ export class LocalMemoryStore {
       ...stats,
       active_session_id: this._store.activeSessionId ? this._store.activeSessionId() : null,
     };
+  }
+
+  /**
+   * 搜索观察级内容
+   * @param {string} query - 查询文本
+   * @param {number} [topK=5] - 返回数量上限
+   * @returns {Array<Object>} 匹配的观察列表
+   */
+  searchObservations(query, topK = 5) {
+    return this._store.searchObservations(query, topK);
+  }
+
+  /**
+   * 获取关联记忆（1跳）
+   * @param {string} memoryId - 记忆 ID
+   * @returns {Array<Object>} 关联的记忆列表
+   */
+  getRelatedMemories(memoryId) {
+    return this._store.getRelatedMemories(memoryId);
   }
 
   /**

@@ -481,6 +481,29 @@ export async function memoryRoutes(fastify, context) {
     return { success: true, ...result };
   });
 
+  /** 搜索观察级内容 */
+  fastify.post('/api/memory/search-observations', async (request, reply) => {
+    const { query, top_k } = request.body || {};
+    if (!query) {
+      reply.code(400);
+      return { success: false, error: 'query is required' };
+    }
+    const results = knowledgeBase.searchObservations(query, top_k || 5);
+    return { success: true, data: results, count: results.length };
+  });
+
+  /** 获取关联记忆（1跳） */
+  fastify.get('/api/memory/:id/related', async (request, reply) => {
+    const { id } = request.params;
+    const memory = await knowledgeBase.getMemory(id);
+    if (!memory) {
+      reply.code(404);
+      return { success: false, error: 'Memory not found' };
+    }
+    const related = knowledgeBase.getRelatedMemories(id);
+    return { success: true, data: related, count: related.length };
+  });
+
   // Helper function for autoTriage
   function recordAutoTriageResult({ status, candidates = [], error = null }) {
     metrics.lastAutoTriage = {
