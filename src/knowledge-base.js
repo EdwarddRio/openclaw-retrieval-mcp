@@ -187,6 +187,25 @@ export class KnowledgeBase {
     return this.memoryFacade.listActiveFacts(limit);
   }
 
+  /**
+   * 搜索观察级内容
+   * @param {string} query - 查询文本
+   * @param {number} [topK=5] - 返回数量上限
+   * @returns {Array<Object>} 匹配的观察列表
+   */
+  searchObservations(query, topK = 5) {
+    return this.memoryFacade.localMemory.searchObservations(query, topK);
+  }
+
+  /**
+   * 获取关联记忆（1跳）
+   * @param {string} memoryId - 记忆 ID
+   * @returns {Array<Object>} 关联的记忆列表
+   */
+  getRelatedMemories(memoryId) {
+    return this.memoryFacade.localMemory.getRelatedMemories(memoryId);
+  }
+
   // ========== Review ==========
 
   /**
