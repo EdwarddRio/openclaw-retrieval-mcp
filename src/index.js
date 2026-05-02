@@ -193,6 +193,34 @@ let serverInstance = null;
 
 const start = async () => {
   try {
+    // Port conflict detection and cleanup
+    const checkPortAvailable = () => new Promise((resolve) => {
+      const testServer = net.createServer();
+      testServer.once('error', (err) => {
+        resolve(err.code !== 'EADDRINUSE');
+      });
+      testServer.once('listening', () => {
+        testServer.close(() => resolve(true));
+      });
+      testServer.listen(HTTP_PORT, HTTP_HOST);
+    });
+
+    const portAvailable = await checkPortAvailable();
+    if (!portAvailable) {
+      logger.warn(`Port ${HTTP_PORT} is in use, attempting to find and kill existing process...`);
+      try {
+        const { execSync } = await import('child_process');
+        const pid = execSync(`lsof -ti :${HTTP_PORT} 2>/dev/null || true`, { encoding: 'utf-8' }).trim();
+        if (pid && pid !== String(process.pid)) {
+          logger.info(`Found process ${pid} on port ${HTTP_PORT}, sending SIGTERM...`);
+          process.kill(parseInt(pid, 10), 'SIGTERM');
+          await new Promise(r => setTimeout(r, 2000));
+        }
+      } catch (killErr) {
+        logger.warn(`Failed to kill existing process: ${killErr.message}`);
+      }
+    }
+
     if (!API_SECRET) {
       logger.warn('OPENCLAW_API_SECRET is not set. API authentication is DISABLED. All endpoints are publicly accessible.');
     }

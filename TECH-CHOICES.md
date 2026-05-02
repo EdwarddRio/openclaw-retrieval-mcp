@@ -1,9 +1,9 @@
-# OpenClaw Context Engine 技术选型深度解析
+# 技术选型深度解析
 
 > 本文采用"技术小白提问 + 架构师回答"的对话形式，逐层剥开 `openclaw-engine-js` 的每一个技术决策。
 >
-> 目标读者：对技术感兴趣的产品/运维人员，以及刚接触本项目的开发者。
-> 阅读建议：如果某节看不懂，跳过不影响理解其他节——每节相对独立。
+> **目标读者**：对技术感兴趣的产品/运维人员，以及刚接触本项目的开发者。
+> **阅读建议**：每节相对独立，跳读不影响理解。建议先看决策矩阵速查表，再按需深入。
 
 ---
 
@@ -14,29 +14,52 @@
 
 ---
 
+## 决策矩阵速查表
+
+| 领域 | 选型 | 一句话理由 | 备选方案 | 关键指标 |
+|------|------|-----------|----------|----------|
+| 语言 | Node.js | 同语言通信、部署简单、内存低 | Python | ~50MB vs ~200MB |
+| 架构 | 单服务 | 运维成本低、故障点少 | 微服务 (3进程) | 1进程 vs 3进程 |
+| 知识检索 | LLM Wiki | 人机协作、结构化、易维护 | 向量+BM25 | 整页阅读 vs 分块 |
+| HTTP 框架 | Fastify | 性能高、内置验证、Pino日志 | Express | 快2-3倍 |
+| 数据库 | better-sqlite3 | 零部署、同步API、WAL模式 | PostgreSQL | ~5MB vs ~100MB+ |
+| 记忆模型 | 2态 (tentative/kept) | 认知负担低、代码简洁 | 7态 | 2态 vs 7态 |
+| 搜索方案 | SQL LIKE + bigram | 中文友好、数据量小够用 | FTS5/BM25 | <1ms |
+| 治理比较 | 词法匹配 + LLM兜底 | 零依赖、优雅降级 | 纯LLM | 10秒超时保护 |
+| 日志 | Pino(HTTP) + Winston(业务) | 各司其职 | 单一库 | Pino最快 |
+| 认证 | Bearer Token + Unix Socket | 简单、轻量、本地免密 | OAuth2/JWT | 10行代码 |
+| 配置 | 环境变量 + dotenv | 12-Factor、安全 | JSON/YAML | 不进代码仓库 |
+| 基准测试 | 自建框架 | 测试搜索质量而非速度 | Vitest/Jest | 命中率/召回率/多样性 |
+
+---
+
 ## 一、全局架构选型
 
 ### 1.1 为什么是 Node.js 而不是 Python？
 
 **小白**：之前的上下文引擎是 Python 写的，为什么重写成 Node.js？
 
-**架构师**：三个原因：
+**架构师**：三个核心原因：
 
 | 维度 | Node.js | Python |
 |------|---------|--------|
-| 部署复杂度 | 单进程，零外部依赖 | 需要 Python 虚拟环境 + pip 依赖 |
-| 与主程序通信 | 同语言，可直接嵌入 | 需要跨进程通信（HTTP/gRPC） |
+| 部署复杂度 | `npm install` + `node src/index.js` | 需要 Python 虚拟环境 + pip 依赖 |
+| 与主程序通信 | 同语言直接 HTTP 调用，无序列化开销 | 需要跨进程通信（HTTP/gRPC） |
 | 内存占用 | ~50MB | ~200MB（含 ChromaDB 客户端） |
+| 数据科学生态 | 不需要 numpy/pandas | 生态丰富但本项目用不上 |
+| CPU密集型 | 不如 Python C 扩展 | 更高效（但本项目是 I/O 密集型） |
+| 中文NLP | 工具链不如 Python | 丰富（但本项目用简单分词就够） |
 
-**优势**：
-- 部署简单：`npm install` + `node src/index.js`，不需要 Python 虚拟环境
-- 通信高效：OpenClaw 主程序是 Node.js，同语言直接 HTTP 调用，无序列化开销
-- 生态够用：better-sqlite3、Fastify 都是成熟方案
+**小白**：那 Node.js 有什么劣势吗？
 
-**劣势**：
-- 数据科学生态不如 Python（但本项目不需要 numpy/pandas）
-- CPU 密集型任务不如 Python 的 C 扩展高效（但本项目是 I/O 密集型）
+**架构师**：
+- 数据科学生态不如 Python（但本项目不需要）
+- CPU 密集型任务不如 Python C 扩展（但本项目是 I/O 密集型）
 - 中文 NLP 工具链不如 Python 丰富（但本项目用简单分词就够了）
+
+**结论**：本项目是 I/O 密集型，不需要复杂 NLP，Node.js 生态完全够用。
+
+---
 
 ### 1.2 为什么是单服务而不是微服务？
 
@@ -53,31 +76,56 @@
 | 故障点 | 3 个进程都可能挂 | 1 个进程 |
 | 调试 | 跨服务日志追踪 | 单进程日志 |
 
-**优势**：部署简单、故障点少、内存占用低、调试方便
-**劣势**：单进程无法水平扩展（但本项目数据量不需要）
+**小白**：单服务不能水平扩展怎么办？
+
+**架构师**：本项目数据量在 GB 级别以内，单进程完全够用。如果未来需要扩展，可以拆分为读写分离，但目前没必要。
+
+**结论**：部署简单、故障点少、内存占用低、调试方便。
+
+---
 
 ### 1.3 为什么放弃向量检索和 BM25 分块索引？
 
-**小白**：我看到项目从 ChromaDB + Embedding + BM25 分块索引变成了 localMem + LLM Wiki，为什么？
+**小白**：我看到项目从 ChromaDB + Embedding + BM25 分块索引变成了 localMem + LLM Wiki，为什么？搜索质量会下降吗？
 
-**架构师**：三步演化：
+**架构师**：这是本项目最大的架构决策，我详细解释一下三步演化：
 
-1. **移除向量检索**：中文没有空格分隔，embedding 模型对短查询和长文档的语义匹配不稳定，经常"看起来相关但实际不相关"。而且 ChromaDB + Python Embedding 服务需要额外 500MB 内存和 GPU 资源
-2. **移除 BM25 分块索引（static_kb）**：BM25 分块索引把文件切成 chunk 建索引，但 LLM Wiki 的页面本身就是编译好的结构化文档——切碎反而丢失结构。Agent 可以直接用 `read_file` 读文件，不需要中间层建索引
-3. **保留 LLM Wiki**：Karpathy 提出的 LLM Wiki 模式，把知识编译成结构化 Markdown，人可读、机可查、易维护
+#### 第一步：移除向量检索
 
-**小白**：那搜索质量会下降吗？
+**问题**：
+- 中文没有空格分隔，embedding 模型对短查询和长文档的语义匹配不稳定
+- 经常出现"看起来相关但实际不相关"的情况
+- ChromaDB + Python Embedding 服务需要额外 500MB 内存和 GPU 资源
 
-**架构师**：不会。对于精确匹配（文件名、端口号、函数名），关键词搜索本来就够用。对于语义理解，LLM Wiki 的结构化页面比 embedding 分块更准确——因为 wiki 页面是完整的知识文档，不是切碎的 512 token 片段。用户搜"帧同步"，直接命中 `[[帧同步-Lockstep]]` 整个页面，比向量检索返回 3 个不相关的代码片段好得多。
+**小白**：能举个例子吗？
+
+**架构师**：用户搜"帧同步"，向量检索可能返回"同步帧率"、"帧动画"、"同步机制"等看似相关但实际不同的内容。而关键词搜索直接命中 `[[帧同步-Lockstep]]` 整个页面，更准确。
+
+#### 第二步：移除 BM25 分块索引（static_kb）
+
+**问题**：
+- BM25 分块索引把文件切成 chunk 建索引
+- 但 LLM Wiki 的页面本身就是编译好的结构化文档——切碎反而丢失结构
+- Agent 可以直接用 `read_file` 读文件，不需要中间层建索引
+
+#### 第三步：保留 LLM Wiki
+
+**Karpathy 提出的 LLM Wiki 模式**：把知识编译成结构化 Markdown，人可读、机可查、易维护。
+
+**小白**：那搜索质量到底怎么样？
+
+**架构师**：不会下降。对比一下：
 
 | 维度 | 传统 RAG | LLM Wiki |
 |------|---------|----------|
 | 检索方式 | 向量相似度 + 分块 | 关键词匹配 + 整页阅读 |
-| 知识组织 | 切片/分块 | 结构化页面 |
+| 知识组织 | 切片/分块（512 token） | 结构化页面（完整知识文档） |
 | 人类可读性 | 差（分块后语义不完整） | 好（整页就是完整的知识文档） |
 | 人机协作 | 困难 | 自然（直接编辑 Markdown） |
 | 维护成本 | 需要维护向量数据库 | 只需维护 Markdown 文件 |
 | 知识生长 | 被动（依赖检索） | 主动（持续编译完善） |
+
+**结论**：对于精确匹配（文件名、端口号、函数名），关键词搜索本来就够用。对于语义理解，LLM Wiki 的结构化页面比 embedding 分块更准确——因为 wiki 页面是完整的知识文档，不是切碎的 512 token 片段。
 
 ---
 
@@ -95,20 +143,16 @@
 | 日志 | 内置 Pino（最快的 Node.js 日志库） | 需要自行集成 |
 | TypeScript | 原生类型支持 | 需要 @types/express |
 
-**选择**：Fastify
+**小白**：Fastify 有什么劣势吗？
 
-**优势**：
-- 性能优势明显，JSON 序列化速度是 Express 的 2-3 倍
-- 内置请求验证（`preHandler` + `validate()` 模式），不需要额外中间件
-- 插件作用域隔离，避免全局污染
-- 内置 Pino 日志，零配置即可使用
-
-**劣势**：
+**架构师**：
 - 生态比 Express 小（但本项目不需要大量中间件）
 - 学习曲线比 Express 略陡（但 API 风格相似）
 - 部分第三方库只有 Express 中间件版本（本项目未遇到）
 
 **请求验证实现**：用 `validateBody` preHandler 模式。每个请求模型（如 `MemorySaveRequest`）都有 `validate()` 方法，返回 `{ valid, errors }`。验证失败时返回 400 + 错误详情，验证通过时继续路由处理。
+
+**结论**：性能优势明显，内置验证和日志，插件作用域隔离。
 
 ---
 
@@ -127,39 +171,48 @@
 | 并发 | 单写多读（WAL 模式） | 多写多读 | 单线程 |
 | 适用场景 | 单机嵌入式 | 多客户端服务 | 缓存/会话 |
 
-**选择**：better-sqlite3 + WAL 模式
+**小白**：SQLite 有什么劣势吗？
 
-**优势**：
-- 零部署：数据库就是一个文件，不需要独立服务
-- 零网络开销：进程内调用，没有 TCP 连接
-- 完整 SQL：LIKE 查询、事务、JOIN 全支持
-- WAL 模式：读写不互斥，读操作不阻塞写操作
-- 同步 API：better-sqlite3 是同步的，不需要 async/await，代码更简洁
-
-**劣势**：
+**架构师**：
 - 单写：同一时刻只能有一个写操作（但本项目写操作频率低）
 - 不支持多进程写入（本项目单进程，无此问题）
 - 不适合超大数据集（本项目数据量在 GB 级别以内）
 
 ### 关键实现细节
 
-**WAL 管理**：
-- 启动时自动启用 WAL 模式：`this.db.pragma('journal_mode = WAL')`
-- WAL 超过 10MB 或 log frames 超过 1000 时自动 checkpoint
-- 每小时检查一次是否需要 checkpoint
-- 服务关闭时执行 TRUNCATE checkpoint，确保 WAL 数据写入主库
-- `uncaughtException` 时紧急执行 checkpoint + close，避免数据丢失
+#### WAL 管理
 
-**Prepared Statement 缓存**：
-- `_stmtCache` Map 缓存已编译的 SQL 语句
-- `_getStmt(sql)` 优先从缓存取，避免重复编译
-- 高频 SQL（如 `queryMemory`、`addQueryHash`）受益最大
+```javascript
+// 启动时自动启用 WAL 模式
+this.db.pragma('journal_mode = WAL');
 
-**数据库迁移版本控制**：
-- `_meta` 表记录 `migration_version`
-- 迁移是幂等的：`_ensureColumns` 只添加缺失的列
-- 版本 1 迁移：删除废弃表（`memory_reviews`、`wiki_exports`、`memory_mentions`、`runtime_state`、`memory_items_fts`）和废弃触发器
-- 旧状态自动迁移：7 态 → 2 态（`local_only`/`manual_only` → `kept`，`wiki_candidate`/`candidate_on_reuse` → `tentative`，`discarded`/`archived` → 硬删除）
+// WAL 超过 10MB 或 log frames 超过 1000 时自动 checkpoint
+// 每小时检查一次是否需要 checkpoint
+// 服务关闭时执行 TRUNCATE checkpoint，确保 WAL 数据写入主库
+// uncaughtException 时紧急执行 checkpoint + close，避免数据丢失
+```
+
+#### Prepared Statement 缓存
+
+```javascript
+// _stmtCache Map 缓存已编译的 SQL 语句
+// _getStmt(sql) 优先从缓存取，避免重复编译
+// 高频 SQL（如 queryMemory、addQueryHash）受益最大
+```
+
+#### 数据库迁移版本控制
+
+```javascript
+// _meta 表记录 migration_version
+// 迁移是幂等的：_ensureColumns 只添加缺失的列
+// 版本 1 迁移：删除废弃表（memory_reviews、wiki_exports 等）和废弃触发器
+// 旧状态自动迁移：7态 → 2态
+//   - local_only/manual_only → kept
+//   - wiki_candidate/candidate_on_reuse → tentative
+//   - discarded/archived → 硬删除
+```
+
+**结论**：零部署、零网络开销、完整 SQL、WAL 模式、同步 API。
 
 ---
 
@@ -185,27 +238,27 @@ WHERE (content LIKE '%token1%' OR aliases_json LIKE '%"token1"%')
 ORDER BY updated_at DESC LIMIT ?
 ```
 
-**中文 bigram 扩展搜索**：精确匹配不足时，自动将中文查询词拆分为 bigram（双字组合），放宽匹配条件：
+**小白**：中文 bigram 扩展搜索是什么？
+
+**架构师**：中文没有空格分词，"帧同步策略"和"帧同步"共享"帧同"和"同步"两个 bigram，但精确匹配 "帧同步策略" 搜不到 "帧同步"。bigram 扩展解决了这个问题。
 
 ```javascript
 // "帧同步" → ["帧同", "同步"]
 // 至少匹配 ceil(bigrams.length / 2) 个 bigram
 ```
 
-为什么需要这个？中文没有空格分词，"帧同步策略"和"帧同步"共享"帧同"和"同步"两个 bigram，但精确匹配 "帧同步策略" 搜不到 "帧同步"。bigram 扩展解决了这个问题。
-
 **搜索排序权重** (`RELEVANCE_WEIGHTS.search`)：
-- **命中率 (hitRate)** 50%：查询词在内容中的命中比例
-- **位置 (position)** 20%：命中词出现位置越靠前分越高
-- **频次 (count)** 15%：记忆被查询命中的历史次数（从 `unique_query_hashes` 字段计算）
-- **新鲜度 (freshness)** 15%：越新的记忆分越高
 
-**置信度权重** (`RELEVANCE_WEIGHTS.confidence`)：
-- **命中率 (hitRate)** 40% / **位置 (position)** 20% / **频次 (count)** 20% / **新鲜度 (freshness)** 20%
-
-```javascript
+```
 score = hitRate * 0.5 + positionScore * 0.2 + countScore * 0.15 + freshnessScore * 0.15
 ```
+
+| 维度 | 权重 | 说明 |
+|------|------|------|
+| 命中率 (hitRate) | 50% | 查询词在内容中的命中比例 |
+| 位置 (position) | 20% | 命中词出现位置越靠前分越高 |
+| 频次 (count) | 15% | 记忆被查询命中的历史次数 |
+| 新鲜度 (freshness) | 15% | 越新的记忆分越高 |
 
 **频次维度**：每次查询命中一条记忆时，`addQueryHash()` 会把查询的哈希值追加到 `unique_query_hashes` 字段。`computeRelevanceScore` 用 `Math.min(1, _hitCount / 3)` 归一化——被 3 次以上不同查询命中的记忆，频次维度得满分。
 
@@ -222,12 +275,13 @@ score += titleMatchCount * 5 + contentMatchCount;
 // 返回 score > 0 的页面，按 score 降序
 ```
 
-为什么不用 BM25？三个原因：
+**为什么不用 BM25？三个原因**：
+
 1. **~24 页太少**，BM25 的 IDF（逆文档频率）区分度极低——每个词几乎都只出现在 1-2 个页面里
 2. **返回整页不是 chunk**，BM25 的核心优势是 chunk 级精确匹配，但 wiki 返回整页
 3. **零依赖零状态**，不需要建索引、不需要缓存文件、不需要增量同步
 
-搜索缓存：5 分钟 TTL（`_searchCacheTTL = 300000`ms），`saveWikiPage` 或 `removeWikiPage` 被调用时主动失效。外部直接编辑 wiki 文件时缓存不会感知——需要等 TTL 过期。
+**搜索缓存**：5 分钟 TTL（`_searchCacheTTL = 300000`ms），`saveWikiPage` 或 `removeWikiPage` 被调用时主动失效。外部直接编辑 wiki 文件时缓存不会感知——需要等 TTL 过期。
 
 ### 4.3 为什么不用 FTS5？
 
@@ -247,7 +301,7 @@ score += titleMatchCount * 5 + contentMatchCount;
 > | 改动范围 | — | `wiki/compiler.js` 的 `searchWiki()` 方法，约 50 行 |
 > | 依赖 | 无 | `bm25Okapi` npm 包（或内联实现） |
 >
-> 关键设计决策：即使升级 BM25，仍返回**整页**而非 chunk。wiki 页面本身就是编译好的结构化文档，切碎会丢失上下文。
+> **关键设计决策**：即使升级 BM25，仍返回**整页**而非 chunk。wiki 页面本身就是编译好的结构化文档，切碎会丢失上下文。
 
 ---
 
@@ -255,7 +309,19 @@ score += titleMatchCount * 5 + contentMatchCount;
 
 **小白**：记忆系统为什么只有 tentative 和 kept 两个状态？
 
-**架构师**：之前的 7 态模型（tentative / local_only / manual_only / candidate_on_reuse / wiki_candidate / published / discarded）太复杂了。实际使用中，local_only 和 manual_only 没有语义差异，candidate_on_reuse 和 wiki_candidate 的提权路径也几乎没人用。简化为 2 态后，代码量减半，认知负担大幅降低。
+**架构师**：之前的 7 态模型太复杂了：
+
+```
+旧模型：tentative / local_only / manual_only / candidate_on_reuse / wiki_candidate / published / discarded
+新模型：tentative / kept
+```
+
+实际使用中：
+- `local_only` 和 `manual_only` 没有语义差异
+- `candidate_on_reuse` 和 `wiki_candidate` 的提权路径也几乎没人用
+- 简化为 2 态后，代码量减半，认知负担大幅降低
+
+**状态转换图**：
 
 ```
 tentative ──用户确认──→ kept（永久保留）
@@ -263,14 +329,9 @@ tentative ──用户确认──→ kept（永久保留）
     └──丢弃──→ 从数据库硬删除（不留痕迹）
 ```
 
-**选择**：tentative / kept 二态模型
+**小白**：2 态模型有什么劣势吗？
 
-**优势**：
-- 认知负担低：只有两种状态，新人一眼看懂
-- 代码简洁：状态转换逻辑只有一条路径
-- 硬删除干净：丢弃不留痕迹，不会积累垃圾数据
-
-**劣势**：
+**架构师**：
 - 没有中间状态：不能标记"可能有用但不确定"的记忆
 - 没有 wiki 提权路径：记忆不会自动变成 wiki 页面（但 wiki 由独立编译系统管理，不需要这个路径）
 
@@ -595,24 +656,9 @@ Unix Socket 客户端 → 透明代理（自动注入 Bearer Token）→ Fastify
 
 ---
 
-## 十二、技术选型原则总结
+## 十二、API 速率限制与安全
 
-1. **务实优先**：关键词匹配 + SQLite 是经过验证的技术，不需要 GPU
-2. **最小依赖**：单服务架构，不依赖 ChromaDB/Python 服务，不依赖 BM25 索引库
-3. **人机协作**：LLM Wiki 的 Markdown 格式让人和 AI 都能读写
-4. **可观测性**：健康检查、结构化日志、Metrics 端点——出问题要知道哪里坏了
-5. **简化优先**：2 态记忆模型比 7 态好维护，不建索引比建索引好调试
-6. **优雅降级**：LLM 语义比较不可用时自动降级为词法匹配，不会阻塞主流程
-7. **安全默认**：路径遍历防护、Bearer Token 认证、Unix Socket 自动注入、API 速率限制
-8. **数据安全**：Graceful Shutdown 确保 WAL 数据不丢失，uncaughtException 紧急 checkpoint
-9. **模块化架构**：路由、中间件、业务逻辑分离，便于维护和测试
-10. **性能优先**：BM25 搜索在页面增多时自动启用，保证搜索质量
-
----
-
-## 十三、新增功能说明（2026-05-01 更新）
-
-### 13.1 API 速率限制
+### 12.1 速率限制
 
 为防止 API 滥用和 DDoS 攻击，新增了基于 token bucket 算法的速率限制：
 
@@ -625,10 +671,10 @@ Unix Socket 客户端 → 透明代理（自动注入 Bearer Token）→ Fastify
 **实现细节**：
 - 使用 `rate-limiter-flexible` 库的内存存储
 - 基于 IP 地址进行限制
+- Unix Socket 请求有更高的限额（200 points / 60s）
 - 超限时返回 429 状态码和 `Retry-After` 头
-- `/metrics` 端点包含速率限制指标
 
-### 13.2 CORS 配置
+### 12.2 CORS 配置
 
 支持跨域资源共享（CORS）配置：
 
@@ -641,7 +687,7 @@ Unix Socket 客户端 → 透明代理（自动注入 Bearer Token）→ Fastify
 - 支持凭据（cookies）传递
 - 24 小时预检缓存
 
-### 13.3 统一错误处理
+### 12.3 统一错误处理
 
 建立了统一的错误响应格式：
 
@@ -665,7 +711,7 @@ Unix Socket 客户端 → 透明代理（自动注入 Bearer Token）→ Fastify
 - `RATE_LIMIT_EXCEEDED` (429) - 速率限制
 - `INTERNAL_ERROR` (500) - 服务器内部错误
 
-### 13.4 请求追踪
+### 12.4 请求追踪
 
 每个请求自动分配唯一 ID：
 
@@ -674,22 +720,9 @@ Unix Socket 客户端 → 透明代理（自动注入 Bearer Token）→ Fastify
 - 日志中包含请求 ID 用于问题追踪
 - 错误响应中包含请求 ID
 
-### 13.5 BM25 搜索升级
+---
 
-Wiki 搜索支持 BM25Okapi 算法，当页面数量超过阈值时自动启用：
-
-| 配置 | 默认值 | 说明 |
-|------|--------|------|
-| 启用阈值 | 200 页 | 超过此数量启用 BM25 |
-| k1 参数 | 1.5 | 词频饱和参数 |
-| b 参数 | 0.75 | 文档长度归一化参数 |
-
-**特性**：
-- 中文支持：字符级 + bigram 分词
-- 标题加权：标题匹配得分 × 1.5
-- 自动降级：页面少时使用简单词频匹配
-
-### 13.6 模块化架构
+## 十三、模块化架构
 
 代码重构为模块化结构：
 
@@ -700,6 +733,7 @@ src/
 │   ├── rate-limit.js (速率限制)
 │   ├── cors.js (CORS)
 │   ├── tracing.js (请求追踪)
+│   ├── validation.js (请求验证)
 │   └── error-handler.js (错误处理)
 ├── routes/
 │   ├── memory.js (记忆路由)
@@ -707,29 +741,63 @@ src/
 │   ├── health.js (健康检查)
 │   ├── benchmark.js (基准测试)
 │   └── legacy-bridge.js (兼容层)
-└── wiki/
-    └── bm25.js (BM25搜索)
+├── facades/
+│   ├── memory.js (记忆门面)
+│   ├── health.js (健康门面)
+│   └── benchmark.js (基准测试门面)
+├── memory/
+│   ├── models.js (数据模型)
+│   ├── local-memory.js (核心逻辑)
+│   ├── sqlite-store.js (SQLite存储)
+│   └── governance.js (治理系统)
+├── wiki/
+│   ├── compiler.js (Wiki编译器)
+│   ├── manifest.js (清单管理)
+│   └── bm25.js (BM25搜索)
+└── api/
+    ├── contract.js (请求契约)
+    └── presenter.js (响应格式化)
 ```
+
+**设计模式**：
+- **Facade 模式**：`KnowledgeBase` 作为组合门面，聚合 Memory/Health/Benchmark/Wiki 四个子模块
+- **分层架构**：Routes → Facades → Business Logic → SQLite Store
+- **Plugin 模式**：Fastify 的 `register` 注册路由模块，每个路由模块接收 `routeContext` 依赖注入
+
+---
+
+## 十四、技术选型原则总结
+
+1. **务实优先**：关键词匹配 + SQLite 是经过验证的技术，不需要 GPU
+2. **最小依赖**：单服务架构，不依赖 ChromaDB/Python 服务，不依赖 BM25 索引库
+3. **人机协作**：LLM Wiki 的 Markdown 格式让人和 AI 都能读写
+4. **可观测性**：健康检查、结构化日志、Metrics 端点——出问题要知道哪里坏了
+5. **简化优先**：2 态记忆模型比 7 态好维护，不建索引比建索引好调试
+6. **优雅降级**：LLM 语义比较不可用时自动降级为词法匹配，不会阻塞主流程
+7. **安全默认**：路径遍历防护、Bearer Token 认证、Unix Socket 自动注入、API 速率限制
+8. **数据安全**：Graceful Shutdown 确保 WAL 数据不丢失，uncaughtException 紧急 checkpoint
+9. **模块化架构**：路由、中间件、业务逻辑分离，便于维护和测试
+10. **性能优先**：BM25 搜索在页面增多时自动启用，保证搜索质量
 
 ---
 
 ## 附录 A：速查卡（出问题先看哪里）
 
-| 问题现象 | 排查方式 |
-|---------|---------|
-| Wiki 搜不到结果 | 调用 MCP 工具 `wiki_detect_changes` 检查是否需要编译 |
-| 服务起不来 | `journalctl --user -u openclaw-context-engine.service` |
-| Wiki 没编译 | 调用 MCP 工具 `wiki_check_stale` |
-| 磁盘满了 | `du -sh ./runtime/` |
-| 记忆搜不到 | 检查 `memory_items` 表中的 `status` 和 `content` |
-| WAL 膨胀 | `curl http://127.0.0.1:8901/metrics` 查看 `process.external_mb` |
-| 服务无响应 | `curl http://127.0.0.1:8901/api/health/ready` 检查是否存活 |
-| 性能下降 | 检查 metrics 中 `requests_total` 与 `errors_total` 比例 |
-| 治理误判 | 检查 `SIDE_LLM_GATEWAY_URL` 是否配置，未配置时仅用词法匹配 |
-| Benchmark 崩溃 | 检查 `config/benchmark-scenarios/` 目录是否存在场景文件 |
-| autoTriage 不工作 | 检查 `memory_events` 表是否有 `auto_triage_failure` 事件 |
-| Unix Socket 连不上 | 检查 `/tmp/openclaw-engine.sock` 是否存在，权限是否 0600 |
-| 认证失败 | 检查 `OPENCLAW_API_SECRET` 是否配置，Bearer Token 是否正确 |
+| 问题现象 | 排查方式 | 相关章节 |
+|---------|---------|---------|
+| Wiki 搜不到结果 | 调用 MCP 工具 `wiki_detect_changes` 检查是否需要编译 | 七 |
+| 服务起不来 | `journalctl --user -u openclaw-context-engine.service` | - |
+| Wiki 没编译 | 调用 MCP 工具 `wiki_check_stale` | 七 |
+| 磁盘满了 | `du -sh ./runtime/` | 三 |
+| 记忆搜不到 | 检查 `memory_items` 表中的 `status` 和 `content` | 四、五 |
+| WAL 膨胀 | `curl http://127.0.0.1:8901/metrics` 查看 `process.external_mb` | 三 |
+| 服务无响应 | `curl http://127.0.0.1:8901/api/health/ready` 检查是否存活 | - |
+| 性能下降 | 检查 metrics 中 `requests_total` 与 `errors_total` 比例 | 十二 |
+| 治理误判 | 检查 `SIDE_LLM_GATEWAY_URL` 是否配置，未配置时仅用词法匹配 | 六 |
+| Benchmark 崩溃 | 检查 `config/benchmark-scenarios/` 目录是否存在场景文件 | 十一 |
+| autoTriage 不工作 | 检查 `memory_events` 表是否有 `auto_triage_failure` 事件 | 五 |
+| Unix Socket 连不上 | 检查 `/tmp/openclaw-engine.sock` 是否存在，权限是否 0600 | 十 |
+| 认证失败 | 检查 `OPENCLAW_API_SECRET` 是否配置，Bearer Token 是否正确 | 十 |
 
 ---
 
@@ -768,17 +836,17 @@ src/
 |------|------|---------|
 | `fastify` | ^4.26.0 | HTTP 框架，性能优于 Express，内置验证和日志 |
 | `better-sqlite3` | ^9.4.0 | SQLite 绑定，同步 API，WAL 模式支持，零部署 |
-| `winston` | ^3.17.0 | 业务日志，丰富的传输层和格式化选项 |
 | `pino` | ^8.19.0 | Fastify 内置 HTTP 日志，性能最优 |
 | `dotenv` | ^16.4.0 | 环境变量加载，12-Factor App 标准做法 |
 | `uuid` | ^9.0.1 | UUID 生成，用于记忆 ID、会话 ID 等 |
 | `zod` | ^3.22.4 | Schema 验证（当前未深度使用，预留扩展） |
-| `rate-limiter-flexible` | ^5.0.0 | API 速率限制，防止滥用和 DDoS 攻击 |
+| `rate-limiter-flexible` | ^11.0.1 | API 速率限制，防止滥用和 DDoS 攻击 |
 | `eslint` | ^8.57.0 | 代码质量检查（devDependency） |
+| `c8` | ^11.0.0 | 代码覆盖率（devDependency） |
+| `pino-pretty` | ^10.3.1 | 开发环境日志格式化（devDependency） |
 
 ---
 
-*本文档最后更新：2026-05-01*
-*反映 localMem + LLM Wiki 双引擎架构（已移除 BM25/static_kb）*
-*新增：认证方案、日志选型、配置管理、基准测试框架、中文 bigram 扩展搜索、检索洞察注入、人工编辑保护、数据库迁移版本控制、Prepared Statement 缓存、Unix Socket 代理、路径遍历防护、Graceful Shutdown*
-*2026-05-01 更新：API 速率限制、CORS 配置、统一错误处理、请求追踪、模块化架构、BM25 搜索升级、边界条件测试、性能基准测试*
+*本文档最后更新：2026-05-02*
+*反映 localMem + LLM Wiki 双引擎架构*
+*覆盖：语言选择、架构选择、数据库、HTTP框架、搜索方案、记忆模型、治理系统、Wiki编译、日志、配置、认证、基准测试、速率限制、CORS、错误处理、请求追踪、模块化架构*
