@@ -9,12 +9,25 @@ import { fileURLToPath } from 'url';
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
+import { validateConfig } from './config-schema.js';
 
 const __filename = fileURLToPath(import.meta.url); // 当前模块文件的绝对路径
 const __dirname = path.dirname(__filename); // 当前模块所在目录
 
 // 加载 .env 文件
 dotenv.config({ path: path.join(__dirname, '../config/context-engine.env') });
+
+// Schema validation at startup
+const validation = validateConfig(process.env);
+if (!validation.success) {
+  console.error('[config] Environment validation failed:');
+  for (const err of validation.errors) {
+    console.error(`  - ${err}`);
+  }
+  if (process.env.NODE_ENV === 'production') {
+    process.exit(1);
+  }
+}
 
 // ========== 路径常量 ==========
 export const PROJECT_ROOT = path.resolve(process.env.PROJECT_ROOT || path.join(__dirname, '..', '..', 'workspace')); // 项目根目录

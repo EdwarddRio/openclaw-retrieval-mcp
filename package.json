@@ -7,6 +7,8 @@
   "scripts": {
     "start:http": "node src/index.js",
     "test": "node --test tests/**/*.test.js",
+    "test:coverage": "c8 --reporter=text --reporter=html node --test tests/**/*.test.js",
+    "test:contract": "bash scripts/test-contract.sh",
     "lint": "eslint src/",
     "healthcheck": "scripts/healthcheck.sh",
     "benchmark": "node src/benchmark/cli.js",
@@ -22,6 +24,7 @@
     "zod": "^3.22.4"
   },
   "devDependencies": {
+    "c8": "^11.0.0",
     "eslint": "^8.57.0",
     "pino-pretty": "^10.3.1"
   },
