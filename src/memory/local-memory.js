@@ -8,7 +8,7 @@ import path from 'path';
 import crypto from 'crypto';
 import { logger, LOCALMEM_DIR, LOCALMEM_FACT_MAX_AGE_DAYS, LOCALMEM_SESSION_MAX_AGE_DAYS, PROJECT_ROOT, LOCALMEM_DAILY_WRITE_LIMIT, LOCALMEM_TENTATIVE_TTL_DAYS } from '../config.js';
 import { SqliteStore } from './sqlite-store.js';
-import { ChatTurn, ChatSession, MemoryFact, isoNow, canonicalKeyForText, computeRelevanceScore, TRIAGE_CONFIRM_SIGNALS, TRIAGE_DISCARD_SIGNALS, TRIAGE_MIN_CONTENT_LENGTH, TRIAGE_MAX_CONTENT_LENGTH, RELEVANCE_WEIGHTS } from './models.js';
+import { ChatTurn, ChatSession, MemoryFact, isoNow, canonicalKeyForText, computeRelevanceScore, TRIAGE_CONFIRM_SIGNALS, TRIAGE_DISCARD_SIGNALS, TRIAGE_MIN_CONTENT_LENGTH, TRIAGE_MAX_CONTENT_LENGTH, RELEVANCE_WEIGHTS, WEIGHT, CATEGORY } from './models.js';
 import { planKnowledgeUpdate } from './governance.js';
 
 // ========== Saveable states ==========
@@ -216,11 +216,11 @@ export class LocalMemoryStore {
   }
 
   /**
-   * 完整记忆查询，返回命中结果、暂定条目、新鲜度信息和弃权信号
+   * 完整记忆查询，返回命中结果、待审核条目、新鲜度信息和弃权信号
    * @param {string} query - 查询文本
    * @param {number} [topK=3] - 返回结果数量上限
    * @param {string} [sessionId] - 会话 ID（⚠️ 当前未实现会话范围过滤，查询始终为全局范围，保留供未来扩展）
-   * @returns {{ hits: Array, tentative_items: Array, freshness: Object, abstention_signals: Object, memory_context: Object }}
+   * @returns {{ hits: Array, weak_items: Array, freshness: Object, abstention_signals: Object, memory_context: Object }}
    */
   queryMemoryFull(query, topK = 3, sessionId = null) {
     const hits = this._store.queryMemory(query, topK, sessionId);
@@ -233,7 +233,8 @@ export class LocalMemoryStore {
         this._store.addQueryHash(hit.memory_id, queryHash);
       }
     }
-    const tentativeItems = this._store.listMemoryByState('tentative', topK);
+    // v3.3: 使用 weight='WEAK' 替代 state='tentative'
+    const weakItems = this._store.listMemoryByWeight('WEAK', topK);
     const freshness = this._freshnessPayload(hits);
     const computedConfidence = this._computeConfidence(query, hits);
     const memoryContext = {
@@ -268,7 +269,7 @@ export class LocalMemoryStore {
     };
     return {
       hits,
-      tentative_items: tentativeItems,
+      weak_items: weakItems, // v3.3: 从 tentative_items 改为 weak_items
       freshness,
       abstention_signals: {
         should_abstain: hits.length === 0,
@@ -399,9 +400,13 @@ export class LocalMemoryStore {
    * @param {string[]} [options.aliases] - 别名列表
    * @param {string[]} [options.path_hints] - 路径提示列表
    * @param {string[]} [options.collection_hints] - 集合提示列表
-   * @param {string} [options.state] - 状态（tentative/kept）
-   * @param {string} [options.source] - 来源（manual/auto_triage/user_explicit/auto_draft）
+   * @param {string} [options.state] - @deprecated 使用 category+weight 替代
+   * @param {string} [options.source] - 来源（manual/auto_triage/user_explicit/auto_draft/dream-cycle）
    * @param {string} [options.created_at] - 创建时间
+   * @param {string} [options.category] - 记忆分类（fact|preference|project|instruction|episodic）
+   * @param {string} [options.weight] - 权重（STRONG|MEDIUM|WEAK）
+   * @param {string} [options.weight_set_at] - weight最后变更时间
+   * @param {string} [options.expires_at] - 过期时间
    * @returns {Object} 保存后的记忆对象，日限额到达时返回 rate_limited 状态
    */
   saveMemory(options) {
@@ -415,6 +420,10 @@ export class LocalMemoryStore {
       state,
       source,
       created_at,
+      category,
+      weight,
+      weight_set_at,
+      expires_at,
     } = options;
 
     const normalizedState = (state || 'tentative').trim() || 'tentative';
@@ -466,6 +475,11 @@ export class LocalMemoryStore {
       collection_hints: normalizedCollectionHints,
       source: source || 'manual',
       created_at: now,
+      // v3.3: weight-based lifecycle
+      category: category || 'general',
+      weight: weight || 'MEDIUM',
+      weight_set_at: weight_set_at || now,
+      expires_at: expires_at || null,
     }));
 
     if (session_id && this._store.updateSession) {
@@ -480,7 +494,7 @@ export class LocalMemoryStore {
         memory_id: memoryId,
         event_type: 'memory_created',
         created_at: now,
-        event_data: { state: normalizedState, source: source },
+        event_data: { state: normalizedState, source: source, category: category, weight: weight },
       });
     } catch (error) {
       logger.warn(`Failed to append timeline event: ${error}`);
@@ -747,7 +761,7 @@ export class LocalMemoryStore {
   }
 
   /**
-   * 定期清理过期数据（每 24 小时执行一次）：清理旧轮次、旧会话、旧事件、过期暂定记忆
+   * 定期清理过期数据（每 24 小时执行一次）：清理旧轮次、旧会话、旧事件、权重衰减GC
    */
   _maybePeriodicCleanup() {
     if (!this._store) return;
@@ -764,10 +778,14 @@ export class LocalMemoryStore {
       const turnResult = this._store.cleanupOldTurns(sessionAge);
       const sessionResult = this._store.cleanupOldSessions(sessionAge);
       const eventResult = this._store.cleanupOldEvents(30);
-      const tentativeResult = this._store.cleanupExpiredTentative(LOCALMEM_TENTATIVE_TTL_DAYS);
+      
+      // v3.3: 使用基于权重的衰减GC替代旧的tentative TTL清理
+      const weightResult = this._store.cleanupByWeight();
+      
       logger.info(
         `Periodic cleanup: turns=${turnResult.deleted}, sessions=${sessionResult.deleted}, ` +
-        `events=${eventResult.deleted}, tentative=${tentativeResult.deleted}`
+        `events=${eventResult.deleted}, weight_downgraded=${weightResult.downgraded}, ` +
+        `weight_deleted=${weightResult.deleted}, weight_expired=${weightResult.expired}`
       );
       this._cleanupConsecutiveFails = 0;
     } catch (err) {
@@ -794,6 +812,7 @@ export class LocalMemoryStore {
 
   /**
    * Auto-triage a conversation turn for memory extraction (async, with governance).
+   * v3.3: 根据信号强度自动分配 category 和 weight
    */
   async autoTriageTurn(options) {
     const { session_id, role, content, previous_content, persist = true, side_llm_gateway } = options;
@@ -801,6 +820,10 @@ export class LocalMemoryStore {
 
     if (role === 'assistant' && this._shouldKeepCandidate(content) && this._isKnowledgeAssertion(content)) {
       const aliases = this._extractAliasesFromContent(content);
+      
+      // v3.3: 智能分类 - 根据信号强度自动分配 weight
+      const triageResult = this._classifyBySignalStrength(content, 'assistant');
+      
       if (persist) {
         const saved = await this.saveMemoryWithGovernance({
           session_id,
@@ -808,7 +831,10 @@ export class LocalMemoryStore {
           aliases,
           state: 'tentative',
           source: 'auto_triage',
-            sideLlmGateway: side_llm_gateway,
+          category: triageResult.category,
+          weight: triageResult.weight,
+          weight_set_at: isoNow(),
+          sideLlmGateway: side_llm_gateway,
         });
         candidates.push(saved);
       } else {
@@ -819,6 +845,8 @@ export class LocalMemoryStore {
           aliases,
           state: 'tentative',
           canonical_key: canonicalKeyForText(content),
+          category: triageResult.category,
+          weight: triageResult.weight,
         });
       }
     }
@@ -827,6 +855,10 @@ export class LocalMemoryStore {
       const extracted = this._extractMemoryFromUserMessage(content, previous_content);
       if (extracted && this._shouldKeepCandidate(extracted)) {
         const aliases = this._extractAliasesFromContent(extracted);
+        
+        // v3.3: 用户显式请求 → MEDIUM
+        const triageResult = this._classifyBySignalStrength(extracted, 'user');
+        
         if (persist) {
           const saved = await this.saveMemoryWithGovernance({
             session_id,
@@ -834,6 +866,9 @@ export class LocalMemoryStore {
             aliases,
             state: 'tentative',
             source: 'user_explicit',
+            category: triageResult.category,
+            weight: triageResult.weight,
+            weight_set_at: isoNow(),
             sideLlmGateway: side_llm_gateway,
           });
           saved._user_feedback = `我已记住：${extracted.slice(0, 50)}`;
@@ -849,14 +884,43 @@ export class LocalMemoryStore {
             aliases,
             state: 'tentative',
             source: 'user_explicit',
-            sideLlmGateway: side_llm_gateway,
             canonical_key: canonicalKeyForText(extracted),
+            category: triageResult.category,
+            weight: triageResult.weight,
           });
         }
       }
     }
 
     return candidates;
+  }
+
+  /**
+   * 根据信号强度自动分类记忆
+   * @param {string} content - 记忆内容
+   * @param {string} role - 角色（assistant/user）
+   * @returns {{ category: string, weight: string }}
+   */
+  _classifyBySignalStrength(content, role) {
+    const cleaned = (content || '').trim().toLowerCase();
+    
+    // TRIAGE_CONFIRM_SIGNALS 匹配 → STRONG (自动确认，不经Review)
+    if (TRIAGE_CONFIRM_SIGNALS.some(s => cleaned.includes(s.toLowerCase()))) {
+      return { category: 'preference', weight: 'STRONG' };
+    }
+    
+    // 用户显式请求 → MEDIUM (需用户确认)
+    if (role === 'user' && this._containsExplicitMemoryRequest(content)) {
+      return { category: 'preference', weight: 'MEDIUM' };
+    }
+    
+    // 知识断言 → MEDIUM (需用户确认)
+    if (role === 'assistant' && this._isKnowledgeAssertion(content)) {
+      return { category: 'fact', weight: 'MEDIUM' };
+    }
+    
+    // 默认 → WEAK (3天衰减，需用户确认)
+    return { category: 'general', weight: 'WEAK' };
   }
 
   /**
@@ -1188,52 +1252,67 @@ export class LocalMemoryStore {
   // ========== Review API ==========
 
   /**
-   * 列出待审核记忆（state='tentative'）
+   * 列出待审核记忆（weight='WEAK'）
    * @param {number} [limit=50] - 返回数量上限
    * @returns {Array<Object>} 待审核记忆列表
    */
   listReviews(limit = 50) {
-    return this._store.listMemoryByState('tentative', limit);
+    return this._store.listMemoryByWeight('WEAK', limit);
   }
 
   /**
-   * 提升待审核记忆为永久（kept）
+   * 确认待审核记忆（WEAK → STRONG/MEDIUM）
    * @param {string} memoryId - 记忆 ID
+   * @param {string} [targetWeight='STRONG'] - 目标权重（STRONG/MEDIUM）
    * @param {Object} [evaluation] - 可选的评估结果
    * @returns {Object} 操作结果
    */
-  promoteReview(memoryId, evaluation = null) {
+  confirmReview(memoryId, targetWeight = 'STRONG', evaluation = null) {
     const memory = this._store.getMemory(memoryId);
     if (!memory) throw new Error(`Memory not found: ${memoryId}`);
-    if (memory.state !== 'tentative') throw new Error(`Memory is not in tentative state: ${memory.state}`);
+    if (memory.weight !== 'WEAK') throw new Error(`Memory is not in WEAK weight: ${memory.weight}`);
 
-    const autoPromoted = Boolean(
+    const autoConfirmed = Boolean(
       evaluation && typeof evaluation.score === 'number' && evaluation.score >= 0.8
     );
 
     if (evaluation) {
       this._store.evaluateMemory(memoryId, evaluation);
     }
-    this._store.updateMemoryState(memoryId, 'kept');
+    
+    // 更新权重和weight_set_at
+    this._store.updateMemoryState(memoryId, undefined, {
+      weight: targetWeight,
+      weight_set_at: isoNow(),
+    });
+    
     this._store.addEvent({
       memory_id: memoryId,
-      event_type: autoPromoted ? 'review_auto_promoted' : 'review_promoted',
+      event_type: autoConfirmed ? 'review_auto_confirmed' : 'review_confirmed',
       created_at: new Date().toISOString(),
       event_data: {
         evaluation,
-        previous_state: 'tentative',
-        auto_promoted: autoPromoted,
+        previous_weight: 'WEAK',
+        new_weight: targetWeight,
+        auto_confirmed: autoConfirmed,
         score: evaluation?.score ?? null,
       },
     });
     return {
       success: true,
       memory_id: memoryId,
-      action: 'promoted',
-      state: 'kept',
-      auto_promoted: autoPromoted,
+      action: 'confirmed',
+      weight: targetWeight,
+      auto_confirmed: autoConfirmed,
       score: evaluation?.score ?? null,
     };
+  }
+
+  /**
+   * @deprecated 使用 confirmReview 代替
+   */
+  promoteReview(memoryId, evaluation = null) {
+    return this.confirmReview(memoryId, 'STRONG', evaluation);
   }
 
   /**

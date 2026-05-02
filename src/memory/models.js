@@ -89,14 +89,18 @@ export class MemoryFact {
    * @param {string} [options.choice] - 用户决策
    * @param {string} [options.session_id] - 关联会话 ID
    * @param {string[]} [options.source_turn_ids] - 来源轮次 ID 列表
-   * @param {string} [options.state] - 状态（tentative/kept）
+   * @param {string} [options.state] - @deprecated 使用 category+weight 替代
    * @param {string} [options.normalized_text] - 归一化文本
    * @param {string[]} [options.aliases] - 别名列表
    * @param {string[]} [options.path_hints] - 路径提示列表
    * @param {string[]} [options.collection_hints] - 集合提示列表
    * @param {Array} [options.previous_versions] - 历史版本列表
-   * @param {string} [options.source] - 来源类型（manual/auto_triage/user_explicit/auto_draft）
+   * @param {string} [options.source] - 来源类型（manual/auto_triage/user_explicit/auto_draft/dream-cycle）
    * @param {string} [options.last_choice] - 最近一次用户决策
+   * @param {string} [options.category] - 记忆分类（fact|preference|project|instruction|episodic）
+   * @param {string} [options.weight] - 权重（STRONG|MEDIUM|WEAK）
+   * @param {string} [options.weight_set_at] - weight最后变更时间（衰减计时基准）
+   * @param {string} [options.expires_at] - 过期时间（null=永不过期）
    */
   constructor(options = {}) {
     // Basic fields
@@ -112,7 +116,7 @@ export class MemoryFact {
     // Extended fields
     this.session_id = options.session_id || options.source_session_id || '';
     this.source_turn_ids = options.source_turn_ids || [];
-    this.state = options.state || 'tentative';
+    this.state = options.state || 'tentative'; // @deprecated: 使用 category+weight 替代
     this.normalized_text = options.normalized_text || '';
     this.aliases = options.aliases || [];
     this.path_hints = options.path_hints || [];
@@ -120,6 +124,12 @@ export class MemoryFact {
     this.previous_versions = options.previous_versions || [];
     this.source = options.source || 'manual';
     this.last_choice = options.last_choice || null;
+
+    // New fields for weight-based lifecycle (v3.3)
+    this.category = options.category || 'general'; // fact|preference|project|instruction|episodic
+    this.weight = options.weight || 'MEDIUM'; // STRONG|MEDIUM|WEAK
+    this.weight_set_at = options.weight_set_at || null; // ISO时间，weight变更时更新
+    this.expires_at = options.expires_at || null; // ISO时间，null=永不过期
   }
 }
 
@@ -145,6 +155,39 @@ export const TRIAGE_DISCARD_SIGNALS = [
   '试试看', '先不管', '暂时不用', '先跳过', '算了',
   '不确定', '可能不对', '随便看看',
 ];
+
+// ========== Weight & Category Constants (v3.3) ==========
+
+/** 记忆权重枚举 */
+export const WEIGHT = {
+  STRONG: 'STRONG',
+  MEDIUM: 'MEDIUM',
+  WEAK: 'WEAK',
+};
+
+/** 记忆分类枚举 */
+export const CATEGORY = {
+  FACT: 'fact',
+  PREFERENCE: 'preference',
+  PROJECT: 'project',
+  INSTRUCTION: 'instruction',
+  EPISODIC: 'episodic',
+  GENERAL: 'general',
+};
+
+/** 权重优先级（用于排序和冲突检测） */
+export const WEIGHT_PRIORITY = {
+  STRONG: 3,
+  MEDIUM: 2,
+  WEAK: 1,
+};
+
+/** 衰减间隔配置（毫秒） */
+export const DECAY_INTERVALS = {
+  STRONG_TO_MEDIUM: 14 * 24 * 60 * 60 * 1000,  // 14天
+  MEDIUM_TO_WEAK: 7 * 24 * 60 * 60 * 1000,      // 7天
+  WEAK_TO_DELETE: 3 * 24 * 60 * 60 * 1000,       // 3天
+};
 
 export const TRIAGE_MIN_CONTENT_LENGTH = parseInt(process.env.TRIAGE_MIN_CONTENT_LENGTH || '10', 10);
 export const TRIAGE_MAX_CONTENT_LENGTH = parseInt(process.env.TRIAGE_MAX_CONTENT_LENGTH || '500', 10);
@@ -228,6 +271,10 @@ export default {
   TRIAGE_DISCARD_SIGNALS,
   TRIAGE_MIN_CONTENT_LENGTH,
   TRIAGE_MAX_CONTENT_LENGTH,
+  WEIGHT,
+  CATEGORY,
+  WEIGHT_PRIORITY,
+  DECAY_INTERVALS,
   normalizeText,
   isoNow,
   isoToEpochMs,

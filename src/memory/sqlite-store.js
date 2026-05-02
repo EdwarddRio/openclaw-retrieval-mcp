@@ -105,6 +105,11 @@ const MEMORY_ITEM_COLUMNS = {
   last_choice: "TEXT",
   evaluation_json: "TEXT",
   unique_query_hashes: "TEXT NOT NULL DEFAULT '[]'",
+  // v3.3: weight-based lifecycle
+  category: "TEXT NOT NULL DEFAULT 'general'",
+  weight: "TEXT NOT NULL DEFAULT 'MEDIUM'",
+  weight_set_at: "TEXT",
+  expires_at: "TEXT",
 };
 
 /**
@@ -286,6 +291,8 @@ export class SqliteStore {
       CREATE INDEX IF NOT EXISTS idx_memory_items_ck_status ON memory_items(canonical_key, status);
       CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_items_ck_active ON memory_items(canonical_key) WHERE status = 'active';
       CREATE INDEX IF NOT EXISTS idx_aliases_memory ON memory_aliases(memory_id);
+      CREATE INDEX IF NOT EXISTS idx_memory_items_weight_status ON memory_items(weight, status) WHERE status = 'active';
+      CREATE INDEX IF NOT EXISTS idx_memory_items_category_status ON memory_items(category, status) WHERE status = 'active';
     `);
 
     // Drop deprecated tables (wiki promotion path removed, mentions unused)
@@ -527,11 +534,15 @@ export class SqliteStore {
    * @param {string} memory.memory_id - 记忆 ID
    * @param {string} [memory.canonical_key] - 规范键
    * @param {string} [memory.summary] - 摘要
-   * @param {string} [memory.state] - 状态（tentative/kept）
+   * @param {string} [memory.state] - @deprecated 使用 category+weight 替代
    * @param {string} [memory.content] - 内容
    * @param {string[]} [memory.aliases] - 别名列表
    * @param {string[]} [memory.path_hints] - 路径提示
    * @param {string[]} [memory.collection_hints] - 集合提示
+   * @param {string} [memory.category] - 记忆分类（fact|preference|project|instruction|episodic）
+   * @param {string} [memory.weight] - 权重（STRONG|MEDIUM|WEAK）
+   * @param {string} [memory.weight_set_at] - weight最后变更时间
+   * @param {string} [memory.expires_at] - 过期时间
    * @returns {Object} 保存后的记忆对象
    */
   saveMemory(memory) {
@@ -542,8 +553,9 @@ export class SqliteStore {
         INSERT OR REPLACE INTO memory_items
         (id, canonical_key, summary, state, status, source, content,
          session_id, created_at, updated_at,
-         aliases_json, path_hints_json, collection_hints_json, last_choice)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         aliases_json, path_hints_json, collection_hints_json, last_choice,
+         category, weight, weight_set_at, expires_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
       stmt.run(
         memory.memory_id,
@@ -559,7 +571,11 @@ export class SqliteStore {
         JSON.stringify(memory.aliases || []),
         JSON.stringify(memory.path_hints || []),
         JSON.stringify(memory.collection_hints || []),
-        memory.last_choice || null
+        memory.last_choice || null,
+        memory.category || 'general',
+        memory.weight || 'MEDIUM',
+        memory.weight_set_at || now,
+        memory.expires_at || null
       );
 
       this._getStmt('DELETE FROM memory_aliases WHERE memory_id = ?').run(memory.memory_id);
@@ -810,6 +826,20 @@ export class SqliteStore {
   }
 
   /**
+   * 按权重列出活跃记忆
+   * @param {string} weight - 权重值（STRONG|MEDIUM|WEAK）
+   * @param {number} [limit=50] - 返回数量上限
+   * @returns {Array<Object>} 记忆列表
+   */
+  listMemoryByWeight(weight, limit = 50) {
+    const stmt = this.db.prepare(`
+      SELECT * FROM memory_items WHERE weight = ? AND status = 'active'
+      ORDER BY updated_at DESC LIMIT ?
+    `);
+    return stmt.all(weight, limit).map(r => this._rowToMemory(r));
+  }
+
+  /**
    * 更新记忆内容
    * @param {string} memoryId - 记忆 ID
    * @param {string} content - 新内容
@@ -940,6 +970,11 @@ export class SqliteStore {
       evaluation,
       last_choice: row.last_choice || null,
       _hitCount: queryHashCount,
+      // v3.3: weight-based lifecycle
+      category: row.category || 'general',
+      weight: row.weight || 'MEDIUM',
+      weight_set_at: row.weight_set_at || null,
+      expires_at: row.expires_at || null,
     };
   }
 
@@ -986,7 +1021,7 @@ export class SqliteStore {
 
   /**
    * 获取存储统计摘要
-   * @returns {{ total: number, active: number, tentative: number, kept: number, sessions: number }}
+   * @returns {{ total: number, active: number, tentative: number, kept: number, sessions: number, by_weight: {STRONG: number, MEDIUM: number, WEAK: number}, by_category: Object }}
    */
   statsSummary() {
     const total = this._getStmt("SELECT COUNT(*) as c FROM memory_items").get().c;
@@ -994,7 +1029,24 @@ export class SqliteStore {
     const tentative = this._getStmt("SELECT COUNT(*) as c FROM memory_items WHERE state = 'tentative' AND status = 'active'").get().c;
     const kept = this._getStmt("SELECT COUNT(*) as c FROM memory_items WHERE state = 'kept' AND status = 'active'").get().c;
     const sessions = this._getStmt("SELECT COUNT(*) as c FROM sessions").get().c;
-    return { total, active, tentative, kept, sessions };
+    
+    // v3.3: weight-based stats
+    const strong = this._getStmt("SELECT COUNT(*) as c FROM memory_items WHERE weight = 'STRONG' AND status = 'active'").get().c;
+    const medium = this._getStmt("SELECT COUNT(*) as c FROM memory_items WHERE weight = 'MEDIUM' AND status = 'active'").get().c;
+    const weak = this._getStmt("SELECT COUNT(*) as c FROM memory_items WHERE weight = 'WEAK' AND status = 'active'").get().c;
+    
+    // v3.3: category stats
+    const categoryRows = this._getStmt("SELECT category, COUNT(*) as c FROM memory_items WHERE status = 'active' GROUP BY category").all();
+    const by_category = {};
+    for (const row of categoryRows) {
+      by_category[row.category] = row.c;
+    }
+    
+    return { 
+      total, active, tentative, kept, sessions,
+      by_weight: { STRONG: strong, MEDIUM: medium, WEAK: weak },
+      by_category
+    };
   }
 
   /**
@@ -1088,7 +1140,7 @@ export class SqliteStore {
   }
 
   /**
-   * 清理超过指定天数仍未确认的暂定记忆
+   * 清理超过指定天数仍未确认的暂定记忆（@deprecated 使用 cleanupByWeight 代替）
    * @param {number} ttlDays - 暂定记忆存活天数
    * @returns {{ deleted: number }} 删除数量
    */
@@ -1106,6 +1158,60 @@ export class SqliteStore {
       return { deleted: result.changes, orphan_aliases_deleted: aliasResult.changes };
     });
     return txn();
+  }
+
+  /**
+   * 基于权重的衰减GC：降级或删除过期记忆
+   * @returns {{ downgraded: number, deleted: number, expired: number }}
+   */
+  cleanupByWeight() {
+    const now = Date.now();
+    const nowISO = new Date(now).toISOString();
+    
+    // 1. 处理 expires_at 到期的记忆（直接硬删除）
+    const expiredResult = this._getStmt(`
+      DELETE FROM memory_items 
+      WHERE expires_at IS NOT NULL AND expires_at < ? AND status = 'active'
+    `).run(nowISO);
+    
+    // 2. 处理 weight 衰减
+    // STRONG → MEDIUM (14天)
+    const strongCutoff = new Date(now - 14 * 24 * 60 * 60 * 1000).toISOString();
+    const strongDowngrade = this._getStmt(`
+      UPDATE memory_items SET weight = 'MEDIUM', weight_set_at = ?
+      WHERE weight = 'STRONG' AND status = 'active' 
+      AND weight_set_at < ?
+      AND category NOT IN ('instruction')
+      AND NOT (category = 'preference' AND weight = 'STRONG')
+    `).run(nowISO, strongCutoff);
+    
+    // MEDIUM → WEAK (7天)
+    const mediumCutoff = new Date(now - 7 * 24 * 60 * 60 * 1000).toISOString();
+    const mediumDowngrade = this._getStmt(`
+      UPDATE memory_items SET weight = 'WEAK', weight_set_at = ?
+      WHERE weight = 'MEDIUM' AND status = 'active' 
+      AND weight_set_at < ?
+      AND category NOT IN ('instruction')
+    `).run(nowISO, mediumCutoff);
+    
+    // WEAK → 删除 (3天)
+    const weakCutoff = new Date(now - 3 * 24 * 60 * 60 * 1000).toISOString();
+    const weakDelete = this._getStmt(`
+      DELETE FROM memory_items
+      WHERE weight = 'WEAK' AND status = 'active'
+      AND weight_set_at < ?
+    `).run(weakCutoff);
+    
+    // 3. 清理孤立别名
+    this._getStmt(`
+      DELETE FROM memory_aliases WHERE memory_id NOT IN (SELECT id FROM memory_items)
+    `).run();
+    
+    return {
+      downgraded: strongDowngrade.changes + mediumDowngrade.changes,
+      deleted: weakDelete.changes,
+      expired: expiredResult.changes,
+    };
   }
 
   // ========== State Migration ==========

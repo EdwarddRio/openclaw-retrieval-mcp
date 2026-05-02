@@ -87,7 +87,7 @@ export async function memoryRoutes(fastify, context) {
         total: merged.length,
         include_wiki: true,
         freshness_level: freshness.level,
-        tentative_count: (result.tentative_items || []).length,
+        weak_count: (result.weak_items || []).length,
       };
     }
 
@@ -103,10 +103,10 @@ export async function memoryRoutes(fastify, context) {
         updated_at: h.updated_at,
       })),
       total: (result.hits || []).length,
-      tentative_items: (result.tentative_items || []).map(t => ({
+      weak_items: (result.weak_items || []).map(t => ({
         id: t.memory_id,
         content: t.content || '',
-        state: t.state,
+        weight: t.weight,
         source: t.source,
         created_at: t.created_at,
       })),
@@ -378,9 +378,11 @@ export async function memoryRoutes(fastify, context) {
 
   /** 保存记忆（可选走治理流程） */
   fastify.post('/api/memory/save', { preHandler: [validateBody(MemorySaveRequest)] }, async (request, reply) => {
-    const { session_id, content, state, aliases, path_hints, collection_hints, source, use_governance } = request.body;
+    const { session_id, content, state, aliases, path_hints, collection_hints, source, use_governance, category, weight, weight_set_at, expires_at } = request.body;
     const options = {
       session_id, content, state, aliases, path_hints, collection_hints, source: source || 'manual',
+      // v3.3: weight-based lifecycle
+      category, weight, weight_set_at, expires_at,
     };
     const result = use_governance
       ? await knowledgeBase.saveMemoryWithGovernance(options)
@@ -456,7 +458,15 @@ export async function memoryRoutes(fastify, context) {
     return { success: true, ...result };
   });
 
-  /** 提升待审核记忆为永久 */
+  /** 确认待审核记忆（WEAK → STRONG/MEDIUM） */
+  fastify.post('/api/memory/reviews/:id/confirm', async (request, reply) => {
+    const { id } = request.params;
+    const { weight, evaluation } = request.body || {};
+    const result = knowledgeBase.confirmReview(id, weight || 'STRONG', evaluation || null);
+    return { success: true, ...result };
+  });
+
+  /** @deprecated 使用 /confirm 代替 */
   fastify.post('/api/memory/reviews/:id/promote', async (request, reply) => {
     const { id } = request.params;
     const { evaluation } = request.body || {};

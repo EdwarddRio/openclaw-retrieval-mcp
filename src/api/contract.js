@@ -18,7 +18,8 @@ export const MEMORY_ENDPOINTS = {
   AUTO_TRIAGE_BATCH: `${API_PREFIX}/memory/auto-triage/batch`,
   REVIEWS: `${API_PREFIX}/memory/reviews`,
   REVIEW_EVALUATE: `${API_PREFIX}/memory/reviews/:id/evaluate`,
-  REVIEW_PROMOTE: `${API_PREFIX}/memory/reviews/:id/promote`,
+  REVIEW_CONFIRM: `${API_PREFIX}/memory/reviews/:id/confirm`,
+  REVIEW_PROMOTE: `${API_PREFIX}/memory/reviews/:id/promote`, // @deprecated
   REVIEW_DISCARD: `${API_PREFIX}/memory/reviews/:id/discard`,
   GOVERNANCE_PLAN: `${API_PREFIX}/memory/governance/plan-update`,
   TIMELINE: `${API_PREFIX}/memory/timeline`,
@@ -85,6 +86,11 @@ export class MemorySaveRequest {
     this.path_hints = options.path_hints || [];
     this.collection_hints = options.collection_hints || [];
     this.source = options.source || 'manual';
+    // v3.3: weight-based lifecycle
+    this.category = options.category || 'general';
+    this.weight = options.weight || 'MEDIUM';
+    this.weight_set_at = options.weight_set_at || null;
+    this.expires_at = options.expires_at || null;
   }
 
   validate() {
@@ -97,6 +103,12 @@ export class MemorySaveRequest {
     }
     if (this.state && !['tentative', 'kept'].includes(this.state)) {
       errors.push('state must be tentative or kept');
+    }
+    if (this.category && !['fact', 'preference', 'project', 'instruction', 'episodic', 'general'].includes(this.category)) {
+      errors.push('category must be fact, preference, project, instruction, episodic, or general');
+    }
+    if (this.weight && !['STRONG', 'MEDIUM', 'WEAK'].includes(this.weight)) {
+      errors.push('weight must be STRONG, MEDIUM, or WEAK');
     }
     return { valid: errors.length === 0, errors };
   }
@@ -263,6 +275,11 @@ export class MemoryItem {
     this.aliases = options.aliases || [];
     this.path_hints = options.path_hints || [];
     this.collection_hints = options.collection_hints || [];
+    // v3.3: weight-based lifecycle
+    this.category = options.category || 'general';
+    this.weight = options.weight || 'MEDIUM';
+    this.weight_set_at = options.weight_set_at || null;
+    this.expires_at = options.expires_at || null;
   }
 }
 

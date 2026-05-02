@@ -18,6 +18,13 @@ const MEMORY_STATE_PRIORITY = {
   kept: 2,
 };
 
+/** v3.3: 记忆权重优先级排序权重，STRONG > MEDIUM > WEAK */
+const MEMORY_WEIGHT_PRIORITY = {
+  STRONG: 3,
+  MEDIUM: 2,
+  WEAK: 1,
+};
+
 /**
  * Plan how a new memory candidate should be integrated into the knowledge base.
  *
@@ -358,14 +365,15 @@ function _normalizePath(pathHint) {
 }
 
 /**
- * 对记忆事实排序：优先级(kept>tentative) > 命中次数 > 更新时间 > ID
+ * 对记忆事实排序：优先级(weight: STRONG>MEDIUM>WEAK) > 命中次数 > 更新时间 > ID
  * @param {Array<Object>} facts - 待排序的记忆事实列表
  * @returns {Array<Object>} 排序后的列表
  */
 function _sortedFacts(facts) {
   return [...facts].sort((a, b) => {
-    const pa = MEMORY_STATE_PRIORITY[a.state] || 0;
-    const pb = MEMORY_STATE_PRIORITY[b.state] || 0;
+    // v3.3: 优先使用 weight 排序，fallback 到 state
+    const pa = MEMORY_WEIGHT_PRIORITY[a.weight] || MEMORY_STATE_PRIORITY[a.state] || 0;
+    const pb = MEMORY_WEIGHT_PRIORITY[b.weight] || MEMORY_STATE_PRIORITY[b.state] || 0;
     if (pa !== pb) return pb - pa;
     const ha = Number(a.hit_count || 0);
     const hb = Number(b.hit_count || 0);
