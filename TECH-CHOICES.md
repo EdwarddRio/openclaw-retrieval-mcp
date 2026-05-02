@@ -20,16 +20,15 @@
 |------|------|-----------|----------|----------|
 | 语言 | Node.js | 同语言通信、部署简单、内存低 | Python | ~50MB vs ~200MB |
 | 架构 | 单服务 | 运维成本低、故障点少 | 微服务 (3进程) | 1进程 vs 3进程 |
-| 知识检索 | LLM Wiki | 人机协作、结构化、易维护 | 向量+BM25 | 整页阅读 vs 分块 |
+| 搜索 | BM25 + 4因子融合 | 中文友好、<5ms、可解释 | 向量检索 | 内存索引 vs 向量库 |
+| 分词 | bigram + jieba | 零依赖默认 + 可选增强 | jieba必需 | auto模式自动降级 |
+| 记忆模型 | weight-based | 精细生命周期、递减衰减 | 2态/7态 | STRONG/MEDIUM/WEAK |
+| 实体 | 正则+词典提取 | 零依赖、够用 | LLM提取 | <1ms vs 10s |
 | HTTP 框架 | Fastify | 性能高、内置验证、Pino日志 | Express | 快2-3倍 |
 | 数据库 | better-sqlite3 | 零部署、同步API、WAL模式 | PostgreSQL | ~5MB vs ~100MB+ |
-| 记忆模型 | 2态 (tentative/kept) | 认知负担低、代码简洁 | 7态 | 2态 vs 7态 |
-| 搜索方案 | SQL LIKE + bigram | 中文友好、数据量小够用 | FTS5/BM25 | <1ms |
 | 治理比较 | 词法匹配 + LLM兜底 | 零依赖、优雅降级 | 纯LLM | 10秒超时保护 |
 | 日志 | Pino(HTTP) + Winston(业务) | 各司其职 | 单一库 | Pino最快 |
 | 认证 | Bearer Token + Unix Socket | 简单、轻量、本地免密 | OAuth2/JWT | 10行代码 |
-| 配置 | 环境变量 + dotenv | 12-Factor、安全 | JSON/YAML | 不进代码仓库 |
-| 基准测试 | 自建框架 | 测试搜索质量而非速度 | Vitest/Jest | 命中率/召回率/多样性 |
 
 ---
 
@@ -47,15 +46,13 @@
 | 与主程序通信 | 同语言直接 HTTP 调用，无序列化开销 | 需要跨进程通信（HTTP/gRPC） |
 | 内存占用 | ~50MB | ~200MB（含 ChromaDB 客户端） |
 | 数据科学生态 | 不需要 numpy/pandas | 生态丰富但本项目用不上 |
-| CPU密集型 | 不如 Python C 扩展 | 更高效（但本项目是 I/O 密集型） |
-| 中文NLP | 工具链不如 Python | 丰富（但本项目用简单分词就够） |
 
 **小白**：那 Node.js 有什么劣势吗？
 
 **架构师**：
 - 数据科学生态不如 Python（但本项目不需要）
 - CPU 密集型任务不如 Python C 扩展（但本项目是 I/O 密集型）
-- 中文 NLP 工具链不如 Python 丰富（但本项目用简单分词就够了）
+- 中文 NLP 工具链不如 Python 丰富（但我们用 jieba 的 Node.js 绑定够用）
 
 **结论**：本项目是 I/O 密集型，不需要复杂 NLP，Node.js 生态完全够用。
 
@@ -74,58 +71,147 @@
 | 内存占用 | ~700MB（含 ChromaDB + Python） | ~50MB |
 | 部署 | systemd 三服务链 | systemd 单服务 |
 | 故障点 | 3 个进程都可能挂 | 1 个进程 |
-| 调试 | 跨服务日志追踪 | 单进程日志 |
 
 **小白**：单服务不能水平扩展怎么办？
 
 **架构师**：本项目数据量在 GB 级别以内，单进程完全够用。如果未来需要扩展，可以拆分为读写分离，但目前没必要。
 
-**结论**：部署简单、故障点少、内存占用低、调试方便。
+---
+
+### 1.3 为什么用 BM25 替代 LIKE 查询？
+
+**小白**：之前用 SQL LIKE 搜索，为什么要换成 BM25？
+
+**架构师**：LIKE 查询有几个问题：
+
+| 问题 | LIKE 查询 | BM25 |
+|------|----------|------|
+| 中文支持 | 需要 bigram 扩展 | 原生支持分词 |
+| 排序 | 只能按时间排序 | 按相关度排序 |
+| 布尔查询 | 不支持 | 支持 +/-/"" |
+| 性能 | 全表扫描 | 内存索引 <5ms |
+
+**小白**：BM25 是什么？
+
+**架构师**：BM25（Best Matching 25）是一种经典的文本检索算法，核心思想是：
+1. **词频（TF）**：一个词在文档中出现越多，越相关
+2. **逆文档频率（IDF）**：一个词在越少文档中出现，越有区分度
+3. **文档长度归一化**：短文档的词频权重更高
+
+**我们的实现**：
+```
+finalScore = bm25Norm × 0.5 + positionScore × 0.1 + recency × 0.3 + weightBoost × 0.1
+```
+
+| 因子 | 权重 | 说明 |
+|------|------|------|
+| bm25Norm | 50% | BM25 分数归一化 |
+| positionScore | 10% | 首次匹配位置越前越相关 |
+| recency | 30% | 时间衰减（30天半衰期） |
+| weightBoost | 10% | STRONG=1.5, MEDIUM=1.0, WEAK=0.5 |
+
+**结论**：BM25 搜索更准确、更快、功能更强。
 
 ---
 
-### 1.3 为什么放弃向量检索和 BM25 分块索引？
+### 1.4 为什么用 bigram + jieba 双模式分词？
 
-**小白**：我看到项目从 ChromaDB + Embedding + BM25 分块索引变成了 localMem + LLM Wiki，为什么？搜索质量会下降吗？
+**小白**：中文分词为什么不用一个方案？
 
-**架构师**：这是本项目最大的架构决策，我详细解释一下三步演化：
+**架构师**：因为没有完美方案，只有权衡：
 
-#### 第一步：移除向量检索
+| 方案 | 优点 | 缺点 |
+|------|------|------|
+| bigram | 零依赖、永远可用 | 分词质量一般（"微服务"→"微服","服务"） |
+| jieba | 分词质量好 | 需要安装、可能失败 |
 
-**问题**：
-- 中文没有空格分隔，embedding 模型对短查询和长文档的语义匹配不稳定
-- 经常出现"看起来相关但实际不相关"的情况
-- ChromaDB + Python Embedding 服务需要额外 500MB 内存和 GPU 资源
+**小白**：那怎么选择？
 
-**小白**：能举个例子吗？
+**架构师**：用 `auto` 模式：
+1. 启动时检测 jieba 是否可用
+2. 可用就用 jieba，打印日志 `[tokenizer] jieba loaded`
+3. 不可用就 fallback 到 bigram，打印警告
 
-**架构师**：用户搜"帧同步"，向量检索可能返回"同步帧率"、"帧动画"、"同步机制"等看似相关但实际不同的内容。而关键词搜索直接命中 `[[帧同步-Lockstep]]` 整个页面，更准确。
+```javascript
+// 环境变量控制
+TOKENIZER_MODE=auto   // 默认：自动选择
+TOKENIZER_MODE=jieba  // 强制用 jieba（失败报错）
+TOKENIZER_MODE=bigram // 强制用 bigram
+```
 
-#### 第二步：移除 BM25 分块索引（static_kb）
+**结论**：零依赖是底线，可选增强是加分。
 
-**问题**：
-- BM25 分块索引把文件切成 chunk 建索引
-- 但 LLM Wiki 的页面本身就是编译好的结构化文档——切碎反而丢失结构
-- Agent 可以直接用 `read_file` 读文件，不需要中间层建索引
+---
 
-#### 第三步：保留 LLM Wiki
+### 1.5 为什么用 weight-based 生命周期替代 2 态模型？
 
-**Karpathy 提出的 LLM Wiki 模式**：把知识编译成结构化 Markdown，人可读、机可查、易维护。
+**小白**：之前 tentative/kept 两个状态就够用，为什么要改成 STRONG/MEDIUM/WEAK？
 
-**小白**：那搜索质量到底怎么样？
+**架构师**：2 态模型太粗：
 
-**架构师**：不会下降。对比一下：
+| 问题 | 2 态模型 | weight-based |
+|------|---------|-------------|
+| 衰减 | tentative 7天一刀切 | 递减：14天→7天→3天 |
+| 分类 | 无 | category: fact/preference/project/instruction/episodic |
+| 免疫 | 无 | instruction 永不降级，preference+STRONG 永不降级 |
+| 审核 | tentative 进 Review Queue | WEAK 进 Review Queue |
 
-| 维度 | 传统 RAG | LLM Wiki |
-|------|---------|----------|
-| 检索方式 | 向量相似度 + 分块 | 关键词匹配 + 整页阅读 |
-| 知识组织 | 切片/分块（512 token） | 结构化页面（完整知识文档） |
-| 人类可读性 | 差（分块后语义不完整） | 好（整页就是完整的知识文档） |
-| 人机协作 | 困难 | 自然（直接编辑 Markdown） |
-| 维护成本 | 需要维护向量数据库 | 只需维护 Markdown 文件 |
-| 知识生长 | 被动（依赖检索） | 主动（持续编译完善） |
+**小白**：递减衰减是什么意思？
 
-**结论**：对于精确匹配（文件名、端口号、函数名），关键词搜索本来就够用。对于语义理解，LLM Wiki 的结构化页面比 embedding 分块更准确——因为 wiki 页面是完整的知识文档，不是切碎的 512 token 片段。
+**架构师**：越弱的记忆衰减越快：
+```
+STRONG → 14天 → MEDIUM → 7天 → WEAK → 3天 → 删除
+总生存期：24天
+
+MEDIUM → 7天 → WEAK → 3天 → 删除
+总生存期：10天
+
+WEAK → 3天 → 删除
+总生存期：3天
+```
+
+**小白**：为什么要这样设计？
+
+**架构师**：
+- STRONG 记忆（用户确认的偏好）应该长期保留
+- WEAK 记忆（临时提取的）应该快速清理
+- 中间的 MEDIUM 给一个合理的过渡期
+
+---
+
+### 1.6 为什么要实体链接？
+
+**小白**：记忆系统为什么要提取实体？
+
+**架构师**：因为扁平记忆→结构化知识：
+
+| 维度 | 扁平记忆 | 实体链接 |
+|------|---------|---------|
+| 查询 | 只能搜内容 | 可以搜实体关联 |
+| 关联 | 无 | 通过实体关联不同记忆 |
+| 精准度 | 返回整条记忆 | 返回单条观察 |
+
+**小白**：实体提取准确吗？
+
+**架构师**：用正则+词典，不是 LLM：
+
+```javascript
+const TECH_PATTERNS = [
+  /(?:React|Vue|Kubernetes|Docker|PostgreSQL)/gi,
+  /(?:Node\.js|Python|Go|Rust)/gi,
+];
+```
+
+**优势**：
+- 零依赖，不需要 LLM
+- <1ms，实时提取
+- 可预测，不会误判
+
+**劣势**：
+- 只能提取已知模式
+- 不支持歧义消解
+
+**结论**：对于技术文档，正则+词典够用。
 
 ---
 
@@ -137,20 +223,10 @@
 
 | 维度 | Fastify | Express |
 |------|---------|---------|
-| 性能 | 比 Express 快 2-3 倍（JSON 序列化用 fast-json-stringify） | 够用但不是最快 |
+| 性能 | 比 Express 快 2-3 倍 | 够用但不是最快 |
 | Schema 验证 | 内置 JSON Schema 验证 | 需要额外中间件 |
 | 插件系统 | 封装性好，作用域隔离 | 中间件全局共享 |
 | 日志 | 内置 Pino（最快的 Node.js 日志库） | 需要自行集成 |
-| TypeScript | 原生类型支持 | 需要 @types/express |
-
-**小白**：Fastify 有什么劣势吗？
-
-**架构师**：
-- 生态比 Express 小（但本项目不需要大量中间件）
-- 学习曲线比 Express 略陡（但 API 风格相似）
-- 部分第三方库只有 Express 中间件版本（本项目未遇到）
-
-**请求验证实现**：用 `validateBody` preHandler 模式。每个请求模型（如 `MemorySaveRequest`）都有 `validate()` 方法，返回 `{ valid, errors }`。验证失败时返回 400 + 错误详情，验证通过时继续路由处理。
 
 **结论**：性能优势明显，内置验证和日志，插件作用域隔离。
 
@@ -167,9 +243,7 @@
 | 部署 | 零配置，文件即数据库 | 需要独立服务 | 需要独立服务 |
 | 内存 | ~5MB | ~100MB+ | ~50MB+ |
 | 事务 | 完整 ACID | 完整 ACID | 有限事务 |
-| 查询 | SQL 全功能 | SQL 全功能 | 键值查询为主 |
 | 并发 | 单写多读（WAL 模式） | 多写多读 | 单线程 |
-| 适用场景 | 单机嵌入式 | 多客户端服务 | 缓存/会话 |
 
 **小白**：SQLite 有什么劣势吗？
 
@@ -178,200 +252,119 @@
 - 不支持多进程写入（本项目单进程，无此问题）
 - 不适合超大数据集（本项目数据量在 GB 级别以内）
 
-### 关键实现细节
-
-#### WAL 管理
-
-```javascript
-// 启动时自动启用 WAL 模式
-this.db.pragma('journal_mode = WAL');
-
-// WAL 超过 10MB 或 log frames 超过 1000 时自动 checkpoint
-// 每小时检查一次是否需要 checkpoint
-// 服务关闭时执行 TRUNCATE checkpoint，确保 WAL 数据写入主库
-// uncaughtException 时紧急执行 checkpoint + close，避免数据丢失
-```
-
-#### Prepared Statement 缓存
-
-```javascript
-// _stmtCache Map 缓存已编译的 SQL 语句
-// _getStmt(sql) 优先从缓存取，避免重复编译
-// 高频 SQL（如 queryMemory、addQueryHash）受益最大
-```
-
-#### 数据库迁移版本控制
-
-```javascript
-// _meta 表记录 migration_version
-// 迁移是幂等的：_ensureColumns 只添加缺失的列
-// 版本 1 迁移：删除废弃表（memory_reviews、wiki_exports 等）和废弃触发器
-// 旧状态自动迁移：7态 → 2态
-//   - local_only/manual_only → kept
-//   - wiki_candidate/candidate_on_reuse → tentative
-//   - discarded/archived → 硬删除
-```
-
-**结论**：零部署、零网络开销、完整 SQL、WAL 模式、同步 API。
+**关键实现**：
+- WAL 模式：启动时自动启用
+- Prepared Statement 缓存：避免重复编译 SQL
+- 幂等迁移：`_ensureColumns` 只添加缺失的列
 
 ---
 
-## 四、搜索方案选型：关键词匹配 vs 向量检索 vs BM25
+## 四、搜索方案选型：BM25 vs 向量检索
 
-### 4.1 记忆搜索：SQL LIKE + 中文 bigram 扩展
+### 4.1 为什么放弃向量检索？
 
-**小白**：记忆搜索为什么不建索引？BM25 不是更快吗？
+**小白**：向量检索不是更智能吗？为什么要换成 BM25？
 
-**架构师**：建索引的前提是数据量大到简单扫描不够用。我们的数据量：
+**架构师**：向量检索有几个问题：
 
-| 搜索目标 | 数据量 | 搜索方式 | 耗时 |
-|---------|--------|---------|------|
-| 记忆条目 | 几百条 | SQL LIKE 多 token AND | <1ms |
+| 问题 | 说明 |
+|------|------|
+| 中文效果差 | MiniLM-L6-v2 中文效果极差 |
+| 依赖重 | 28MB 模型 + 300MB 内存 |
+| 不可解释 | 相似度分数无法解释 |
+| 误匹配多 | "帧同步"可能匹配"同步帧率" |
 
-**query_memory 实现**：
+**小白**：BM25 不会误匹配吗？
 
-```sql
-SELECT * FROM memory_items
-WHERE (content LIKE '%token1%' OR aliases_json LIKE '%"token1"%')
-  AND (content LIKE '%token2%' OR aliases_json LIKE '%"token2"%')
-  AND status = 'active' AND state IN ('tentative', 'kept')
-ORDER BY updated_at DESC LIMIT ?
-```
+**架构师**：BM25 是精确匹配，不会出现语义相似但实际不同的情况。而且我们有 4 因子融合排序：
+- bm25Norm：语义相关度
+- positionScore：位置越前越相关
+- recency：时间衰减
+- weightBoost：权重加成
 
-**小白**：中文 bigram 扩展搜索是什么？
+**结论**：对于 <200 条记忆，BM25 比向量检索更准确、更快、更可控。
 
-**架构师**：中文没有空格分词，"帧同步策略"和"帧同步"共享"帧同"和"同步"两个 bigram，但精确匹配 "帧同步策略" 搜不到 "帧同步"。bigram 扩展解决了这个问题。
+### 4.2 布尔查询
 
-```javascript
-// "帧同步" → ["帧同", "同步"]
-// 至少匹配 ceil(bigrams.length / 2) 个 bigram
-```
+**小白**：布尔查询是什么？
 
-**搜索排序权重** (`RELEVANCE_WEIGHTS.search`)：
+**架构师**：用符号控制搜索逻辑：
 
 ```
-score = hitRate * 0.5 + positionScore * 0.2 + countScore * 0.15 + freshnessScore * 0.15
++部署          必须包含"部署"
+-deprecated    必须排除"deprecated"
+"Kubernetes"   精确短语匹配
+category:fact  按分类过滤
+weight:STRONG  按权重过滤
 ```
 
-| 维度 | 权重 | 说明 |
-|------|------|------|
-| 命中率 (hitRate) | 50% | 查询词在内容中的命中比例 |
-| 位置 (position) | 20% | 命中词出现位置越靠前分越高 |
-| 频次 (count) | 15% | 记忆被查询命中的历史次数 |
-| 新鲜度 (freshness) | 15% | 越新的记忆分越高 |
+**实现**：`query-parser.js` 解析查询字符串，返回结构化条件。
 
-**频次维度**：每次查询命中一条记忆时，`addQueryHash()` 会把查询的哈希值追加到 `unique_query_hashes` 字段。`computeRelevanceScore` 用 `Math.min(1, _hitCount / 3)` 归一化——被 3 次以上不同查询命中的记忆，频次维度得满分。
+### 4.3 Wiki 搜索为什么不用 BM25？
 
-**置信度**：`_computeConfidence` 取前 3 个命中结果的 `computeRelevanceScore` 平均分。这样即使第一个命中较弱，但后续命中较强时，置信度不会太低，避免不必要的弃权。
+**架构师**：Wiki 页面太少（~24 页），BM25 的 IDF 区分度极低。简单词频匹配够用。
 
-### 4.2 Wiki 搜索：标题加权词频匹配
-
-**小白**：Wiki 搜索为什么不也用 SQL？
-
-**架构师**：Wiki 页面是 Markdown 文件，不在数据库里。搜索直接读文件：
-
-```javascript
-score += titleMatchCount * 5 + contentMatchCount;
-// 返回 score > 0 的页面，按 score 降序
-```
-
-**为什么不用 BM25？三个原因**：
-
-1. **~24 页太少**，BM25 的 IDF（逆文档频率）区分度极低——每个词几乎都只出现在 1-2 个页面里
-2. **返回整页不是 chunk**，BM25 的核心优势是 chunk 级精确匹配，但 wiki 返回整页
-3. **零依赖零状态**，不需要建索引、不需要缓存文件、不需要增量同步
-
-**搜索缓存**：5 分钟 TTL（`_searchCacheTTL = 300000`ms），`saveWikiPage` 或 `removeWikiPage` 被调用时主动失效。外部直接编辑 wiki 文件时缓存不会感知——需要等 TTL 过期。
-
-### 4.3 为什么不用 FTS5？
-
-**架构师**：SQLite FTS5 的默认分词器不支持中文（没有空格分隔），测试后发现 LIKE 查询对中文更可靠。而且 FTS5 需要维护额外的虚拟表和触发器，增加了复杂度。
-
-### 4.4 未来升级路径
-
-> **📋 未来升级方向（wiki_search → BM25）**
->
-> 当 wiki 页面超过 200 页时，简单词频匹配的召回率和区分度会下降，需要升级为 BM25Okapi。升级方案：
->
-> | 维度 | 当前（简单词频） | 升级后（BM25） |
-> |------|----------------|---------------|
-> | 触发条件 | 页面 < 200 | 页面 ≥ 200 |
-> | 搜索方式 | 标题×5 + 内容计数 | BM25Okapi IDF + TF 归一化 |
-> | 返回粒度 | 整页摘要 | 整页摘要（不切 chunk） |
-> | 改动范围 | — | `wiki/compiler.js` 的 `searchWiki()` 方法，约 50 行 |
-> | 依赖 | 无 | `bm25Okapi` npm 包（或内联实现） |
->
-> **关键设计决策**：即使升级 BM25，仍返回**整页**而非 chunk。wiki 页面本身就是编译好的结构化文档，切碎会丢失上下文。
+**未来**：当 wiki 页面超过 200 页时，自动升级为 BM25。
 
 ---
 
-## 五、记忆模型选型：2 状态 vs 7 状态
+## 五、记忆模型选型：weight-based 生命周期
 
-**小白**：记忆系统为什么只有 tentative 和 kept 两个状态？
+### 5.1 为什么用 weight 替代 state？
 
-**架构师**：之前的 7 态模型太复杂了：
+**小白**：之前 tentative/kept 两个状态，为什么要改成 STRONG/MEDIUM/WEAK？
 
-```
-旧模型：tentative / local_only / manual_only / candidate_on_reuse / wiki_candidate / published / discarded
-新模型：tentative / kept
-```
+**架构师**：2 态模型太粗，无法区分记忆的重要性：
 
-实际使用中：
-- `local_only` 和 `manual_only` 没有语义差异
-- `candidate_on_reuse` 和 `wiki_candidate` 的提权路径也几乎没人用
-- 简化为 2 态后，代码量减半，认知负担大幅降低
+| 场景 | 2 态模型 | weight-based |
+|------|---------|-------------|
+| 用户确认的偏好 | kept（永久） | STRONG + preference（永不降级） |
+| 临时提取的事实 | tentative（7天） | WEAK（3天衰减） |
+| 用户明确要求 | kept（永久） | STRONG（14天衰减） |
 
-**状态转换图**：
+### 5.2 AutoTriage 智能分类
 
-```
-tentative ──用户确认──→ kept（永久保留）
-    │
-    └──丢弃──→ 从数据库硬删除（不留痕迹）
-```
+**小白**：AutoTriage 是什么？
 
-**小白**：2 态模型有什么劣势吗？
-
-**架构师**：
-- 没有中间状态：不能标记"可能有用但不确定"的记忆
-- 没有 wiki 提权路径：记忆不会自动变成 wiki 页面（但 wiki 由独立编译系统管理，不需要这个路径）
-
-### 三层过滤
+**架构师**：自动从对话中提取记忆，并根据信号强度分配 weight：
 
 ```
-对话内容
-  → Layer 1: 否定检测（"先不管""试试看""算了"→ 丢弃）
-  → Layer 2: 敏感过滤（密码/密钥 → 丢弃，当前预留）
-  → Layer 3: 噪声过滤（太短/太长/纯寒暄/纯代码/时间敏感内容 → 丢弃）
-  → 通过 → 生成 Canonical Key（SHA1 规范化文本）
-  → 检查去重（相同 canonical_key 且 active → 跳过）
-  → 新内容 → tentative（临时记忆）
+TRIAGE_CONFIRM_SIGNALS 匹配 → STRONG (自动确认)
+用户显式请求 → MEDIUM (需确认)
+知识断言 → MEDIUM (需确认)
+其他 → WEAK (3天衰减)
 ```
 
-### Canonical Key SHA1 去重
+### 5.3 衰减 GC
 
-`canonicalKeyForText` 对文本做 `normalizeText`（合并空白 + 去首尾 + 转小写）后计算 SHA1 hash。相同语义的记忆只存一份。
+**小白**：记忆会自动删除吗？
 
-### 日写入限流
+**架构师**：会，按递减规则：
 
-自动来源（auto_triage / auto_draft）每天最多 50 条（`LOCALMEM_DAILY_WRITE_LIMIT`）。到达限额后返回 `status: 'rate_limited'`，不写入。
+```
+STRONG → 14天 → MEDIUM → 7天 → WEAK → 3天 → 删除
+```
 
-### Auto-Triage 保护机制
+**免疫规则**：
+- instruction 类别：永不降级
+- preference + STRONG：永不降级
 
-autoTriage 在连续 5 次失败后会设置 `autoTriageDisabled = true`，后续 `/api/memory/turn` 端点会跳过 autoTriage 调用。30 分钟后自动恢复尝试。失败事件会持久化到 `memory_events` 表（`event_type: 'auto_triage_failure'`），**服务重启后会从 `memory_events` 表恢复禁用状态**，避免重启后立即重复失败。
+### 5.4 Review Queue
 
-### 待审核记忆提醒
+**小白**：用户怎么审核记忆？
 
-tentative 记忆不会主动弹窗通知，但有三条提醒路径：
+**架构师**：WEAK 记忆进入 Review Queue：
 
-| 时机 | 链路 | 触发条件 |
-|------|------|---------|
-| 心跳 | `check-review-reminder.sh` → HEARTBEAT.md | 有 tentative 记忆 |
-| 对话 | `queryMemoryFull()` → `tentative_items` | Agent 查记忆时 |
-| 7天到期 | `_maybePeriodicCleanup()` → 硬删除 | 无需触发，自动执行 |
+```bash
+# 查看待审核记忆
+curl http://127.0.0.1:8901/api/memory/reviews
 
-### 检索洞察注入
+# 确认记忆（WEAK → STRONG）
+curl -X POST http://127.0.0.1:8901/api/memory/reviews/:id/confirm
 
-`queryMemoryContext` 在查询记忆时，会自动将检索洞察注入到当前会话中（以 `[检索洞察]` 前缀的 system 消息）。洞察内容包括命中数量、新鲜度、过时警告等。每个会话每小时最多注入 3 条洞察，避免信息过载。
+# 丢弃记忆（硬删除）
+curl -X POST http://127.0.0.1:8901/api/memory/reviews/:id/discard
+```
 
 ---
 
@@ -383,56 +376,28 @@ tentative 记忆不会主动弹窗通知，但有三条提醒路径：
 
 ### 第一步：四维重叠检测
 
-判断新记忆和已有记忆是否属于"同一主题"：
-
 | 维度 | 权重 | 检测方式 |
 |------|------|---------|
 | alias 重叠 | 0.35 | 别名集合是否有交集 |
 | path 重叠 | 0.25 | path_hints 集合是否有交集 |
 | collection 重叠 | 0.15 | collection_hints 集合是否有交集 |
-| token 重叠 | 0.10 | 分词后 token 集合交集 ≥ 3 个，或交集 ≥ 2 个且占比 ≥ 25% |
+| token 重叠 | 0.10 | 分词后 token 集合交集 |
 | 文本包含 | 0.15 | 一方内容是否包含另一方 |
-
-**小白**：token 重叠为什么阈值是 3？
-
-**架构师**：之前阈值是 2，但中文分词后"决定使用Python"和"决定不使用Python"共享"决定"和"使用"两个 token，被误判为同主题。提高到 3 后大幅减少误报。2 个 token 重叠时，额外检查重叠比例（≥ 25%），避免短文本的偶然重叠。
 
 ### 第二步：策略选择
 
 | 策略 | 触发条件 | 行为 |
 |------|---------|------|
-| `keep_existing` | 同主题 + 语义相同 | 保留旧记忆，不写入新记忆 |
-| `supersede_existing` | 同主题 + 新内容更完整 | 新记忆替代旧记忆（旧记忆归档） |
-| `resolve_conflict` | 同主题 + 语义冲突 | 保留旧记忆，标记新记忆为冲突 |
-| `create_new` | 不同主题 | 直接创建新记忆 |
+| `keep_existing` | 同主题 + 语义相同 | 保留旧记忆 |
+| `supersede_existing` | 同主题 + 新内容更完整 | 新记忆替代旧记忆 |
+| `resolve_conflict` | 同主题 + 语义冲突 | 标记冲突 |
+| `create_new` | 不同主题 | 直接创建 |
 
-### LLM 语义比较
+### LLM 语义比较（可选）
 
-**小白**：怎么判断"语义相同"还是"语义冲突"？
+配置 `SIDE_LLM_GATEWAY_URL` 后，调用 LLM 判断两条记忆是否表达同一意图。
 
-**架构师**：有两种模式：
-
-1. **词法匹配**（默认）：基于 token 重叠和文本包含判断。不需要 LLM，速度快，但可能误判
-2. **LLM 语义比较**（可选）：调用侧边 LLM 网关，让 LLM 判断两条记忆是否表达同一意图
-
-**选择**：词法匹配为主 + LLM 语义兜底
-
-**优势**：
-- 默认零依赖：不配置 LLM 网关也能正常工作
-- 优雅降级：LLM 不可用时自动降级为词法匹配
-- 可选增强：配置 LLM 网关后语义判断更准确
-
-**劣势**：
-- 词法匹配可能误判（"决定用 A" vs "决定不用 A" 会被判为同主题）
-- LLM 调用增加延迟（10 秒超时保护）
-- LLM 返回格式不稳定（代码做了容错解析）
-
-LLM 返回 JSON 格式 `{"sameIntent": true/false, "confidence": 0.0-1.0}`。代码会严格解析布尔值——`true` 或字符串 `"true"` 都视为真，其他值视为假。LLM 调用有 10 秒超时保护，超时自动降级为词法匹配。
-
-| 配置项 | 环境变量 | 默认值 | 说明 |
-|--------|---------|--------|------|
-| 侧边 LLM 网关 | `SIDE_LLM_GATEWAY_URL` | 空（不启用） | 如 `http://127.0.0.1:11434` |
-| 侧边 LLM 模型 | `SIDE_LLM_GATEWAY_MODEL` | `k2p6` | 网关默认模型名 |
+**优势**：默认零依赖，LLM 不可用时自动降级为词法匹配。
 
 ---
 
@@ -442,51 +407,21 @@ LLM 返回 JSON 格式 `{"sameIntent": true/false, "confidence": 0.0-1.0}`。代
 
 **架构师**：四步走：
 
-1. **detectChanges**：扫描 `raw-sources.json` 中定义的所有源文件，对比 SHA256 hash，找出新增/修改/删除
-2. **编译**：Agent 用自己的 LLM 能力将原始材料编译为结构化 wiki 页面（不是复制！）
-3. **saveWikiPage**：保存到 wiki/ 目录，更新 manifest
-4. **updateIndex**：刷新 wiki/index.md 总索引
-
-**小白**：为什么不让中间层自己调 LLM？
-
-**架构师**：因为中间层不应该持有 API Key，也不应该决定怎么编译。编译策略由 Agent 决定，中间层只负责文件扫描和状态管理。这样编译提示、质量标准、LLM 模型选择都是可插拔的。
+1. **detectChanges**：扫描源文件，对比 SHA256 hash
+2. **编译**：Agent 将原始材料编译为结构化 wiki 页面
+3. **saveWikiPage**：保存到 wiki/ 目录
+4. **updateIndex**：刷新总索引
 
 **选择**：Karpathy LLM Wiki 模式
 
 **优势**：
-- 人可读：wiki 页面是标准 Markdown，人类可以直接阅读和编辑
-- 机可查：Agent 可以用 `wiki_search` 搜索结构化知识
-- 易维护：只需要维护 Markdown 文件，不需要维护向量数据库
-- 知识生长：持续编译完善，而不是被动检索
+- 人可读：wiki 页面是标准 Markdown
+- 机可查：Agent 可以用 `wiki_search` 搜索
+- 易维护：只需要维护 Markdown 文件
 
 **劣势**：
-- 编译需要 LLM：如果 LLM 不可用，wiki 无法自动更新
-- 搜索精度有限：关键词匹配不如向量检索的语义理解
-- 页面数量受限：超过 200 页后需要升级为 BM25
-
-### 增量编译
-
-Manifest 记录每个源文件的 SHA256 hash。下次 `detectChanges` 时对比 hash，只标记新增/修改的文件。Agent 只编译有变化的文件。
-
-### 人工编辑保护
-
-Wiki 页面支持人工编辑区域，不会被增量编译覆盖：
-
-```markdown
-<!-- human-edit-start:SECTION_NAME -->
-这里是你自己写的笔记、补充、心得，编译时不会被覆盖。
-<!-- human-edit-end:SECTION_NAME -->
-```
-
-编译时 `_mergeHumanEdits` 会：
-- 从旧文件中提取所有 `human-edit` 区域
-- 如果新内容中有同名区域，旧内容替换新内容中的占位
-- 如果新内容中没有该区域，旧区域追加到文件末尾
-
-### 路径安全验证
-
-- `_normalizeWikiPageName`：拒绝绝对路径、路径遍历（`..`）、非 `.md` 后缀
-- `_resolveAllowedSourcePath`：验证 sourcePath 必须在 `raw-sources.json` 配置的文件列表中
+- 编译需要 LLM
+- 搜索精度有限（页面少时）
 
 ---
 
@@ -498,32 +433,14 @@ Wiki 页面支持人工编辑区域，不会被增量编译覆盖：
 
 | 日志库 | 用途 | 位置 |
 |--------|------|------|
-| Winston | 业务逻辑日志（记忆操作、wiki 编译、定时清理等） | `config.js` 导出的 `logger` |
-| Pino | HTTP 请求日志（Fastify 内置） | Fastify 自动管理 |
+| Winston | 业务逻辑日志 | `config.js` 导出的 `logger` |
+| Pino | HTTP 请求日志 | Fastify 自动管理 |
 
-**选择**：Winston（主日志）+ Pino（Fastify 内置）
-
-**Winston 优势**：
-- 丰富的传输层：Console、File、HTTP 等
-- 自定义格式：时间戳 + 级别 + 消息
-- 文件日志保留策略：`buildRetainedLogHandler` 支持按天数和大小轮转
-
-**Winston 劣势**：
-- 性能不如 Pino（但业务日志频率低，不影响）
-- 配置比 Pino 复杂
-
-**Pino 优势**：
-- 最快的 Node.js 日志库
-- Fastify 内置，零配置
-- 结构化 JSON 输出，方便日志分析
-
-**Pino 劣势**：
-- 自定义格式不如 Winston 灵活
-- 文件传输需要额外配置
+**结论**：各司其职，互不干扰。
 
 ---
 
-## 九、配置管理选型：dotenv + 环境变量 vs 配置文件
+## 九、配置管理选型：dotenv + 环境变量
 
 **小白**：配置为什么用环境变量而不是 JSON/YAML 配置文件？
 
@@ -533,251 +450,34 @@ Wiki 页面支持人工编辑区域，不会被增量编译覆盖：
 |------|---------|---------|
 | 部署灵活性 | 容器/系统原生支持 | 需要额外挂载 |
 | 敏感信息 | 不容易意外提交 | 容易误提交密钥 |
-| 类型安全 | 需要手动解析（parseInt 等） | JSON 原生类型 |
-| 默认值 | 代码中定义 | 文件中定义 |
 
-**选择**：dotenv + 环境变量
-
-**优势**：
-- 12-Factor App 标准做法
-- 敏感信息（API_SECRET、LLM 网关地址）不进代码仓库
-- 容器部署时直接注入环境变量
-- 默认值在代码中定义，不需要额外配置文件
-
-**劣势**：
-- 类型需要手动解析（`parseInt(process.env.HTTP_PORT || '8901', 10)`）
-- 没有配置校验（错误的环境变量值在运行时才报错）
-- 环境变量名容易拼错（但代码中集中定义了常量，避免直接使用字符串）
-
-### prepareRuntimePath 旧路径迁移机制
-
-`config.js` 的 `prepareRuntimePath` 函数实现了旧路径自动迁移到 `runtime/` 目录：
-
-1. 优先使用 `runtime/` 目录下的路径
-2. 如果 `runtime/` 下不存在但旧路径存在，自动 `rename`（跨文件系统时用 `cpSync` + `rmSync`）
-3. 如果都不存在，返回 `runtime/` 下的目标路径
-
-这样从旧版本升级时，数据文件会自动迁移到新位置，不需要手动操作。
+**结论**：12-Factor App 标准做法，敏感信息不进代码仓库。
 
 ---
 
-## 十、认证方案选型：Bearer Token + Unix Socket 自动注入
+## 十、认证方案选型：Bearer Token + Unix Socket
 
 **小白**：API 认证是怎么做的？
 
 **架构师**：轻量级 Bearer Token 方案：
 
-- 配置 `OPENCLAW_API_SECRET` 环境变量后，所有 HTTP 请求必须携带 `Authorization: Bearer <secret>` 头
-- 未配置时跳过认证（兼容现有部署）
-- 未配置时启动会打印警告
+- 配置 `OPENCLAW_API_SECRET` 后，所有 HTTP 请求必须携带 Token
+- Unix Socket 连接自动注入 Token，无需手动传参
 
-**选择**：轻量级 Bearer Token
-
-**优势**：
-- 实现简单：Fastify `onRequest` hook，10 行代码
-- 兼容性好：未配置时自动跳过，不影响现有部署
-- Unix Socket 自动注入：本地工具通过 Unix Socket 连接时不需要手动传 Token
-
-**劣势**：
-- 没有 OAuth2/JWT 那样的细粒度权限控制
-- Token 是静态的，没有过期机制
-- 没有 RBAC（所有端点同一权限）
-
-### Unix Socket 透明代理
-
-`index.js` 实现了 TCP 透明代理，让 Unix Socket 客户端无需手动传 Token：
-
-```
-Unix Socket 客户端 → 透明代理（自动注入 Bearer Token）→ Fastify HTTP 服务
-```
-
-代理机制：
-1. 监听 Unix Domain Socket（默认 `/tmp/openclaw-engine.sock`）
-2. 收到客户端连接后，解析 HTTP 请求头
-3. 如果客户端已携带 `Authorization` 头，拒绝（防止 Token 冲突）
-4. 自动注入 `Authorization: Bearer ${API_SECRET}` 头
-5. 将修改后的请求转发到 Fastify HTTP 端口
-6. 响应原路返回
-
-这样本地工具（如 `cec` 命令）通过 Unix Socket 连接时不需要知道 API Secret，而远程客户端通过 HTTP 连接时必须提供 Token。
-
-### 路径遍历防护
-
-`import-transcript` 端点使用 `isPathInsideRoot()` 验证文件路径：
-- 解析为绝对路径后检查是否在允许的根目录内
-- 防止 `../../etc/passwd` 等路径遍历攻击
-- 只允许 `.md`、`.json`、`.jsonl` 文件
+**优势**：实现简单，10 行代码，兼容性好。
 
 ---
 
-## 十一、基准测试框架选型：自建 vs 外部框架
+## 十一、技术选型原则总结
 
-**小白**：基准测试为什么自己写，不用 Vitest/Jest 的 benchmark 功能？
-
-**架构师**：因为我们需要测试的是**搜索质量**（命中率、召回率、多样性），不是代码性能。Vitest/Jest 的 benchmark 测的是执行速度，不是搜索准确度。
-
-**选择**：自建轻量框架
-
-**优势**：
-- 零依赖：不需要额外测试框架
-- 专注搜索质量：命中率、召回率、多样性三个核心指标
-- 双格式报告：JSON + Markdown，方便人工阅读和程序解析
-- 灵活运行：HTTP API 和 CLI 两种方式
-
-**劣势**：
-- 没有统计显著性检验（但样本量小，不需要）
-- 没有历史趋势对比（但 JSONL 文件可以手动对比）
-- 场景定义是手写的 JSON（但数量少，维护成本低）
-
-### 框架组成
-
-| 模块 | 文件 | 职责 |
-|------|------|------|
-| Scenario | `benchmark/scenario.js` | 定义测试用例（BenchmarkCase）和套件（ScenarioSuite） |
-| Harness | `benchmark/harness.js` | 运行套件、调用搜索函数、收集结果 |
-| Metrics | `benchmark/metrics.js` | 计算命中率、召回率、Jaccard 多样性 |
-| Reporting | `benchmark/reporting.js` | 生成 JSON + Markdown 双格式报告 |
-| Facade | `facades/benchmark.js` | 记录结果、查询历史、文件轮转 |
-
-### Jaccard 相异度
-
-**小白**：为什么用 Jaccard 相异度算多样性？
-
-**架构师**：Jaccard 相异度 = 1 - Jaccard 相似度。它衡量两个搜索结果之间的词汇差异——如果所有结果都说一样的话，多样性为 0；如果每个结果都不同，多样性为 1。
-
-**优势**：
-- 零依赖，纯 Set 运算
-- 语义直观：值越高 = 结果越多样化
-- 对中文友好：基于字符级分词（`[a-z0-9\u4e00-\u9fff]+`）
-
-**劣势**：
-- 只考虑词汇重叠，不考虑语义相似性（"开心"和"高兴"被视为完全不同）
-- 对短文本不够敏感（两句话只差一个字，Jaccard 可能接近 0）
-
----
-
-## 十二、API 速率限制与安全
-
-### 12.1 速率限制
-
-为防止 API 滥用和 DDoS 攻击，新增了基于 token bucket 算法的速率限制：
-
-| 配置项 | 环境变量 | 默认值 | 说明 |
-|--------|---------|--------|------|
-| 请求点数 | `RATE_LIMIT_POINTS` | `100` | 时间窗口内允许的最大请求数 |
-| 时间窗口 | `RATE_LIMIT_DURATION` | `60` | 时间窗口秒数 |
-| 封禁时长 | `RATE_LIMIT_BLOCK_DURATION` | `0` | 超限后封禁秒数（0 = 不封禁） |
-
-**实现细节**：
-- 使用 `rate-limiter-flexible` 库的内存存储
-- 基于 IP 地址进行限制
-- Unix Socket 请求有更高的限额（200 points / 60s）
-- 超限时返回 429 状态码和 `Retry-After` 头
-
-### 12.2 CORS 配置
-
-支持跨域资源共享（CORS）配置：
-
-| 配置项 | 环境变量 | 默认值 | 说明 |
-|--------|---------|--------|------|
-| 允许源 | `CORS_ORIGINS` | `*` | 逗号分隔的允许源列表 |
-
-**实现细节**：
-- 自动处理 OPTIONS 预检请求
-- 支持凭据（cookies）传递
-- 24 小时预检缓存
-
-### 12.3 统一错误处理
-
-建立了统一的错误响应格式：
-
-```json
-{
-  "success": false,
-  "error": "ERROR_TYPE",
-  "message": "Human readable message",
-  "requestId": "uuid",
-  "timestamp": "ISO8601",
-  "details": {}
-}
-```
-
-**错误类型**：
-- `VALIDATION_ERROR` (400) - 请求验证失败
-- `UNAUTHORIZED` (401) - 认证失败
-- `FORBIDDEN` (403) - 权限不足
-- `NOT_FOUND` (404) - 资源不存在
-- `CONFLICT` (409) - 状态冲突
-- `RATE_LIMIT_EXCEEDED` (429) - 速率限制
-- `INTERNAL_ERROR` (500) - 服务器内部错误
-
-### 12.4 请求追踪
-
-每个请求自动分配唯一 ID：
-
-- 请求头 `X-Request-Id` 传递或自动生成 UUID
-- 响应头 `X-Request-Id` 返回请求 ID
-- 日志中包含请求 ID 用于问题追踪
-- 错误响应中包含请求 ID
-
----
-
-## 十三、模块化架构
-
-代码重构为模块化结构：
-
-```
-src/
-├── index.js (入口，~300行)
-├── middleware/
-│   ├── rate-limit.js (速率限制)
-│   ├── cors.js (CORS)
-│   ├── tracing.js (请求追踪)
-│   ├── validation.js (请求验证)
-│   └── error-handler.js (错误处理)
-├── routes/
-│   ├── memory.js (记忆路由)
-│   ├── wiki.js (Wiki路由)
-│   ├── health.js (健康检查)
-│   ├── benchmark.js (基准测试)
-│   └── legacy-bridge.js (兼容层)
-├── facades/
-│   ├── memory.js (记忆门面)
-│   ├── health.js (健康门面)
-│   └── benchmark.js (基准测试门面)
-├── memory/
-│   ├── models.js (数据模型)
-│   ├── local-memory.js (核心逻辑)
-│   ├── sqlite-store.js (SQLite存储)
-│   └── governance.js (治理系统)
-├── wiki/
-│   ├── compiler.js (Wiki编译器)
-│   ├── manifest.js (清单管理)
-│   └── bm25.js (BM25搜索)
-└── api/
-    ├── contract.js (请求契约)
-    └── presenter.js (响应格式化)
-```
-
-**设计模式**：
-- **Facade 模式**：`KnowledgeBase` 作为组合门面，聚合 Memory/Health/Benchmark/Wiki 四个子模块
-- **分层架构**：Routes → Facades → Business Logic → SQLite Store
-- **Plugin 模式**：Fastify 的 `register` 注册路由模块，每个路由模块接收 `routeContext` 依赖注入
-
----
-
-## 十四、技术选型原则总结
-
-1. **务实优先**：关键词匹配 + SQLite 是经过验证的技术，不需要 GPU
-2. **最小依赖**：单服务架构，不依赖 ChromaDB/Python 服务，不依赖 BM25 索引库
+1. **务实优先**：BM25 + SQLite 是经过验证的技术
+2. **最小依赖**：单服务架构，7 个必需依赖 + 1 个可选依赖
 3. **人机协作**：LLM Wiki 的 Markdown 格式让人和 AI 都能读写
-4. **可观测性**：健康检查、结构化日志、Metrics 端点——出问题要知道哪里坏了
-5. **简化优先**：2 态记忆模型比 7 态好维护，不建索引比建索引好调试
-6. **优雅降级**：LLM 语义比较不可用时自动降级为词法匹配，不会阻塞主流程
-7. **安全默认**：路径遍历防护、Bearer Token 认证、Unix Socket 自动注入、API 速率限制
-8. **数据安全**：Graceful Shutdown 确保 WAL 数据不丢失，uncaughtException 紧急 checkpoint
-9. **模块化架构**：路由、中间件、业务逻辑分离，便于维护和测试
-10. **性能优先**：BM25 搜索在页面增多时自动启用，保证搜索质量
+4. **可观测性**：健康检查、结构化日志、Metrics 端点
+5. **简化优先**：weight-based 模型比 7 态好维护
+6. **优雅降级**：jieba 不可用时 fallback 到 bigram
+7. **安全默认**：路径遍历防护、Bearer Token 认证
+8. **数据安全**：Graceful Shutdown 确保 WAL 数据不丢失
 
 ---
 
@@ -785,68 +485,31 @@ src/
 
 | 问题现象 | 排查方式 | 相关章节 |
 |---------|---------|---------|
-| Wiki 搜不到结果 | 调用 MCP 工具 `wiki_detect_changes` 检查是否需要编译 | 七 |
-| 服务起不来 | `journalctl --user -u openclaw-context-engine.service` | - |
-| Wiki 没编译 | 调用 MCP 工具 `wiki_check_stale` | 七 |
-| 磁盘满了 | `du -sh ./runtime/` | 三 |
-| 记忆搜不到 | 检查 `memory_items` 表中的 `status` 和 `content` | 四、五 |
-| WAL 膨胀 | `curl http://127.0.0.1:8901/metrics` 查看 `process.external_mb` | 三 |
-| 服务无响应 | `curl http://127.0.0.1:8901/api/health/ready` 检查是否存活 | - |
-| 性能下降 | 检查 metrics 中 `requests_total` 与 `errors_total` 比例 | 十二 |
-| 治理误判 | 检查 `SIDE_LLM_GATEWAY_URL` 是否配置，未配置时仅用词法匹配 | 六 |
-| Benchmark 崩溃 | 检查 `config/benchmark-scenarios/` 目录是否存在场景文件 | 十一 |
-| autoTriage 不工作 | 检查 `memory_events` 表是否有 `auto_triage_failure` 事件 | 五 |
-| Unix Socket 连不上 | 检查 `/tmp/openclaw-engine.sock` 是否存在，权限是否 0600 | 十 |
-| 认证失败 | 检查 `OPENCLAW_API_SECRET` 是否配置，Bearer Token 是否正确 | 十 |
+| 搜不到记忆 | 检查 BM25 索引日志 | 四 |
+| 服务起不来 | `journalctl --user -u openclaw-context-engine` | - |
+| 中文分词差 | 检查 jieba 是否安装 | 1.4 |
+| 记忆被误删 | 检查 weight 和 category | 5.1 |
+| 治理误判 | 检查 LLM 网关配置 | 六 |
+| 实体未提取 | 检查正则模式 | - |
+| Unix Socket 连不上 | 检查 `/tmp/openclaw-engine.sock` | 十 |
+| 认证失败 | 检查 `OPENCLAW_API_SECRET` | 十 |
 
 ---
 
-## 附录 B：环境变量速查
+## 附录 B：依赖清单
 
-| 变量 | 默认值 | 说明 |
-|------|--------|------|
-| `HTTP_HOST` | `127.0.0.1` | HTTP 绑定地址 |
-| `HTTP_PORT` | `8901` | HTTP 端口 |
-| `HTTP_SOCKET_PATH` | `/tmp/openclaw-engine.sock` | Unix Socket 路径（为空时禁用） |
-| `OPENCLAW_API_SECRET` | 空 | API 认证密钥（空时不校验） |
-| `SIDE_LLM_GATEWAY_URL` | 空 | 侧边 LLM 网关地址（用于治理语义比较） |
-| `SIDE_LLM_GATEWAY_MODEL` | `k2p6` | 侧边 LLM 网关默认模型名 |
-| `PROJECT_ROOT` | `../workspace` | 工作区根目录 |
-| `CONTEXT_ENGINE_RUNTIME_DIR` | `./runtime` | 运行时数据目录（SQLite、日志等） |
-| `LOCALMEM_DAILY_WRITE_LIMIT` | `50` | 自动来源每日写入上限 |
-| `LOCALMEM_FACT_MAX_AGE_DAYS` | `180` | 事实记忆最大保留天数 |
-| `LOCALMEM_SESSION_MAX_AGE_DAYS` | `60` | 会话最大保留天数 |
-| `DEBUG_EXPORT_ENABLED` | `0` | 是否启用调试导出 |
-| `DEBUG_EXPORT_HISTORY_LIMIT` | `20` | 调试导出历史记录上限 |
-| `DEBUG_EXPORT_MAX_AGE_DAYS` | `3` | 调试导出文件最大保留天数 |
-| `MCP_LOG_RETENTION_DAYS` | `3` | MCP 日志保留天数 |
-| `RATE_LIMIT_POINTS` | `100` | 速率限制：时间窗口内最大请求数 |
-| `RATE_LIMIT_DURATION` | `60` | 速率限制：时间窗口秒数 |
-| `RATE_LIMIT_BLOCK_DURATION` | `0` | 速率限制：超限封禁秒数（0 = 不封禁） |
-| `CORS_ORIGINS` | `*` | CORS 允许源（逗号分隔） |
-| `LOCALMEM_AUTO_TRANSCRIPT_SYNC_ENABLED` | `1` | 是否启用对话记录自动同步 |
-| `LOCALMEM_AUTO_TRANSCRIPT_MAX_AGE_SECONDS` | `1800` | 自动同步的对话记录最大存活秒数 |
-| `CURSOR_PROJECTS_DIR` | `~/.cursor/projects` | Cursor 编辑器项目目录 |
+| 依赖 | 版本 | 类型 | 说明 |
+|------|------|------|------|
+| `fastify` | ^4.26.0 | 必需 | HTTP 框架 |
+| `better-sqlite3` | ^9.4.0 | 必需 | SQLite 绑定 |
+| `pino` | ^8.19.0 | 必需 | HTTP 日志 |
+| `dotenv` | ^16.4.0 | 必需 | 环境变量加载 |
+| `uuid` | ^9.0.1 | 必需 | UUID 生成 |
+| `zod` | ^3.22.4 | 必需 | Schema 验证 |
+| `rate-limiter-flexible` | ^11.0.1 | 必需 | API 速率限制 |
+| `@node-rs/jieba` | - | 可选 | 中文分词增强 |
 
 ---
 
-## 附录 C：依赖清单与选择原因
-
-| 依赖 | 版本 | 选择原因 |
-|------|------|---------|
-| `fastify` | ^4.26.0 | HTTP 框架，性能优于 Express，内置验证和日志 |
-| `better-sqlite3` | ^9.4.0 | SQLite 绑定，同步 API，WAL 模式支持，零部署 |
-| `pino` | ^8.19.0 | Fastify 内置 HTTP 日志，性能最优 |
-| `dotenv` | ^16.4.0 | 环境变量加载，12-Factor App 标准做法 |
-| `uuid` | ^9.0.1 | UUID 生成，用于记忆 ID、会话 ID 等 |
-| `zod` | ^3.22.4 | Schema 验证（当前未深度使用，预留扩展） |
-| `rate-limiter-flexible` | ^11.0.1 | API 速率限制，防止滥用和 DDoS 攻击 |
-| `eslint` | ^8.57.0 | 代码质量检查（devDependency） |
-| `c8` | ^11.0.0 | 代码覆盖率（devDependency） |
-| `pino-pretty` | ^10.3.1 | 开发环境日志格式化（devDependency） |
-
----
-
-*本文档最后更新：2026-05-02*
-*反映 localMem + LLM Wiki 双引擎架构*
-*覆盖：语言选择、架构选择、数据库、HTTP框架、搜索方案、记忆模型、治理系统、Wiki编译、日志、配置、认证、基准测试、速率限制、CORS、错误处理、请求追踪、模块化架构*
+*本文档最后更新：2026-05-03*
+*反映 v3.3 weight-based + BM25 + 实体链接架构*
