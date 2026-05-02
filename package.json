@@ -19,11 +19,11 @@
     "pino": "^8.19.0",
     "rate-limiter-flexible": "^11.0.1",
     "uuid": "^9.0.1",
-    "winston": "^3.17.0",
     "zod": "^3.22.4"
   },
   "devDependencies": {
-    "eslint": "^8.57.0"
+    "eslint": "^8.57.0",
+    "pino-pretty": "^10.3.1"
   },
   "engines": {
     "node": ">=18.0.0"

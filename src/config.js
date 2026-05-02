@@ -4,7 +4,7 @@
  */
 
 import dotenv from 'dotenv';
-import winston from 'winston';
+import pino from 'pino';
 import { fileURLToPath } from 'url';
 import path from 'path';
 import fs from 'fs';
@@ -92,40 +92,35 @@ export const HTTP_SOCKET_PATH = Object.prototype.hasOwnProperty.call(process.env
   ? process.env.HTTP_SOCKET_PATH
   : '/tmp/openclaw-engine.sock'; // Unix Domain Socket 路径，为空时禁用
 
-// ========== Winston 日志 ==========
-/** Winston 日志实例，默认输出到控制台，带时间戳和级别 */
-export const logger = winston.createLogger({
-  level: 'info',
-  format: winston.format.combine(
-    winston.format.timestamp(),
-    winston.format.printf(({ timestamp, level, message }) => `${timestamp} ${level.toUpperCase()} ${message}`)
-  ),
-  transports: [
-    new winston.transports.Console()
-  ]
+// ========== 可配置的业务参数 ==========
+export const AUTOTRIAGE_RECOVERY_MS = parseInt(process.env.AUTOTRIAGE_RECOVERY_MS || '1800000', 10); // auto-triage 恢复超时（毫秒），默认 30 分钟
+export const TRIAGE_MIN_CONTENT_LENGTH = parseInt(process.env.TRIAGE_MIN_CONTENT_LENGTH || '10', 10); // triage 最小内容长度
+export const TRIAGE_MAX_CONTENT_LENGTH = parseInt(process.env.TRIAGE_MAX_CONTENT_LENGTH || '500', 10); // triage 最大内容长度
+export const WIKI_SEARCH_CACHE_TTL_MS = parseInt(process.env.WIKI_SEARCH_CACHE_TTL_MS || '300000', 10); // Wiki 搜索缓存 TTL（毫秒），默认 5 分钟
+export const LLM_SEMANTIC_COMPARE_TIMEOUT_MS = parseInt(process.env.LLM_SEMANTIC_COMPARE_TIMEOUT_MS || '10000', 10); // LLM 语义比较超时（毫秒），默认 10 秒
+export const LOCALMEM_TENTATIVE_TTL_DAYS = parseInt(process.env.LOCALMEM_TENTATIVE_TTL_DAYS || '7', 10); // tentative 记忆 TTL（天数）
+
+// ========== Pino 日志 ==========
+export const LOG_DIR = prepareRuntimePath('logs');
+
+const pinoTargets = [];
+if (process.env.NODE_ENV !== 'production') {
+  pinoTargets.push({ target: 'pino-pretty', options: { colorize: true, translateTime: 'SYS:standard' } });
+} else {
+  pinoTargets.push({ target: 'pino/file', options: { destination: 1 } });
+}
+pinoTargets.push({
+  target: 'pino/file',
+  options: {
+    destination: path.join(LOG_DIR, `context-engine-${new Date().toISOString().slice(0, 10)}.log`),
+    mkdir: true,
+  },
 });
 
-// ========== 日志处理器 ==========
-/**
- * 创建带保留策略的文件日志处理器
- * @param {string} logPath - 日志文件路径
- * @param {object} [options] - 可选配置
- * @param {number} [options.retentionDays=3] - 日志文件保留天数
- * @param {string} [options.encoding='utf-8'] - 文件编码
- * @returns {winston.transports.File} Winston 文件传输实例
- */
-export function buildRetainedLogHandler(logPath, { retentionDays = 3, encoding = 'utf-8' } = {}) {
-  const dir = path.dirname(logPath);
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
-  }
-  return new winston.transports.File({
-    filename: logPath,
-    encoding,
-    maxFiles: retentionDays > 0 ? retentionDays : 0,
-    maxSize: '20m'
-  });
-}
+export const logger = pino({
+  level: process.env.LOG_LEVEL || 'info',
+  transport: { targets: pinoTargets },
+});
 
 // ========== 部署摘要 ==========
 /**

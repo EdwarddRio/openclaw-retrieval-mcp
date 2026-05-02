@@ -60,6 +60,22 @@ export class MemoryQueryRequest {
   }
 }
 
+export class MemoryQueryContextRequest {
+  constructor(options = {}) {
+    this.query = options.query || '';
+    this.top_k = options.top_k || 3;
+    this.session_id = options.session_id || null;
+  }
+
+  validate() {
+    const errors = [];
+    if (!this.query || this.query.trim().length === 0) {
+      errors.push('query is required');
+    }
+    return { valid: errors.length === 0, errors };
+  }
+}
+
 export class MemorySaveRequest {
   constructor(options = {}) {
     this.session_id = options.session_id || null;
@@ -149,19 +165,90 @@ export class StartMemorySessionRequest {
   }
 }
 
-export class ImportTranscriptSessionRequest {
+export class AutoTriageRequest {
   constructor(options = {}) {
-    this.transcript_path = options.transcript_path || null;
-    this.transcript_id = options.transcript_id || null;
-    this.transcripts_root = options.transcripts_root || null;
-    this.project_id = options.project_id || 'default';
-    this.title = options.title || '';
-    this.created_at = options.created_at || null;
-    this.session_id = options.session_id || null;
+    this.session_id = options.session_id || '';
+    this.role = options.role || '';
+    this.content = options.content || '';
+    this.previous_role = options.previous_role || '';
+    this.previous_content = options.previous_content || '';
+  }
+
+  validate() {
+    const errors = [];
+    if (!this.session_id) errors.push('session_id is required');
+    if (!this.role || !['user', 'assistant', 'system'].includes(this.role)) {
+      errors.push('role is required and must be user, assistant, or system');
+    }
+    if (!this.content || this.content.trim().length === 0) {
+      errors.push('content is required');
+    }
+    return { valid: errors.length === 0, errors };
   }
 }
 
-// ========== Response DTOs ==========
+export class GovernancePlanUpdateRequest {
+  constructor(options = {}) {
+    this.content = options.content || '';
+    this.aliases = options.aliases || [];
+    this.path_hints = options.path_hints || [];
+    this.collection_hints = options.collection_hints || [];
+  }
+
+  validate() {
+    const errors = [];
+    if (!this.content || this.content.trim().length === 0) {
+      errors.push('content is required');
+    }
+    return { valid: errors.length === 0, errors };
+  }
+}
+
+export class WikiSearchRequest {
+  constructor(options = {}) {
+    this.query = options.query || '';
+    this.top_k = options.top_k || 5;
+  }
+
+  validate() {
+    const errors = [];
+    if (!this.query || this.query.trim().length === 0) {
+      errors.push('query is required');
+    }
+    return { valid: errors.length === 0, errors };
+  }
+}
+
+export class WikiSavePageRequest {
+  constructor(options = {}) {
+    this.sourcePath = options.sourcePath || '';
+    this.wikiPageName = options.wikiPageName || '';
+    this.content = options.content || '';
+    this.sourceId = options.sourceId || null;
+  }
+
+  validate() {
+    const errors = [];
+    if (!this.sourcePath) errors.push('sourcePath is required');
+    if (!this.wikiPageName) errors.push('wikiPageName is required');
+    if (!this.content || this.content.trim().length === 0) errors.push('content is required');
+    return { valid: errors.length === 0, errors };
+  }
+}
+
+export class WikiRemovePageRequest {
+  constructor(options = {}) {
+    this.wikiPageName = options.wikiPageName || '';
+  }
+
+  validate() {
+    const errors = [];
+    if (!this.wikiPageName) errors.push('wikiPageName is required');
+    return { valid: errors.length === 0, errors };
+  }
+}
+
+// ========== Response DTOs (used by presenter) ==========
 
 export class MemoryItem {
   constructor(options = {}) {
@@ -339,6 +426,15 @@ export function buildMemoryQueryCall(payload) {
 
 export default {
   MemoryQueryRequest,
+  MemoryQueryContextRequest,
   MemorySaveRequest,
+  BenchmarkResultRequest,
+  SessionTurnRequest,
+  StartMemorySessionRequest,
+  AutoTriageRequest,
+  GovernancePlanUpdateRequest,
+  WikiSearchRequest,
+  WikiSavePageRequest,
+  WikiRemovePageRequest,
   buildMemoryQueryCall,
 };

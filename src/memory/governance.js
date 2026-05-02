@@ -3,6 +3,8 @@
  * Architecture: localMem + LLMWiki. Semantic (embedding-based) detection removed.
  */
 
+import { logger, LLM_SEMANTIC_COMPARE_TIMEOUT_MS } from '../config.js';
+
 /** 分词正则：匹配英文/数字/下划线片段或中文字符片段 */
 const TOKEN_RE = /[A-Za-z0-9_]+|[\u4e00-\u9fff]+/g;
 /** 主题分词停用词，这些词在主题匹配时被忽略 */
@@ -405,7 +407,6 @@ function _setIntersect(a, b) {
  * @returns {Promise<{sameIntent: boolean, confidence: number}>}
  */
 async function _llmSemanticCompare({ candidate, existing, sideLlmGateway }) {
-  const LLM_TIMEOUT_MS = 10000;
   try {
     const prompt = `判断以下两条记忆是否表达同一意图或规则。只输出 JSON：\n\n候选："${candidate.slice(0, 200)}"\n已有："${existing.slice(0, 200)}"\n\n输出格式：{"sameIntent": true/false, "confidence": 0.0-1.0}`;
     
@@ -417,7 +418,7 @@ async function _llmSemanticCompare({ candidate, existing, sideLlmGateway }) {
       max_tokens: 100,
     });
     const timeoutPromise = new Promise((_, reject) =>
-      setTimeout(() => reject(new Error(`LLM gateway timeout after ${LLM_TIMEOUT_MS}ms`)), LLM_TIMEOUT_MS)
+      setTimeout(() => reject(new Error(`LLM gateway timeout after ${LLM_SEMANTIC_COMPARE_TIMEOUT_MS}ms`)), LLM_SEMANTIC_COMPARE_TIMEOUT_MS)
     );
     const response = await Promise.race([chatPromise, timeoutPromise]);
     
@@ -431,7 +432,7 @@ async function _llmSemanticCompare({ candidate, existing, sideLlmGateway }) {
       };
     }
   } catch (err) {
-    console.warn(`[governance] LLM semantic compare failed (model: ${sideLlmGateway.defaultModel || 'k2p6'}): ${err.message}`);
+    logger.warn(`[governance] LLM semantic compare failed (model: ${sideLlmGateway.defaultModel || 'k2p6'}): ${err.message}`);
   }
   return { sameIntent: false, confidence: 0 };
 }

@@ -7,7 +7,7 @@ import { MemoryFacade } from './facades/memory.js';
 import { HealthFacade } from './facades/health.js';
 import { BenchmarkFacade } from './facades/benchmark.js';
 import { BenchmarkHarness } from './benchmark/harness.js';
-import { BENCHMARKS_DIR, CONTEXT_ENGINE_DIR } from './config.js';
+import { BENCHMARKS_DIR, CONTEXT_ENGINE_DIR, logger } from './config.js';
 import { WikiCompiler } from './wiki/compiler.js';
 import path from 'path';
 
@@ -426,7 +426,7 @@ export class KnowledgeBase {
       errors.push(`memory: ${err.message}`);
     }
     if (errors.length > 0) {
-      console.error(`[KnowledgeBase] close errors: ${errors.join(', ')}`);
+      logger.error(`[KnowledgeBase] close errors: ${errors.join(', ')}`);
     }
   }
 }

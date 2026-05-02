@@ -603,8 +603,113 @@ Unix Socket 客户端 → 透明代理（自动注入 Bearer Token）→ Fastify
 4. **可观测性**：健康检查、结构化日志、Metrics 端点——出问题要知道哪里坏了
 5. **简化优先**：2 态记忆模型比 7 态好维护，不建索引比建索引好调试
 6. **优雅降级**：LLM 语义比较不可用时自动降级为词法匹配，不会阻塞主流程
-7. **安全默认**：路径遍历防护、Bearer Token 认证、Unix Socket 自动注入
+7. **安全默认**：路径遍历防护、Bearer Token 认证、Unix Socket 自动注入、API 速率限制
 8. **数据安全**：Graceful Shutdown 确保 WAL 数据不丢失，uncaughtException 紧急 checkpoint
+9. **模块化架构**：路由、中间件、业务逻辑分离，便于维护和测试
+10. **性能优先**：BM25 搜索在页面增多时自动启用，保证搜索质量
+
+---
+
+## 十三、新增功能说明（2026-05-01 更新）
+
+### 13.1 API 速率限制
+
+为防止 API 滥用和 DDoS 攻击，新增了基于 token bucket 算法的速率限制：
+
+| 配置项 | 环境变量 | 默认值 | 说明 |
+|--------|---------|--------|------|
+| 请求点数 | `RATE_LIMIT_POINTS` | `100` | 时间窗口内允许的最大请求数 |
+| 时间窗口 | `RATE_LIMIT_DURATION` | `60` | 时间窗口秒数 |
+| 封禁时长 | `RATE_LIMIT_BLOCK_DURATION` | `0` | 超限后封禁秒数（0 = 不封禁） |
+
+**实现细节**：
+- 使用 `rate-limiter-flexible` 库的内存存储
+- 基于 IP 地址进行限制
+- 超限时返回 429 状态码和 `Retry-After` 头
+- `/metrics` 端点包含速率限制指标
+
+### 13.2 CORS 配置
+
+支持跨域资源共享（CORS）配置：
+
+| 配置项 | 环境变量 | 默认值 | 说明 |
+|--------|---------|--------|------|
+| 允许源 | `CORS_ORIGINS` | `*` | 逗号分隔的允许源列表 |
+
+**实现细节**：
+- 自动处理 OPTIONS 预检请求
+- 支持凭据（cookies）传递
+- 24 小时预检缓存
+
+### 13.3 统一错误处理
+
+建立了统一的错误响应格式：
+
+```json
+{
+  "success": false,
+  "error": "ERROR_TYPE",
+  "message": "Human readable message",
+  "requestId": "uuid",
+  "timestamp": "ISO8601",
+  "details": {}
+}
+```
+
+**错误类型**：
+- `VALIDATION_ERROR` (400) - 请求验证失败
+- `UNAUTHORIZED` (401) - 认证失败
+- `FORBIDDEN` (403) - 权限不足
+- `NOT_FOUND` (404) - 资源不存在
+- `CONFLICT` (409) - 状态冲突
+- `RATE_LIMIT_EXCEEDED` (429) - 速率限制
+- `INTERNAL_ERROR` (500) - 服务器内部错误
+
+### 13.4 请求追踪
+
+每个请求自动分配唯一 ID：
+
+- 请求头 `X-Request-Id` 传递或自动生成 UUID
+- 响应头 `X-Request-Id` 返回请求 ID
+- 日志中包含请求 ID 用于问题追踪
+- 错误响应中包含请求 ID
+
+### 13.5 BM25 搜索升级
+
+Wiki 搜索支持 BM25Okapi 算法，当页面数量超过阈值时自动启用：
+
+| 配置 | 默认值 | 说明 |
+|------|--------|------|
+| 启用阈值 | 200 页 | 超过此数量启用 BM25 |
+| k1 参数 | 1.5 | 词频饱和参数 |
+| b 参数 | 0.75 | 文档长度归一化参数 |
+
+**特性**：
+- 中文支持：字符级 + bigram 分词
+- 标题加权：标题匹配得分 × 1.5
+- 自动降级：页面少时使用简单词频匹配
+
+### 13.6 模块化架构
+
+代码重构为模块化结构：
+
+```
+src/
+├── index.js (入口，~300行)
+├── middleware/
+│   ├── rate-limit.js (速率限制)
+│   ├── cors.js (CORS)
+│   ├── tracing.js (请求追踪)
+│   └── error-handler.js (错误处理)
+├── routes/
+│   ├── memory.js (记忆路由)
+│   ├── wiki.js (Wiki路由)
+│   ├── health.js (健康检查)
+│   ├── benchmark.js (基准测试)
+│   └── legacy-bridge.js (兼容层)
+└── wiki/
+    └── bm25.js (BM25搜索)
+```
 
 ---
 
@@ -647,6 +752,10 @@ Unix Socket 客户端 → 透明代理（自动注入 Bearer Token）→ Fastify
 | `DEBUG_EXPORT_HISTORY_LIMIT` | `20` | 调试导出历史记录上限 |
 | `DEBUG_EXPORT_MAX_AGE_DAYS` | `3` | 调试导出文件最大保留天数 |
 | `MCP_LOG_RETENTION_DAYS` | `3` | MCP 日志保留天数 |
+| `RATE_LIMIT_POINTS` | `100` | 速率限制：时间窗口内最大请求数 |
+| `RATE_LIMIT_DURATION` | `60` | 速率限制：时间窗口秒数 |
+| `RATE_LIMIT_BLOCK_DURATION` | `0` | 速率限制：超限封禁秒数（0 = 不封禁） |
+| `CORS_ORIGINS` | `*` | CORS 允许源（逗号分隔） |
 | `LOCALMEM_AUTO_TRANSCRIPT_SYNC_ENABLED` | `1` | 是否启用对话记录自动同步 |
 | `LOCALMEM_AUTO_TRANSCRIPT_MAX_AGE_SECONDS` | `1800` | 自动同步的对话记录最大存活秒数 |
 | `CURSOR_PROJECTS_DIR` | `~/.cursor/projects` | Cursor 编辑器项目目录 |
@@ -664,6 +773,7 @@ Unix Socket 客户端 → 透明代理（自动注入 Bearer Token）→ Fastify
 | `dotenv` | ^16.4.0 | 环境变量加载，12-Factor App 标准做法 |
 | `uuid` | ^9.0.1 | UUID 生成，用于记忆 ID、会话 ID 等 |
 | `zod` | ^3.22.4 | Schema 验证（当前未深度使用，预留扩展） |
+| `rate-limiter-flexible` | ^5.0.0 | API 速率限制，防止滥用和 DDoS 攻击 |
 | `eslint` | ^8.57.0 | 代码质量检查（devDependency） |
 
 ---
@@ -671,4 +781,4 @@ Unix Socket 客户端 → 透明代理（自动注入 Bearer Token）→ Fastify
 *本文档最后更新：2026-05-01*
 *反映 localMem + LLM Wiki 双引擎架构（已移除 BM25/static_kb）*
 *新增：认证方案、日志选型、配置管理、基准测试框架、中文 bigram 扩展搜索、检索洞察注入、人工编辑保护、数据库迁移版本控制、Prepared Statement 缓存、Unix Socket 代理、路径遍历防护、Graceful Shutdown*
-*2026-05-01 更新：governance token overlapRatio 阈值从 40% 降至 25%、autoTriage previous_content 修复、Wiki 索引空数组 Bug 修复、_isKnowledgeAssertion 字数阈值从 30 降至 15*
+*2026-05-01 更新：API 速率限制、CORS 配置、统一错误处理、请求追踪、模块化架构、BM25 搜索升级、边界条件测试、性能基准测试*

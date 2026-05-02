@@ -8,12 +8,16 @@ import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import { createRequire } from 'module';
-import { LOCALMEM_DIR } from '../config.js';
+import { LOCALMEM_DIR, logger } from '../config.js';
 import { canonicalKeyForText, computeRelevanceScore, RELEVANCE_WEIGHTS } from './models.js';
 
 /** 生成 UUID */
 function _uuid() {
   return crypto.randomUUID();
+}
+
+function escapeLikePattern(str) {
+  return str.replace(/!/g, '!!').replace(/%/g, '!%').replace(/_/g, '!_');
 }
 
 /**
@@ -240,12 +244,10 @@ export class SqliteStore {
     try {
       const result = this.db.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get();
       if (result && result.checkpointed > 0) {
-        // eslint-disable-next-line no-console
-        console.log(`SQLite WAL checkpoint: log=${result.log}, checkpointed=${result.checkpointed}`);
+        logger.info(`SQLite WAL checkpoint: log=${result.log}, checkpointed=${result.checkpointed}`);
       }
     } catch (err) {
-      // eslint-disable-next-line no-console
-      console.warn(`WAL checkpoint failed: ${err.message}`);
+      logger.warn(`WAL checkpoint failed: ${err.message}`);
     }
   }
 
@@ -262,7 +264,7 @@ export class SqliteStore {
         this._lastCheckpointAt = now;
       }
     } catch (err) {
-      console.warn(`[SqliteStore] Checkpoint check failed: ${err.message}`);
+      logger.warn(`[SqliteStore] Checkpoint check failed: ${err.message}`);
     }
   }
 
@@ -606,11 +608,23 @@ export class SqliteStore {
     const terms = query.trim().split(/\s+/).filter(t => t.length > 0);
     if (terms.length === 0) return [];
 
-    const andConditions = terms.map(() => '(content LIKE ? OR aliases_json LIKE ?)').join(' AND ');
+    const hasChinese = terms.some(t => /[\u4e00-\u9fff]/.test(t));
+    const searchMode = process.env.MEMORY_SEARCH_MODE || (hasChinese ? 'or-first' : 'and-first');
+
+    if (searchMode === 'or-first' && hasChinese) {
+      return this._queryMemoryOrFirst(query, terms, topK, sessionId);
+    }
+
+    return this._queryMemoryAndFirst(query, terms, topK, sessionId);
+  }
+
+  _queryMemoryAndFirst(query, terms, topK, sessionId) {
+    const andConditions = terms.map(() => "(content LIKE ? ESCAPE '!' OR aliases_json LIKE ? ESCAPE '!')").join(' AND ');
     const sessionClause = sessionId ? ' AND session_id = ?' : '';
     const andParams = [];
     for (const t of terms) {
-      andParams.push(`%${t}%`, `%"${t}"%`);
+      const escaped = escapeLikePattern(t);
+      andParams.push(`%${escaped}%`, `%"${escaped}"%`);
     }
     if (sessionId) andParams.push(sessionId);
     const andStmt = this.db.prepare(`
@@ -644,10 +658,11 @@ export class SqliteStore {
 
       if (expandedTerms.length > terms.length) {
         const minMatch = Math.ceil(expandedTerms.length / 2);
-        const orConditions = expandedTerms.map(() => '(content LIKE ? OR aliases_json LIKE ?)').join(' OR ');
+        const orConditions = expandedTerms.map(() => "(content LIKE ? ESCAPE '!' OR aliases_json LIKE ? ESCAPE '!')").join(' OR ');
         const orParams = [];
         for (const t of expandedTerms) {
-          orParams.push(`%${t}%`, `%"${t}"%`);
+          const escaped = escapeLikePattern(t);
+          orParams.push(`%${escaped}%`, `%"${escaped}"%`);
         }
         const excludeIds = rows.map(r => r.memory_id);
         const excludeClause = excludeIds.length > 0
@@ -684,14 +699,70 @@ export class SqliteStore {
     return rows.slice(0, topK);
   }
 
+  _queryMemoryOrFirst(query, terms, topK, sessionId) {
+    const expandedTerms = [];
+    for (const term of terms) {
+      if (term.length > 1 && /[\u4e00-\u9fff]/.test(term)) {
+        const bigrams = [];
+        for (let i = 0; i < term.length - 1; i++) {
+          const bigram = term.slice(i, i + 2);
+          if (/[\u4e00-\u9fff]{2}/.test(bigram)) {
+            bigrams.push(bigram);
+          }
+        }
+        if (bigrams.length > 0) {
+          expandedTerms.push(...bigrams);
+        } else {
+          expandedTerms.push(term);
+        }
+      } else {
+        expandedTerms.push(term);
+      }
+    }
+
+    const minMatch = Math.max(1, Math.ceil(expandedTerms.length / 3));
+    const orConditions = expandedTerms.map(() => "(content LIKE ? ESCAPE '!' OR aliases_json LIKE ? ESCAPE '!')").join(' OR ');
+    const sessionClause = sessionId ? ' AND session_id = ?' : '';
+    const orParams = [];
+    for (const t of expandedTerms) {
+      const escaped = escapeLikePattern(t);
+      orParams.push(`%${escaped}%`, `%"${escaped}"%`);
+    }
+    if (sessionId) orParams.push(sessionId);
+    const stmt = this.db.prepare(`
+      SELECT * FROM memory_items
+      WHERE (${orConditions}) AND status = 'active' AND state IN ('tentative', 'kept')
+      ${sessionClause}
+      ORDER BY updated_at DESC LIMIT ?
+    `);
+    const args = sessionId
+      ? [...orParams, topK * 5]
+      : [...orParams, topK * 5];
+    const rows = stmt.all(...args)
+      .map(r => this._rowToMemory(r))
+      .filter(r => {
+        const content = (r.content || '').toLowerCase();
+        const matchCount = expandedTerms.filter(t => content.includes(t.toLowerCase())).length;
+        return matchCount >= minMatch;
+      });
+
+    rows.sort((a, b) => {
+      const scoreA = this._computeRelevanceScore(a, terms);
+      const scoreB = this._computeRelevanceScore(b, terms);
+      return scoreB - scoreA;
+    });
+
+    return rows.slice(0, topK);
+  }
+
   queryTurns(query, topK = 5, sessionId = null) {
     if (!query || !query.trim()) return [];
     const terms = query.trim().split(/\s+/).filter(Boolean);
     if (terms.length === 0) return [];
 
-    const conditions = terms.map(() => 'content LIKE ?').join(' AND ');
+    const conditions = terms.map(() => "content LIKE ? ESCAPE '!'").join(' AND ');
     const sessionClause = sessionId ? ' AND session_id = ?' : '';
-    const params = terms.map(t => `%${t}%`);
+    const params = terms.map(t => `%${escapeLikePattern(t)}%`);
     if (sessionId) params.push(sessionId);
 
     const rows = this.db.prepare(`
@@ -1047,7 +1118,7 @@ export class SqliteStore {
       this.db.prepare("DELETE FROM memory_items WHERE state = 'discarded' OR status IN ('archived', 'discarded')").run();
       this.db.prepare("DELETE FROM memory_aliases WHERE memory_id NOT IN (SELECT id FROM memory_items)").run();
     } catch (err) {
-      console.error(`[SqliteStore] State migration failed (non-fatal, continuing): ${err.message}`);
+      logger.error(`[SqliteStore] State migration failed (non-fatal, continuing): ${err.message}`);
     }
   }
 }

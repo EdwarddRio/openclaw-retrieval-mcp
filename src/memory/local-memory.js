@@ -6,7 +6,7 @@
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
-import { logger, LOCALMEM_DIR, LOCALMEM_FACT_MAX_AGE_DAYS, LOCALMEM_SESSION_MAX_AGE_DAYS, PROJECT_ROOT, LOCALMEM_DAILY_WRITE_LIMIT } from '../config.js';
+import { logger, LOCALMEM_DIR, LOCALMEM_FACT_MAX_AGE_DAYS, LOCALMEM_SESSION_MAX_AGE_DAYS, PROJECT_ROOT, LOCALMEM_DAILY_WRITE_LIMIT, LOCALMEM_TENTATIVE_TTL_DAYS } from '../config.js';
 import { SqliteStore } from './sqlite-store.js';
 import { ChatTurn, ChatSession, MemoryFact, isoNow, canonicalKeyForText, computeRelevanceScore, TRIAGE_CONFIRM_SIGNALS, TRIAGE_DISCARD_SIGNALS, TRIAGE_MIN_CONTENT_LENGTH, TRIAGE_MAX_CONTENT_LENGTH, RELEVANCE_WEIGHTS } from './models.js';
 import { planKnowledgeUpdate } from './governance.js';
@@ -294,6 +294,12 @@ export class LocalMemoryStore {
       insightSessionId = activeSession?.session_id || null;
     }
     const hits = this._store.queryMemory(query, topK * 2, sessionId);
+    if (hits.length > 0) {
+      const queryHash = crypto.createHash('sha256').update(query.trim().toLowerCase()).digest('hex').slice(0, 12);
+      for (const hit of hits) {
+        this._store.addQueryHash(hit.memory_id, queryHash);
+      }
+    }
     const matchedTurns = this._store.queryTurns(query, topK, sessionId);
     const matchedSessions = this._buildMatchedSessions(sessionId, query, topK);
     const freshness = this._freshnessPayload(hits);
@@ -758,7 +764,7 @@ export class LocalMemoryStore {
       const turnResult = this._store.cleanupOldTurns(sessionAge);
       const sessionResult = this._store.cleanupOldSessions(sessionAge);
       const eventResult = this._store.cleanupOldEvents(30);
-      const tentativeResult = this._store.cleanupExpiredTentative(7);
+      const tentativeResult = this._store.cleanupExpiredTentative(LOCALMEM_TENTATIVE_TTL_DAYS);
       logger.info(
         `Periodic cleanup: turns=${turnResult.deleted}, sessions=${sessionResult.deleted}, ` +
         `events=${eventResult.deleted}, tentative=${tentativeResult.deleted}`

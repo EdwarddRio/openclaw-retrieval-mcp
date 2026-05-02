@@ -146,8 +146,8 @@ export const TRIAGE_DISCARD_SIGNALS = [
   '不确定', '可能不对', '随便看看',
 ];
 
-export const TRIAGE_MIN_CONTENT_LENGTH = 10;
-export const TRIAGE_MAX_CONTENT_LENGTH = 500;
+export const TRIAGE_MIN_CONTENT_LENGTH = parseInt(process.env.TRIAGE_MIN_CONTENT_LENGTH || '10', 10);
+export const TRIAGE_MAX_CONTENT_LENGTH = parseInt(process.env.TRIAGE_MAX_CONTENT_LENGTH || '500', 10);
 
 export const RELEVANCE_WEIGHTS = {
   search: { hitRate: 0.5, position: 0.2, count: 0.15, freshness: 0.15 },

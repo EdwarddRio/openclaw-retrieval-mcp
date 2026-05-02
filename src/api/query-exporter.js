@@ -1,6 +1,6 @@
 import fs from 'fs';
 import path from 'path';
-import { DEBUG_EXPORT_DIR } from '../config.js';
+import { DEBUG_EXPORT_DIR, logger } from '../config.js';
 
 /**
  * QueryExporter - writes debug artifacts for query-context calls.
@@ -39,7 +39,7 @@ export class QueryExporter {
         }
       }
     } catch (err) {
-      console.warn(`[QueryExporter] Failed to cleanup old exports: ${err.message}`);
+      logger.warn(`[QueryExporter] Failed to cleanup old exports: ${err.message}`);
     }
   }
 

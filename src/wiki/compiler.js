@@ -11,8 +11,9 @@
 
 import fs from 'fs';
 import path from 'path';
-import { logger, PROJECT_ROOT } from '../config.js';
+import { logger, PROJECT_ROOT, WIKI_SEARCH_CACHE_TTL_MS } from '../config.js';
 import { WikiManifest } from './manifest.js';
+import { HybridWikiSearch } from './bm25.js';
 
 // LLMWiki 根目录，始终位于 workspace/LLMWiki/
 const LLMWIKI_DIR = path.join(PROJECT_ROOT, 'LLMWiki');
@@ -28,11 +29,21 @@ export class WikiCompiler {
     this._wikiDir = path.join(this._llmwikiDir, 'wiki'); // 编译输出目录
     this._schemaPath = path.join(this._llmwikiDir, 'schema.md'); // Wiki 页面 Schema
     this._sourcesPath = path.join(this._llmwikiDir, 'raw-sources.json'); // 数据源配置文件
-    this._manifestPath = path.join(this._llmwikiDir, 'wiki-manifest.json');
+    this._manifestPath = path.join(this._llmwikiDir, 'wiki-manifest.json'); // Manifest 文件路径
     this._manifest = new WikiManifest(this._manifestPath);
     this._searchCache = null;
     this._searchCacheTime = 0;
-    this._searchCacheTTL = 300000;
+    this._searchCacheTTL = WIKI_SEARCH_CACHE_TTL_MS;
+    
+    // BM25 hybrid search - auto-switches based on page count
+    this._hybridSearch = new HybridWikiSearch({
+      bm25Threshold: parseInt(process.env.WIKI_BM25_THRESHOLD || '200', 10),
+      bm25Options: {
+        k1: parseFloat(process.env.WIKI_BM25_K1 || '1.5'),
+        b: parseFloat(process.env.WIKI_BM25_B || '0.75')
+      }
+    });
+    this._bm25Initialized = false;
   }
 
   /**
@@ -244,6 +255,7 @@ export class WikiCompiler {
 
     this._searchCache = null;
     this._searchCacheTime = 0;
+    this._invalidateSearchIndex();
 
     return {
       wikiPage: safePageName,
@@ -277,6 +289,7 @@ export class WikiCompiler {
 
     this._searchCache = null;
     this._searchCacheTime = 0;
+    this._invalidateSearchIndex();
   }
 
   /**
@@ -293,8 +306,16 @@ export class WikiCompiler {
         title: name.replace(/\.md$/, ''),
       }));
 
+    // Deduplicate by wiki page name (keep last occurrence for each unique page)
+    const seen = new Map();
+    for (const p of sourcePages) {
+      const key = (p.title || p.name || '').replace(/\.md$/, '');
+      if (key) seen.set(key, p);
+    }
+    const dedupedPages = [...seen.values()];
+
     // Auto-fill sourceId from manifest when not provided by caller
-    const enrichedPages = sourcePages.map(p => {
+    const enrichedPages = dedupedPages.map(p => {
       if (p.sourceId) return p;
       // Look up sourceId from manifest by matching wikiPage name
       const expectedName = p.name || (p.title ? p.title + '.md' : '');
@@ -362,40 +383,75 @@ export class WikiCompiler {
   }
 
   /**
-   * Search wiki pages by keywords (independent BM25-like scoring).
-   * Does not depend on static_kb — wiki owns its search.
+   * Search wiki pages by keywords.
+   * Uses HybridWikiSearch which auto-switches between simple and BM25 based on page count.
    * @param {string} query - Search query
    * @param {number} topK - Max results
+   * @returns {Array} Search results with scores
    */
   searchWiki(query, topK = 5) {
     if (!query || !query.trim()) return [];
 
-    const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
-    const pageIndex = this._getSearchIndex();
-    const scored = [];
-
-    for (const [pageName, entry] of Object.entries(pageIndex)) {
-      let score = 0;
-      for (const term of terms) {
-        const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-        const titleCount = (entry.title.match(new RegExp(escaped, 'g')) || []).length;
-        const contentCount = (entry.content.match(new RegExp(escaped, 'g')) || []).length;
-        score += titleCount * 5 + contentCount;
-      }
-
-      if (score > 0) {
-        scored.push({
-          pageName,
-          title: entry.title,
-          score,
-          sourceId: entry.sourceId || '',
-          snippet: entry.content.slice(0, 300),
-        });
-      }
+    // Initialize BM25 index if needed (lazy loading)
+    if (!this._bm25Initialized) {
+      this._initializeHybridSearch();
     }
 
-    scored.sort((a, b) => b.score - a.score);
-    return scored.slice(0, topK);
+    // Use hybrid search (auto-switches between simple and BM25)
+    const results = this._hybridSearch.search(query, topK);
+    
+    // Enrich results with additional metadata
+    return results.map(r => ({
+      pageName: r.docId,
+      title: (r.metadata?.title || r.docId).replace(/\.md$/, ''),
+      score: r.score,
+      sourceId: r.metadata?.sourceId || '',
+      snippet: (r.metadata?.content || '').slice(0, 300),
+      searchMode: this._hybridSearch.getMode()
+    }));
+  }
+
+  /**
+   * Initialize hybrid search index from wiki pages
+   * @private
+   */
+  _initializeHybridSearch() {
+    const wikiPages = this._listWikiPages();
+    this._manifest.load();
+
+    for (const pageName of wikiPages) {
+      const filePath = path.join(this._wikiDir, pageName);
+      if (!fs.existsSync(filePath)) continue;
+      
+      const content = fs.readFileSync(filePath, 'utf-8');
+      const title = pageName.replace(/\.md$/, '');
+      const manifestEntry = Object.values(this._manifest.allEntries).find(e => e.wikiPage === pageName);
+      
+      this._hybridSearch.addPage(pageName, content, {
+        title,
+        sourceId: manifestEntry?.sourceId || '',
+        content: content.toLowerCase()
+      });
+    }
+
+    this._bm25Initialized = true;
+    logger.info(`Hybrid search initialized: ${wikiPages.length} pages, mode=${this._hybridSearch.getMode()}`);
+  }
+
+  /**
+   * Invalidate search index (call after save/remove operations)
+   * @private
+   */
+  _invalidateSearchIndex() {
+    this._hybridSearch = new HybridWikiSearch({
+      bm25Threshold: parseInt(process.env.WIKI_BM25_THRESHOLD || '200', 10),
+      bm25Options: {
+        k1: parseFloat(process.env.WIKI_BM25_K1 || '1.5'),
+        b: parseFloat(process.env.WIKI_BM25_B || '0.75')
+      }
+    });
+    this._bm25Initialized = false;
+    this._searchCache = null;
   }
 
   _getSearchIndex() {
