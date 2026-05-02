@@ -30,7 +30,9 @@ jobs:
         continue-on-error: true
 
       - name: Run tests
-        run: npm test
+        run: |
+          # 排除 integration tests（需要运行的服务）
+          node --test $(find tests -name "*.test.js" ! -name "integration.test.js" | tr '\n' ' ')
 
       - name: Run integration tests (contract check)
         run: npm run test:contract
