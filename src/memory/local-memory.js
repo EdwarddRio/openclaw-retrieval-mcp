@@ -995,6 +995,11 @@ export class LocalMemoryStore {
       // v3.3: 使用基于权重的衰减GC替代旧的tentative TTL清理
       const weightResult = this._store.cleanupByWeight();
       
+      // 如果GC删除了文档，标记BM25索引需要重建
+      if (weightResult.deleted > 0 || weightResult.expired > 0) {
+        this._bm25Dirty = true;
+      }
+      
       logger.info(
         `Periodic cleanup: turns=${turnResult.deleted}, sessions=${sessionResult.deleted}, ` +
         `events=${eventResult.deleted}, weight_downgraded=${weightResult.downgraded}, ` +

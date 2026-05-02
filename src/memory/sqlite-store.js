@@ -1217,8 +1217,7 @@ export class SqliteStore {
       UPDATE memory_items SET weight = 'MEDIUM', weight_set_at = ?
       WHERE weight = 'STRONG' AND status = 'active' 
       AND weight_set_at < ?
-      AND category NOT IN ('instruction')
-      AND NOT (category = 'preference' AND weight = 'STRONG')
+      AND category NOT IN ('instruction', 'preference')
     `).run(nowISO, strongCutoff);
     
     // MEDIUM → WEAK (7天)
