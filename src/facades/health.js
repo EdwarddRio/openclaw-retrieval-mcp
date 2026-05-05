@@ -48,7 +48,7 @@ export class HealthFacade {
     }
 
     const governance = {
-      pending_review_count: (localmem.stats?.by_weight?.WEAK || 0) + (localmem.stats?.by_weight?.MEDIUM || 0),
+      pending_review_count: localmem.stats?.tentative || 0,
       wiki_candidate_count: 0,
     };
     if (governance.pending_review_count > 0) {
