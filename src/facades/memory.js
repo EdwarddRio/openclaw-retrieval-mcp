@@ -229,6 +229,17 @@ export class MemoryFacade {
   }
 
   /**
+   * 确认待审核记忆
+   * @param {string} memoryId - 记忆 ID
+   * @param {string} [targetWeight='STRONG'] - 目标权重（STRONG/MEDIUM）
+   * @param {Object} [evaluation] - 可选的评估结果
+   * @returns {Object} 操作结果
+   */
+  confirmReview(memoryId, targetWeight = 'STRONG', evaluation = null) {
+    return this.localMemory.confirmReview(memoryId, targetWeight, evaluation);
+  }
+
+  /**
    * 提升待审核记忆为永久（kept）
    * @param {string} memoryId - 记忆 ID
    * @param {Object} [evaluation] - 可选的评估结果

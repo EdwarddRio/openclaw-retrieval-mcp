@@ -273,31 +273,105 @@ export class HybridWikiSearch {
   }
 
   /**
-   * Add or update a page
-   * @param {string} pageName - Page name (docId)
+   * Split wiki content into sections by markdown headings.
+   * Each section becomes an independent search document for paragraph-level precision.
+   * @param {string} content - Full page content
+   * @returns {Array<{heading: string, body: string}>} Sections
+   */
+  _splitIntoSections(content) {
+    if (!content) return [];
+    const lines = content.split('\n');
+    const sections = [];
+    let currentHeading = '_top';
+    let currentBody = [];
+    
+    for (const line of lines) {
+      const headingMatch = line.match(/^(#{1,3})\s+(.+)/);
+      if (headingMatch) {
+        // Flush previous section
+        if (currentBody.length > 0 || currentHeading !== '_top') {
+          sections.push({
+            heading: currentHeading,
+            body: currentBody.join('\n').trim()
+          });
+        }
+        currentHeading = headingMatch[2].trim();
+        currentBody = [line];
+      } else {
+        currentBody.push(line);
+      }
+    }
+    // Flush last section
+    if (currentBody.length > 0) {
+      sections.push({
+        heading: currentHeading,
+        body: currentBody.join('\n').trim()
+      });
+    }
+    
+    // If page has no headings, return entire content as one section
+    if (sections.length === 0 && content.trim()) {
+      sections.push({ heading: '_top', body: content.trim() });
+    }
+    
+    // Filter out empty sections
+    return sections.filter(s => s.body.length > 0);
+  }
+
+  /**
+   * Add or update a page. Splits content into sections for paragraph-level search.
+   * @param {string} pageName - Page name
    * @param {string} content - Page content
    * @param {Object} metadata - Page metadata
    */
   addPage(pageName, content, metadata = {}) {
     this.pages.set(pageName, { content, metadata });
-    this.bm25.addDocument(pageName, content, { ...metadata, title: pageName });
+    
+    const sections = this._splitIntoSections(content);
+    
+    if (sections.length <= 1) {
+      // Small page or no headings: index as single document (backward compatible)
+      this.bm25.addDocument(pageName, content, { ...metadata, title: pageName });
+    } else {
+      // Multi-section page: index each section independently
+      for (const section of sections) {
+        const docId = `${pageName}::${section.heading}`;
+        this.bm25.addDocument(docId, section.body, {
+          ...metadata,
+          title: `${pageName} > ${section.heading}`,
+          sectionHeading: section.heading,
+          parentPage: pageName
+        });
+      }
+    }
     
     // Check if we should switch to BM25
-    if (this.pages.size >= this.bm25Threshold && !this.useBM25) {
+    if (this.bm25.docCount >= this.bm25Threshold && !this.useBM25) {
       this.useBM25 = true;
     }
   }
 
   /**
-   * Remove a page
+   * Remove a page and all its sections
    * @param {string} pageName - Page name
    */
   removePage(pageName) {
     this.pages.delete(pageName);
-    this.bm25.removeDocument(pageName);
     
-    // Always check mode based on current page count
-    this.useBM25 = this.pages.size >= this.bm25Threshold;
+    // Remove the page itself and all section documents (pageName::*)
+    this.bm25.removeDocument(pageName);
+    const toRemove = [];
+    for (const docId of this.bm25.docLengths.keys()) {
+      if (docId.startsWith(pageName + '::')) {
+        toRemove.push(docId);
+      }
+    }
+    for (const docId of toRemove) {
+      this.bm25.removeDocument(docId);
+    }
+    
+    // Always check mode based on current doc count
+    this.useBM25 = this.bm25.docCount >= this.bm25Threshold;
   }
 
   /**
@@ -313,33 +387,42 @@ export class HybridWikiSearch {
     const scored = [];
     
     for (const [pageName, { content, metadata }] of this.pages) {
-      const contentLower = content.toLowerCase();
-      const titleLower = pageName.toLowerCase();
+      const sections = this._splitIntoSections(content);
       
-      let score = 0;
-      
-      // Title matches (weighted higher)
-      for (const term of queryTerms) {
-        if (titleLower.includes(term)) {
-          score += 5;
+      if (sections.length <= 1) {
+        // Single section: search as whole page
+        const contentLower = content.toLowerCase();
+        const titleLower = pageName.toLowerCase();
+        let score = 0;
+        for (const term of queryTerms) {
+          if (titleLower.includes(term)) score += 5;
+          const regex = new RegExp(term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
+          const matches = contentLower.match(regex);
+          if (matches) score += matches.length;
         }
-      }
-      
-      // Content matches
-      for (const term of queryTerms) {
-        const regex = new RegExp(term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
-        const matches = contentLower.match(regex);
-        if (matches) {
-          score += matches.length;
+        if (score > 0) {
+          scored.push({ docId: pageName, score, metadata: { ...metadata, content: content.slice(0, 300) } });
         }
-      }
-      
-      if (score > 0) {
-        scored.push({
-          docId: pageName,
-          score,
-          metadata
-        });
+      } else {
+        // Multi-section: search each section independently
+        for (const section of sections) {
+          const sectionLower = section.body.toLowerCase();
+          const headingLower = section.heading.toLowerCase();
+          let score = 0;
+          for (const term of queryTerms) {
+            if (headingLower.includes(term)) score += 5;
+            const regex = new RegExp(term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
+            const matches = sectionLower.match(regex);
+            if (matches) score += matches.length;
+          }
+          if (score > 0) {
+            scored.push({
+              docId: `${pageName}::${section.heading}`,
+              score,
+              metadata: { ...metadata, content: section.body.slice(0, 300), sectionHeading: section.heading, parentPage: pageName }
+            });
+          }
+        }
       }
     }
     

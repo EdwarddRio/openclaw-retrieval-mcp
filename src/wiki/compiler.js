@@ -36,8 +36,9 @@ export class WikiCompiler {
     this._searchCacheTTL = WIKI_SEARCH_CACHE_TTL_MS;
     
     // BM25 hybrid search - auto-switches based on page count
+    // Threshold lowered to 50 since section-level indexing increases doc count
     this._hybridSearch = new HybridWikiSearch({
-      bm25Threshold: parseInt(process.env.WIKI_BM25_THRESHOLD || '200', 10),
+      bm25Threshold: parseInt(process.env.WIKI_BM25_THRESHOLD || '50', 10),
       bm25Options: {
         k1: parseFloat(process.env.WIKI_BM25_K1 || '1.5'),
         b: parseFloat(process.env.WIKI_BM25_B || '0.75')
@@ -401,14 +402,29 @@ export class WikiCompiler {
     const results = this._hybridSearch.search(query, topK);
     
     // Enrich results with additional metadata
-    return results.map(r => ({
-      pageName: r.docId,
-      title: (r.metadata?.title || r.docId).replace(/\.md$/, ''),
-      score: r.score,
-      sourceId: r.metadata?.sourceId || '',
-      snippet: (r.metadata?.content || '').slice(0, 300),
-      searchMode: this._hybridSearch.getMode()
-    }));
+    return results.map(r => {
+      // Handle section-level docIds: "pageName::sectionHeading"
+      const docId = r.docId;
+      const separatorIdx = docId.indexOf('::');
+      const pageName = separatorIdx > 0 ? docId.substring(0, separatorIdx) : docId;
+      const sectionHeading = separatorIdx > 0 ? docId.substring(separatorIdx + 2) : null;
+      
+      // Build snippet from section content (not page-level)
+      const content = r.metadata?.content || '';
+      const snippet = sectionHeading
+        ? `### ${sectionHeading}\n${content.slice(0, 300)}`
+        : content.slice(0, 300);
+      
+      return {
+        pageName: pageName.replace(/\.md$/, ''),
+        title: (r.metadata?.title || pageName).replace(/\.md$/, ''),
+        sectionHeading,
+        score: r.score,
+        sourceId: r.metadata?.sourceId || '',
+        snippet,
+        searchMode: this._hybridSearch.getMode()
+      };
+    });
   }
 
   /**
@@ -444,7 +460,7 @@ export class WikiCompiler {
    */
   _invalidateSearchIndex() {
     this._hybridSearch = new HybridWikiSearch({
-      bm25Threshold: parseInt(process.env.WIKI_BM25_THRESHOLD || '200', 10),
+      bm25Threshold: parseInt(process.env.WIKI_BM25_THRESHOLD || '50', 10),
       bm25Options: {
         k1: parseFloat(process.env.WIKI_BM25_K1 || '1.5'),
         b: parseFloat(process.env.WIKI_BM25_B || '0.75')

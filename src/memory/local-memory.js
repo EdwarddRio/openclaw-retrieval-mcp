@@ -1130,17 +1130,17 @@ export class LocalMemoryStore {
       return { category: 'preference', weight: 'STRONG' };
     }
     
-    // 用户显式请求 → MEDIUM (需用户确认)
+    // 用户显式请求 → WEAK (需用户确认，进review)
     if (role === 'user' && this._containsExplicitMemoryRequest(content)) {
-      return { category: 'preference', weight: 'MEDIUM' };
+      return { category: 'preference', weight: 'WEAK' };
     }
     
-    // 知识断言 → MEDIUM (需用户确认)
+    // 知识断言 → WEAK (需用户确认，进review)
     if (role === 'assistant' && this._isKnowledgeAssertion(content)) {
-      return { category: 'fact', weight: 'MEDIUM' };
+      return { category: 'fact', weight: 'WEAK' };
     }
     
-    // 默认 → WEAK (3天衰减，需用户确认)
+    // 默认 → WEAK (需用户确认，进review)
     return { category: 'general', weight: 'WEAK' };
   }
 
@@ -1473,12 +1473,13 @@ export class LocalMemoryStore {
   // ========== Review API ==========
 
   /**
-   * 列出待审核记忆（weight='WEAK'）
+   * 列出待审核记忆（state='tentative' 且 weight IN ('WEAK', 'MEDIUM')）
+   * WEAK 优先排序
    * @param {number} [limit=50] - 返回数量上限
    * @returns {Array<Object>} 待审核记忆列表
    */
   listReviews(limit = 50) {
-    return this._store.listMemoryByWeight('WEAK', limit);
+    return this._store.listPendingReviews(limit);
   }
 
   /**
@@ -1491,7 +1492,10 @@ export class LocalMemoryStore {
   confirmReview(memoryId, targetWeight = 'STRONG', evaluation = null) {
     const memory = this._store.getMemory(memoryId);
     if (!memory) throw new Error(`Memory not found: ${memoryId}`);
-    if (memory.weight !== 'WEAK') throw new Error(`Memory is not in WEAK weight: ${memory.weight}`);
+    // 允许 WEAK 和 MEDIUM 都可以确认
+    if (!['WEAK', 'MEDIUM'].includes(memory.weight)) {
+      throw new Error(`Memory is not in review state: ${memory.weight}`);
+    }
 
     const autoConfirmed = Boolean(
       evaluation && typeof evaluation.score === 'number' && evaluation.score >= 0.8
@@ -1513,7 +1517,7 @@ export class LocalMemoryStore {
       created_at: new Date().toISOString(),
       event_data: {
         evaluation,
-        previous_weight: 'WEAK',
+        previous_weight: memory.weight,
         new_weight: targetWeight,
         auto_confirmed: autoConfirmed,
         score: evaluation?.score ?? null,

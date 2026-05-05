@@ -871,6 +871,24 @@ export class SqliteStore {
   }
 
   /**
+   * 列出待审核记忆（state='tentative' 且 weight IN ('WEAK', 'MEDIUM')）
+   * WEAK 优先排序
+   * @param {number} [limit=50] - 返回数量上限
+   * @returns {Array<Object>} 待审核记忆列表
+   */
+  listPendingReviews(limit = 50) {
+    return this.db.prepare(`
+      SELECT * FROM memory_items 
+      WHERE state = 'tentative' AND status = 'active'
+        AND weight IN ('WEAK', 'MEDIUM')
+      ORDER BY 
+        CASE weight WHEN 'WEAK' THEN 0 WHEN 'MEDIUM' THEN 1 ELSE 2 END,
+        updated_at DESC 
+      LIMIT ?
+    `).all(limit).map(r => this._rowToMemory(r));
+  }
+
+  /**
    * 更新记忆内容
    * @param {string} memoryId - 记忆 ID
    * @param {string} content - 新内容
